@@ -28,6 +28,21 @@ from src.core.exceptions import register_exception_handlers
 from src.core.health import router as health_router
 from src.core.logging import configure_logging
 from src.core.middleware import RequestContextMiddleware
+from src.modules.identity.router import router as auth_router
+
+# Import model modules so all mappers register on Base.metadata before any
+# query runs. SQLAlchemy resolves `relationship("Agency")` lazily, but the
+# resolution has to happen before the first mapper is configured against
+# the registry.
+from src.modules.agencies.models import Agency as _Agency  # noqa: F401
+from src.modules.identity.models import (  # noqa: F401
+    AuthAuditEvent,
+    EmailVerificationOtp,
+    RefreshToken,
+    SingleUseToken,
+    User,
+    UserRoleAssignment,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -166,8 +181,11 @@ def create_app() -> FastAPI:
     # Health is always exposed (k8s probes never auth).
     app.include_router(health_router)
 
+    # Auth — register with no extra prefix (router already uses /auth).
+    app.include_router(auth_router)
+
     # NOTE: feature routers get registered here as modules land, e.g.
-    #   app.include_router(auth_router, prefix="/auth", tags=["auth"])
+    #   app.include_router(staff_router, prefix="/staff", tags=["staff"])
 
     return app
 
