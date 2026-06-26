@@ -148,16 +148,16 @@ class Appointment(IdMixin, TimestampedMixin, Base):
     )
 
     # Relationships
-    agency: Mapped["Agency"] = relationship(  # noqa: F821
+    agency: Mapped[Agency] = relationship(
         "Agency", back_populates="appointments"
     )
-    patient: Mapped["PatientProfile"] = relationship(  # noqa: F821
+    patient: Mapped[PatientProfile] = relationship(
         "PatientProfile", back_populates="appointments"
     )
-    staff: Mapped["StaffProfile | None"] = relationship(  # noqa: F821
+    staff: Mapped[StaffProfile | None] = relationship(
         "StaffProfile", back_populates="appointments"
     )
-    service_items: Mapped[list["AppointmentServiceItem"]] = relationship(
+    service_items: Mapped[list[AppointmentServiceItem]] = relationship(
         back_populates="appointment",
         cascade="all, delete-orphan",
     )

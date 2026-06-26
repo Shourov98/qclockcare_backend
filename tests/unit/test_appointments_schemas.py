@@ -7,7 +7,7 @@ custom model_validators (window ordering, planned_minutes range, etc.).
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -31,7 +31,7 @@ from src.shared.domain.enums import (
 _UUID_A = "00000000-0000-0000-0000-000000000001"
 _UUID_B = "00000000-0000-0000-0000-000000000002"
 
-_START = datetime(2026, 7, 1, 9, 0, 0, tzinfo=timezone.utc)
+_START = datetime(2026, 7, 1, 9, 0, 0, tzinfo=UTC)
 _END = _START + timedelta(hours=1)
 
 

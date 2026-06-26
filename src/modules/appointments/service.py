@@ -39,7 +39,7 @@ RLS is the source of truth for tenant scoping; functions still take an
 from __future__ import annotations
 
 import uuid
-from typing import Sequence
+from collections.abc import Sequence
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
