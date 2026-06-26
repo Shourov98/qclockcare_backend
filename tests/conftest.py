@@ -5,16 +5,31 @@ FastAPI app. The lifespan will attempt a DB ping; in the absence of a real
 Postgres it logs an error but does not raise. Tests that need a real DB
 should use the `integration` marker and a docker-compose dev DB.
 
-IMPORTANT: env-var defaults are set at module import time (top of file),
-BEFORE any other imports, so that `src.core.config.settings` — which is
-a module singleton built at import time — sees a valid `DATABASE_URL`.
+We load `.env` first so the local Supabase URL (port 54322) wins over the
+fallback below (port 5432). `setdefault` is used everywhere so a developer
+with their own `.env` overrides don't get clobbered.
 """
 
 from __future__ import annotations
 
 # ---- env-var defaults MUST come first (before any src.* import) ----
 import os
+from pathlib import Path
 
+# Load .env into os.environ FIRST so DATABASE_URL wins.
+_ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
+if _ENV_PATH.exists():
+    for _line in _ENV_PATH.read_text().splitlines():
+        # Strip inline comments and surrounding whitespace
+        _line = _line.split("#", 1)[0].strip()
+        if not _line or "=" not in _line:
+            continue
+        _k, _, _v = _line.partition("=")
+        # Strip surrounding whitespace and quotes from the value
+        _v = _v.strip().strip('"').strip("'")
+        os.environ.setdefault(_k.strip(), _v)
+
+# Fallbacks for CI / unit tests without a real DB.
 os.environ.setdefault("APP_ENV", "test")
 os.environ.setdefault(
     "DATABASE_URL",

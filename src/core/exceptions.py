@@ -92,6 +92,9 @@ class CrossAgencyAccessDeniedError(ForbiddenError):
     message = "You cannot access another agency's resources."
 
 
+# --------------------------------------------------------------------------
+# Common subclasses — shared across modules
+# --------------------------------------------------------------------------
 class ConflictError(AppException):
     http_status = 409
     error_code = "CONFLICT"
@@ -118,6 +121,74 @@ class ServiceUnavailableError(AppException):
     http_status = 503
     error_code = "SERVICE_UNAVAILABLE"
     message = "An external dependency is unavailable."
+
+
+# --------------------------------------------------------------------------
+# Auth-specific (ADR-0016)
+# --------------------------------------------------------------------------
+class InvalidCredentialsError(UnauthorizedError):
+    """Wrong email or password. Always use this (never distinguish which)."""
+
+    error_code = "INVALID_CREDENTIALS"
+    message = "Invalid email or password."
+
+
+class AccountLockedError(UnauthorizedError):
+    error_code = "ACCOUNT_LOCKED"
+    message = (
+        "Account is temporarily locked due to too many failed attempts. "
+        "Try again later."
+    )
+
+
+class AccountDisabledError(ForbiddenError):
+    error_code = "ACCOUNT_DISABLED"
+    message = "This account has been disabled."
+
+
+class EmailNotVerifiedError(ForbiddenError):
+    error_code = "EMAIL_NOT_VERIFIED"
+    message = "Please verify your email address to continue."
+
+
+class InvalidInvitationTokenError(UnauthorizedError):
+    error_code = "INVALID_INVITATION_TOKEN"
+    message = "Invitation token is invalid or has expired."
+
+
+class InvitationAlreadyConsumedError(ConflictError):
+    error_code = "INVITATION_ALREADY_CONSUMED"
+    message = "This invitation has already been used."
+
+
+class InvalidOtpError(UnauthorizedError):
+    error_code = "INVALID_OTP"
+    message = "Verification code is incorrect."
+
+
+class OtpExpiredError(UnauthorizedError):
+    error_code = "OTP_EXPIRED"
+    message = "Verification code has expired. Please request a new one."
+
+
+class OtpMaxAttemptsExceededError(UnauthorizedError):
+    error_code = "OTP_MAX_ATTEMPTS_EXCEEDED"
+    message = "Too many incorrect attempts. Please request a new code."
+
+
+class OtpResendCooldownError(RateLimitExceededError):
+    error_code = "OTP_RESEND_COOLDOWN"
+    message = "Please wait before requesting another code."
+
+
+class WeakPasswordError(ValidationError):
+    error_code = "WEAK_PASSWORD"
+    message = "Password does not meet the complexity requirements."
+
+
+class InvalidResetTokenError(UnauthorizedError):
+    error_code = "INVALID_RESET_TOKEN"
+    message = "Password reset token is invalid or has expired."
 
 
 # --------------------------------------------------------------------------
@@ -281,19 +352,31 @@ def register_exception_handlers(app: FastAPI) -> None:
 
 
 __all__ = [
+    "AccountDisabledError",
+    "AccountLockedError",
     "AppException",
     "ConflictError",
     "CrossAgencyAccessDeniedError",
     "DuplicateResourceError",
+    "EmailNotVerifiedError",
     "ForbiddenError",
     "InsufficientPermissionsError",
+    "InvalidCredentialsError",
+    "InvalidInvitationTokenError",
+    "InvalidOtpError",
+    "InvalidResetTokenError",
     "InvalidStateTransitionError",
+    "InvitationAlreadyConsumedError",
     "NotFoundError",
+    "OtpExpiredError",
+    "OtpMaxAttemptsExceededError",
+    "OtpResendCooldownError",
     "RateLimitExceededError",
     "ServiceUnavailableError",
     "TokenExpiredError",
     "TokenInvalidError",
     "UnauthorizedError",
     "ValidationError",
+    "WeakPasswordError",
     "register_exception_handlers",
 ]

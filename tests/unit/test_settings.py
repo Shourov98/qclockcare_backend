@@ -13,6 +13,8 @@ def test_settings_load_with_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     """Settings load from the test env (set by conftest)."""
     from src.core import config
 
+    # Force APP_ENV=test for this test (the local .env may have set it to development)
+    monkeypatch.setenv("APP_ENV", "test")
     config.get_settings.cache_clear()
     settings = config.get_settings()
 
