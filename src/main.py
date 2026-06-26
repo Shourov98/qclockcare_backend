@@ -28,6 +28,7 @@ from src.core.exceptions import register_exception_handlers
 from src.core.health import router as health_router
 from src.core.logging import configure_logging
 from src.core.middleware import RequestContextMiddleware
+from src.modules.appointments.router import router as appointments_router
 from src.modules.identity.router import router as auth_router
 from src.modules.patients.router import router as patients_router
 from src.modules.staff.router import router as staff_router
@@ -54,6 +55,10 @@ from src.modules.patients.models import (  # noqa: F401
     GuardianProfile,
     PatientGuardianRelationship,
     PatientProfile,
+)
+from src.modules.appointments.models import (  # noqa: F401
+    Appointment,
+    AppointmentServiceItem,
 )
 
 logger = structlog.get_logger(__name__)
@@ -201,6 +206,9 @@ def create_app() -> FastAPI:
 
     # Patients + guardians + relationships.
     app.include_router(patients_router)
+
+    # Appointments + service items.
+    app.include_router(appointments_router)
 
     # NOTE: feature routers get registered here as modules land, e.g.
     #   app.include_router(staff_router, prefix="/staff", tags=["staff"])
