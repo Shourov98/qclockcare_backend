@@ -28,16 +28,17 @@ from src.core.exceptions import register_exception_handlers
 from src.core.health import router as health_router
 from src.core.logging import configure_logging
 from src.core.middleware import RequestContextMiddleware
-from src.modules.appointments.router import router as appointments_router
-from src.modules.identity.router import router as auth_router
-from src.modules.patients.router import router as patients_router
-from src.modules.staff.router import router as staff_router
 
 # Import model modules so all mappers register on Base.metadata before any
 # query runs. SQLAlchemy resolves `relationship("Agency")` lazily, but the
 # resolution has to happen before the first mapper is configured against
 # the registry.
 from src.modules.agencies.models import Agency as _Agency  # noqa: F401
+from src.modules.appointments.models import (  # noqa: F401
+    Appointment,
+    AppointmentServiceItem,
+)
+from src.modules.appointments.router import router as appointments_router
 from src.modules.identity.models import (  # noqa: F401
     AuthAuditEvent,
     EmailVerificationOtp,
@@ -46,20 +47,27 @@ from src.modules.identity.models import (  # noqa: F401
     User,
     UserRoleAssignment,
 )
-from src.modules.staff.models import (  # noqa: F401
-    StaffAvailability,
-    StaffProfile,
-    StaffQualification,
-)
+from src.modules.identity.router import router as auth_router
 from src.modules.patients.models import (  # noqa: F401
     GuardianProfile,
     PatientGuardianRelationship,
     PatientProfile,
 )
-from src.modules.appointments.models import (  # noqa: F401
-    Appointment,
-    AppointmentServiceItem,
+from src.modules.patients.router import router as patients_router
+from src.modules.staff.models import (  # noqa: F401
+    StaffAvailability,
+    StaffProfile,
+    StaffQualification,
 )
+from src.modules.staff.router import router as staff_router
+from src.modules.visits.models import (  # noqa: F401
+    ServiceVerification,
+    Visit,
+    VisitIssue,
+    VisitNote,
+    VisitServiceItem,
+)
+from src.modules.visits.router import router as visits_router
 
 logger = structlog.get_logger(__name__)
 
@@ -209,6 +217,9 @@ def create_app() -> FastAPI:
 
     # Appointments + service items.
     app.include_router(appointments_router)
+
+    # Visits + service items + verification + issues.
+    app.include_router(visits_router)
 
     # NOTE: feature routers get registered here as modules land, e.g.
     #   app.include_router(staff_router, prefix="/staff", tags=["staff"])

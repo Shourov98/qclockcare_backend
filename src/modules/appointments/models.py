@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from src.modules.agencies.models import Agency
     from src.modules.patients.models import PatientProfile
     from src.modules.staff.models import StaffProfile
+    from src.modules.visits.models import Visit
 
 
 # --------------------------------------------------------------------------
@@ -160,6 +161,12 @@ class Appointment(IdMixin, TimestampedMixin, Base):
     service_items: Mapped[list[AppointmentServiceItem]] = relationship(
         back_populates="appointment",
         cascade="all, delete-orphan",
+    )
+    visit: Mapped[Visit | None] = relationship(
+        "Visit",
+        back_populates="appointment",
+        cascade="all, delete-orphan",
+        uselist=False,
     )
 
     __table_args__ = (
