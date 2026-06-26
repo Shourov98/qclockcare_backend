@@ -29,6 +29,7 @@ from src.core.health import router as health_router
 from src.core.logging import configure_logging
 from src.core.middleware import RequestContextMiddleware
 from src.modules.identity.router import router as auth_router
+from src.modules.staff.router import router as staff_router
 
 # Import model modules so all mappers register on Base.metadata before any
 # query runs. SQLAlchemy resolves `relationship("Agency")` lazily, but the
@@ -42,6 +43,11 @@ from src.modules.identity.models import (  # noqa: F401
     SingleUseToken,
     User,
     UserRoleAssignment,
+)
+from src.modules.staff.models import (  # noqa: F401
+    StaffAvailability,
+    StaffProfile,
+    StaffQualification,
 )
 
 logger = structlog.get_logger(__name__)
@@ -183,6 +189,9 @@ def create_app() -> FastAPI:
 
     # Auth — register with no extra prefix (router already uses /auth).
     app.include_router(auth_router)
+
+    # Staff — agency-scoped staff profiles, qualifications, availability.
+    app.include_router(staff_router)
 
     # NOTE: feature routers get registered here as modules land, e.g.
     #   app.include_router(staff_router, prefix="/staff", tags=["staff"])

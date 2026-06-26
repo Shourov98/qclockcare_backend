@@ -41,6 +41,7 @@ from src.shared.domain.enums import AuthAuditEventType, UserRole, UserStatus
 
 if TYPE_CHECKING:
     from src.modules.agencies.models import Agency
+    from src.modules.staff.models import StaffProfile
 
 
 # --------------------------------------------------------------------------
@@ -114,6 +115,9 @@ class User(IdMixin, TimestampedMixin, SoftDeleteMixin, Base):
     auth_events: Mapped[list[AuthAuditEvent]] = relationship(
         back_populates="user",
         cascade="all, delete-orphan",
+    )
+    staff_profiles: Mapped[list["StaffProfile"]] = relationship(  # noqa: F821
+        "StaffProfile", back_populates="user", cascade="all, delete-orphan"
     )
 
     __table_args__ = (

@@ -62,12 +62,19 @@ async def get_session_with_auth(
     and call `set_session_context`. The session is committed on success
     and rolled back on exception (inherited from `get_session`).
     """
+    from sqlalchemy.orm import selectinload
+
     async for session in get_session():
         if credentials is not None:
             payload = jwt_service.verify_access_token(credentials.credentials)
             user = (
                 await session.execute(
-                    select(User).where(User.id == payload.user_id)
+                    select(User)
+                    .where(User.id == payload.user_id)
+                    # Eager-load roles so `_pick_primary_role(user.roles)`
+                    # below doesn't trigger a lazy load outside an awaited
+                    # context (the session is held inside this generator).
+                    .options(selectinload(User.roles))
                 )
             ).scalar_one_or_none()
             if user is None:
@@ -105,11 +112,16 @@ async def get_session_with_auth(
 # --------------------------------------------------------------------------
 def get_current_auth(
     request: Request,
+    # We depend on get_session_with_auth so FastAPI resolves the auth-bearing
+    # session FIRST and populates `request.state.auth` before this runs.
+    # The session itself is discarded — we only need the side effect.
+    _session: AsyncSession = Depends(get_session_with_auth),  # noqa: ARG001
 ) -> AuthContext:
     """Return the AuthContext populated by `get_session_with_auth`.
 
-    Use this AFTER `get_session_with_auth` in the dependency chain. It will
-    raise 401 if no auth context was attached.
+    This dep depends on `get_session_with_auth` so FastAPI guarantees the
+    auth flow (token verification + RLS GUCs) runs before we read
+    `request.state.auth`. Raises 401 if no auth context was attached.
     """
     ctx = getattr(request.state, "auth", None)
     if ctx is None:
