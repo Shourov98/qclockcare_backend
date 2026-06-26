@@ -29,6 +29,7 @@ from src.core.health import router as health_router
 from src.core.logging import configure_logging
 from src.core.middleware import RequestContextMiddleware
 from src.modules.identity.router import router as auth_router
+from src.modules.patients.router import router as patients_router
 from src.modules.staff.router import router as staff_router
 
 # Import model modules so all mappers register on Base.metadata before any
@@ -48,6 +49,11 @@ from src.modules.staff.models import (  # noqa: F401
     StaffAvailability,
     StaffProfile,
     StaffQualification,
+)
+from src.modules.patients.models import (  # noqa: F401
+    GuardianProfile,
+    PatientGuardianRelationship,
+    PatientProfile,
 )
 
 logger = structlog.get_logger(__name__)
@@ -192,6 +198,9 @@ def create_app() -> FastAPI:
 
     # Staff — agency-scoped staff profiles, qualifications, availability.
     app.include_router(staff_router)
+
+    # Patients + guardians + relationships.
+    app.include_router(patients_router)
 
     # NOTE: feature routers get registered here as modules land, e.g.
     #   app.include_router(staff_router, prefix="/staff", tags=["staff"])
