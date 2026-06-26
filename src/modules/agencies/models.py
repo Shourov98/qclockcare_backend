@@ -33,6 +33,10 @@ from src.shared.domain.enums import AgencyStatus, ProgramType
 if TYPE_CHECKING:
     from src.modules.identity.models import UserRoleAssignment
     from src.modules.staff.models import StaffProfile
+    from src.modules.patients.models import (
+        GuardianProfile,
+        PatientProfile,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -73,6 +77,12 @@ class Agency(IdMixin, TimestampedMixin, SoftDeleteMixin, Base):
     )
     staff_profiles: Mapped[list["StaffProfile"]] = relationship(  # noqa: F821
         "StaffProfile", back_populates="agency", cascade="all, delete-orphan"
+    )
+    patient_profiles: Mapped[list["PatientProfile"]] = relationship(  # noqa: F821
+        "PatientProfile", back_populates="agency", cascade="all, delete-orphan"
+    )
+    guardian_profiles: Mapped[list["GuardianProfile"]] = relationship(  # noqa: F821
+        "GuardianProfile", back_populates="agency", cascade="all, delete-orphan"
     )
 
     __table_args__ = (
