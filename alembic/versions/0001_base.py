@@ -34,7 +34,7 @@ from sqlalchemy.dialects import postgresql
 from src.shared.domain.enum_mapping import ENUM_TYPE_NAMES
 
 # revision identifiers, used by Alembic.
-revision: str = "0001_extensions_enums_identity_agencies"
+revision: str = "0001_base"
 down_revision: str | Sequence[str] | None = None
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None

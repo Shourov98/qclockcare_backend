@@ -30,7 +30,15 @@ def test_migration_0001_exists() -> None:
     versions_dir = Path(__file__).resolve().parents[2] / "alembic" / "versions"
     files = list(versions_dir.glob("0001_*.py"))
     assert len(files) == 1, f"Expected exactly one 0001 migration, found {files}"
-    assert "extensions_enums" in files[0].name
+    assert "0001_base" in files[0].name, f"Expected 0001_base, got {files[0].name}"
+
+
+def test_migration_0002_exists() -> None:
+    """The RLS scaffold migration exists."""
+    versions_dir = Path(__file__).resolve().parents[2] / "alembic" / "versions"
+    files = list(versions_dir.glob("0002_*.py"))
+    assert len(files) == 1, f"Expected exactly one 0002 migration, found {files}"
+    assert "0002_rls" in files[0].name, f"Expected 0002_rls, got {files[0].name}"
 
 
 def test_alembic_ini_loads() -> None:

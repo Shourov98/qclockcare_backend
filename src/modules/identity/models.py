@@ -163,7 +163,9 @@ class UserRoleAssignment(IdMixin, TimestampedMixin, Base):
     )
 
     user: Mapped[User] = relationship(back_populates="roles")
-    agency: Mapped[Agency | None] = relationship(back_populates="user_roles")
+    agency: Mapped["Agency | None"] = relationship(  # noqa: F821
+        "Agency", back_populates="user_roles"
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -280,9 +282,90 @@ class AuthAuditEvent(IdMixin, Base):
     )
 
 
+# --------------------------------------------------------------------------
+# refresh_tokens
+# --------------------------------------------------------------------------
+class RefreshToken(Base):
+    """One row per issued refresh JWT (ADR-0016 §7.2).
+
+    `jti` is the JWT ID claim — unique, primary key. Revocation is
+    idempotent (`revoked_at` set once). Expired rows stay around for
+    forensics; the lookup query filters on `revoked_at IS NULL AND
+    expires_at > now()`.
+    """
+
+    __tablename__ = "refresh_tokens"
+
+    jti: Mapped[str] = mapped_column(Text, primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    issued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default="now()",
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    revoked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(INET(), nullable=True)
+
+    user: Mapped[User] = relationship()
+
+
+# --------------------------------------------------------------------------
+# single_use_tokens
+# --------------------------------------------------------------------------
+class SingleUseToken(Base):
+    """One row per issued invitation / password-reset token (ADR-0016 §7.3).
+
+    `purpose` is constrained to `'invitation' | 'password_reset'` at the DB
+    level (`ck_single_use_tokens_purpose`). `consumed_at` is set on first
+    valid use; `revoked_at` is set when we invalidate before consumption
+    (e.g. another token of the same purpose has been used).
+    """
+
+    __tablename__ = "single_use_tokens"
+
+    jti: Mapped[str] = mapped_column(Text, primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    purpose: Mapped[str] = mapped_column(Text, nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default="now()",
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    consumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    user: Mapped[User] = relationship()
+
+
 __all__ = [
     "AuthAuditEvent",
     "EmailVerificationOtp",
+    "RefreshToken",
+    "SingleUseToken",
     "User",
     "UserRoleAssignment",
 ]

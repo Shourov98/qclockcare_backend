@@ -26,6 +26,8 @@ from src.modules.agencies.models import (  # noqa: F401
 from src.modules.identity.models import (  # noqa: F401
     AuthAuditEvent,
     EmailVerificationOtp,
+    RefreshToken,
+    SingleUseToken,
     User,
     UserRoleAssignment,
 )
@@ -65,6 +67,8 @@ def run_migrations_offline() -> None:
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
         compare_server_default=True,
+        version_table="alembic_version",
+        version_table_pk_length=128,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -88,6 +92,8 @@ def run_migrations_online() -> None:
             target_metadata=target_metadata,
             compare_type=True,
             compare_server_default=True,
+            version_table="alembic_version",
+            version_table_pk_length=128,
         )
         with context.begin_transaction():
             context.run_migrations()

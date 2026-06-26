@@ -83,3 +83,8 @@ logs/
 # ---- Floci (local S3) ----
 .floci/
 floci_data/
+
+# ---- Supabase (local) ----
+# These directories are created at runtime by `supabase start` — never commit.
+supabase/.branches/
+supabase/.temp/
