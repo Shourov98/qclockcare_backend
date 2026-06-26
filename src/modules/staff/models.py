@@ -51,6 +51,7 @@ from src.shared.utils.datetime_utils import utc_now
 if TYPE_CHECKING:
     from src.modules.agencies.models import Agency
     from src.modules.identity.models import User
+    from src.modules.appointments.models import Appointment
 
 
 # --------------------------------------------------------------------------
@@ -105,6 +106,9 @@ class StaffProfile(IdMixin, TimestampedMixin, Base):
     availability: Mapped[list[StaffAvailability]] = relationship(
         back_populates="staff",
         cascade="all, delete-orphan",
+    )
+    appointments: Mapped[list["Appointment"]] = relationship(  # noqa: F821
+        "Appointment", back_populates="staff"
     )
 
     __table_args__ = (

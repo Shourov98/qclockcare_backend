@@ -45,6 +45,7 @@ from src.shared.utils.datetime_utils import utc_now
 if TYPE_CHECKING:
     from src.modules.agencies.models import Agency
     from src.modules.identity.models import User
+    from src.modules.appointments.models import Appointment
 
 
 # --------------------------------------------------------------------------
@@ -103,6 +104,9 @@ class PatientProfile(IdMixin, TimestampedMixin, Base):
     guardian_links: Mapped[list["PatientGuardianRelationship"]] = relationship(
         back_populates="patient",
         cascade="all, delete-orphan",
+    )
+    appointments: Mapped[list["Appointment"]] = relationship(  # noqa: F821
+        "Appointment", back_populates="patient", cascade="all, delete-orphan"
     )
 
     __table_args__ = (

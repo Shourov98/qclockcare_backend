@@ -37,6 +37,7 @@ if TYPE_CHECKING:
         GuardianProfile,
         PatientProfile,
     )
+    from src.modules.appointments.models import Appointment
 
 
 # --------------------------------------------------------------------------
@@ -83,6 +84,9 @@ class Agency(IdMixin, TimestampedMixin, SoftDeleteMixin, Base):
     )
     guardian_profiles: Mapped[list["GuardianProfile"]] = relationship(  # noqa: F821
         "GuardianProfile", back_populates="agency", cascade="all, delete-orphan"
+    )
+    appointments: Mapped[list["Appointment"]] = relationship(  # noqa: F821
+        "Appointment", back_populates="agency", cascade="all, delete-orphan"
     )
 
     __table_args__ = (
