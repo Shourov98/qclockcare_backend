@@ -32,6 +32,7 @@ from src.shared.domain.enums import AgencyStatus, ProgramType
 
 if TYPE_CHECKING:
     from src.modules.identity.models import UserRoleAssignment
+    from src.modules.staff.models import StaffProfile
 
 
 # --------------------------------------------------------------------------
@@ -69,6 +70,9 @@ class Agency(IdMixin, TimestampedMixin, SoftDeleteMixin, Base):
     agency_programs: Mapped[list[AgencyProgram]] = relationship(
         back_populates="agency",
         cascade="all, delete-orphan",
+    )
+    staff_profiles: Mapped[list["StaffProfile"]] = relationship(  # noqa: F821
+        "StaffProfile", back_populates="agency", cascade="all, delete-orphan"
     )
 
     __table_args__ = (
