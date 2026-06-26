@@ -27,6 +27,7 @@ from src.shared.domain.enums import (
     ServiceType,
 )
 
+
 # --------------------------------------------------------------------------
 # Appointment
 # --------------------------------------------------------------------------
@@ -43,12 +44,12 @@ class AppointmentCreateRequest(BaseModel):
     location: Annotated[str, StringConstraints(max_length=512)] | None = None
     notes: Annotated[str, StringConstraints(max_length=4000)] | None = None
     # Optional initial set of service items
-    service_items: list["AppointmentServiceItemCreateRequest"] = Field(
+    service_items: list[AppointmentServiceItemCreateRequest] = Field(
         default_factory=list
     )
 
     @model_validator(mode="after")
-    def _validate_window(self) -> "AppointmentCreateRequest":
+    def _validate_window(self) -> AppointmentCreateRequest:
         if self.scheduled_end <= self.scheduled_start:
             raise ValueError("scheduled_end must be after scheduled_start")
         return self
@@ -72,7 +73,7 @@ class AppointmentUpdateRequest(BaseModel):
     notes: Annotated[str, StringConstraints(max_length=4000)] | None = None
 
     @model_validator(mode="after")
-    def _validate_window(self) -> "AppointmentUpdateRequest":
+    def _validate_window(self) -> AppointmentUpdateRequest:
         if (
             self.scheduled_start is not None
             and self.scheduled_end is not None
@@ -126,7 +127,7 @@ class AppointmentResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     # Optional nested — populated only by GET /appointments/{id}/with-items
-    service_items: list["AppointmentServiceItemResponse"] | None = None
+    service_items: list[AppointmentServiceItemResponse] | None = None
 
 
 class AppointmentSummaryResponse(BaseModel):

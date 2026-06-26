@@ -29,6 +29,7 @@ import uuid
 import httpx
 import pytest
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from src.core.config import settings
 
@@ -38,7 +39,6 @@ BASE_URL = os.environ.get("QLOCKCARE_TEST_URL", "http://127.0.0.1:8001")
 # --------------------------------------------------------------------------
 # Per-test engine (avoids pytest-asyncio event-loop issues)
 # --------------------------------------------------------------------------
-from sqlalchemy.ext.asyncio import create_async_engine
 
 
 def _make_test_engine():
