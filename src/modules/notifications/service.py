@@ -17,7 +17,6 @@ Two halves:
 from __future__ import annotations
 
 import uuid
-from builtins import type as _type
 from datetime import UTC, datetime
 from typing import Any
 
@@ -42,8 +41,8 @@ async def dispatch_notification(
     title: str,
     body: str,
     metadata: dict[str, Any] | None = None,
-) -> Notification | None:
-    """Create a notification row for a single recipient and fan out.
+) -> tuple[Notification, list[tuple[Any, uuid.UUID]]] | None:
+    """Create a notification row + per-channel PENDING delivery rows.
 
     Returns None in two cases:
       - dedup: an equivalent (recipient + type + entity_id) notification
@@ -56,10 +55,13 @@ async def dispatch_notification(
 
     Otherwise:
       - Insert a `Notification` row with status SENT.
-      - Fan out to other enabled channels via `dispatch_multichannel`.
-        The multichannel call updates the row's status to DELIVERED
-        (any channel succeeded) or FAILED (all attempted channels
-        failed) before returning.
+      - Insert one `NotificationDelivery` row per available channel at
+        status=PENDING via `prepare_deliveries`.
+      - Return `(notification, deliveries)` where `deliveries` is a
+        list of `(channel, delivery_id)` tuples. The caller is
+        responsible for scheduling the network-call phase
+        (`dispatch_provider_phase`) via FastAPI's `BackgroundTasks` —
+        keeping the SMTP/Twilio call off the request thread.
 
     Caller is responsible for committing the surrounding transaction.
     """
@@ -112,26 +114,15 @@ async def dispatch_notification(
     session.add(notification)
     await session.flush()
 
-    # Fan out to other enabled channels (EMAIL/SMS/etc.). Per-channel
-    # try/except inside the dispatcher isolates provider crashes.
-    from src.modules.notifications.deliveries import dispatch_multichannel
+    # Prepare per-channel PENDING delivery rows. The provider network
+    # calls are deferred — see `dispatch_provider_phase` and
+    # `src/modules/notifications/background.py`.
+    from src.modules.notifications.deliveries import prepare_deliveries
 
-    try:
-        await dispatch_multichannel(session, notification=notification)
-    except Exception as exc:
-        from src.core.logging import get_logger
-
-        get_logger(__name__).error(
-            "notifications.dispatch_multichannel_failed",
-            notification_id=str(notification.id),
-            error=_type(exc).__name__,
-            detail=str(exc),
-        )
-        # Leave the row at SENT — the in-app delivery is real even if
-        # the multichannel fan-out crashed.
+    deliveries = await prepare_deliveries(session, notification=notification)
 
     await session.flush()
-    return notification
+    return notification, deliveries
 
 
 # --------------------------------------------------------------------------

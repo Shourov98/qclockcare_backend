@@ -35,7 +35,15 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request, Response, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.exceptions import CrossAgencyAccessDeniedError, ForbiddenError
@@ -172,6 +180,7 @@ def _to_response(
 async def create_visit_endpoint(
     payload: VisitCreateRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> VisitResponse:
@@ -207,10 +216,18 @@ async def create_visit_endpoint(
     except Exception:
         pass
     # Fan-out notification to patient + guardians (best-effort).
+    # In-app row + PENDING delivery rows are inserted synchronously;
+    # provider network calls (SMTP/Twilio) run on BackgroundTasks
+    # so an unreachable SMTP server cannot block the response.
     await notif_integrations.notify_visit_checked_in(
-        session, visit_id=visit.id, agency_id=agency_id
+        background_tasks,
+        session,
+        actor_user_id=ctx.user_id,
+        actor_agency_id=agency_id,
+        actor_role=ctx.role,
+        visit_id=visit.id,
+        agency_id=agency_id,
     )
-    await session.commit()
     return _to_response(visit, with_relations=True)
 
 
@@ -312,6 +329,7 @@ async def check_out_visit_endpoint(
     visit_id: uuid.UUID,
     payload: VisitCheckOutRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> VisitResponse:
@@ -323,8 +341,17 @@ async def check_out_visit_endpoint(
     await session.commit()
     await session.refresh(visit)
     # Fan-out notification to patient + guardians (best-effort).
+    # In-app row + PENDING delivery rows are inserted synchronously;
+    # provider network calls (SMTP/Twilio) run on BackgroundTasks
+    # so an unreachable SMTP server cannot block the response.
     await notif_integrations.notify_visit_checked_out(
-        session, visit_id=visit.id, agency_id=agency_id
+        background_tasks,
+        session,
+        actor_user_id=ctx.user_id,
+        actor_agency_id=agency_id,
+        actor_role=ctx.role,
+        visit_id=visit.id,
+        agency_id=agency_id,
     )
     # Audit
     try:
@@ -521,6 +548,7 @@ async def file_verification_endpoint(
     visit_id: uuid.UUID,
     payload: ServiceVerificationCreateRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> ServiceVerificationResponse:
@@ -553,14 +581,20 @@ async def file_verification_endpoint(
     )
     await session.commit()
     await session.refresh(verification)
-    # Notify the assigned staff (best-effort).
+    # Notify the assigned staff (best-effort). In-app row + PENDING
+    # delivery rows are inserted synchronously; provider network
+    # calls (SMTP/Twilio) run on BackgroundTasks so an unreachable
+    # SMTP server cannot block the response.
     await notif_integrations.notify_verification_status(
+        background_tasks,
         session,
+        actor_user_id=ctx.user_id,
+        actor_agency_id=agency_id,
+        actor_role=ctx.role,
         visit_id=visit_id,
         agency_id=agency_id,
         verified=(verification.status.value == "VERIFIED"),
     )
-    await session.commit()
     # Audit
     try:
         ip, ua = audit_logs_service.request_ip_ua(request)
@@ -621,6 +655,7 @@ async def add_visit_issue_endpoint(
     visit_id: uuid.UUID,
     payload: VisitIssueCreateRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> VisitIssueResponse:
@@ -639,14 +674,20 @@ async def add_visit_issue_endpoint(
     )
     await session.commit()
     await session.refresh(issue)
-    # Notify the assigned staff (best-effort).
+    # Notify the assigned staff (best-effort). In-app row + PENDING
+    # delivery rows are inserted synchronously; provider network
+    # calls (SMTP/Twilio) run on BackgroundTasks so an unreachable
+    # SMTP server cannot block the response.
     await notif_integrations.notify_visit_issue_filed(
+        background_tasks,
         session,
+        actor_user_id=ctx.user_id,
+        actor_agency_id=agency_id,
+        actor_role=ctx.role,
         visit_id=visit_id,
         agency_id=agency_id,
         issue_type=issue.issue_type,
     )
-    await session.commit()
     # Audit
     try:
         ip, ua = audit_logs_service.request_ip_ua(request)

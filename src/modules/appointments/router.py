@@ -23,10 +23,11 @@ Endpoints:
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.exceptions import CrossAgencyAccessDeniedError, ForbiddenError
@@ -54,6 +55,7 @@ from src.modules.identity.dependencies import (
     get_session_with_auth,
     require_role,
 )
+from src.modules.notifications import integrations as notif_integrations
 from src.shared.domain.enums import AppointmentStatus, AuditAction, UserRole
 from src.shared.schemas.pagination import build_offset_response
 
@@ -654,6 +656,7 @@ async def confirm_appointment_endpoint(
     appointment_id: uuid.UUID,
     payload: AppointmentConfirmRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> tuple[AppointmentResponse, AppointmentConfirmationResponse]:
@@ -697,6 +700,19 @@ async def confirm_appointment_endpoint(
         await session.commit()
     except Exception:
         pass
+    # Best-effort staff notification — provider call runs after the
+    # response is sent (see BackgroundTasks wiring in integrations.py).
+    if not payload.declined:
+        with contextlib.suppress(Exception):
+            await notif_integrations.notify_appointment_confirmed(
+                background_tasks,
+                session,
+                actor_user_id=ctx.user_id,
+                actor_agency_id=agency_id,
+                actor_role=ctx.role,
+                appointment_id=appt.id,
+                agency_id=agency_id,
+            )
     return _to_response(appt, with_items=False), AppointmentConfirmationResponse.model_validate(
         confirmation
     )
@@ -710,6 +726,7 @@ async def request_reschedule_endpoint(
     appointment_id: uuid.UUID,
     payload: AppointmentRescheduleRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> AppointmentResponse:
@@ -748,6 +765,19 @@ async def request_reschedule_endpoint(
         await session.commit()
     except Exception:
         pass
+    # Best-effort notification fan-out to staff + admins.
+    with contextlib.suppress(Exception):
+        await notif_integrations.notify_appointment_reschedule_requested(
+            background_tasks,
+            session,
+            actor_user_id=ctx.user_id,
+            actor_agency_id=agency_id,
+            actor_role=ctx.role,
+            appointment_id=appt.id,
+            agency_id=agency_id,
+            proposed_start=payload.proposed_start,
+            proposed_end=payload.proposed_end,
+        )
     return _to_response(appt, with_items=False)
 
 
@@ -759,6 +789,7 @@ async def request_cancellation_endpoint(
     appointment_id: uuid.UUID,
     payload: AppointmentCancellationRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> AppointmentResponse:
@@ -793,6 +824,19 @@ async def request_cancellation_endpoint(
         await session.commit()
     except Exception:
         pass
+    # Best-effort notification fan-out (in-app row durable before
+    # response returns; provider calls deferred to BackgroundTasks).
+    with contextlib.suppress(Exception):
+        await notif_integrations.notify_appointment_cancellation_requested(
+            background_tasks,
+            session,
+            actor_user_id=ctx.user_id,
+            actor_agency_id=agency_id,
+            actor_role=ctx.role,
+            appointment_id=appt.id,
+            agency_id=agency_id,
+            reason=payload.reason,
+        )
     return _to_response(appt, with_items=False)
 
 

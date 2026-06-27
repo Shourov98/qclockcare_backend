@@ -3,8 +3,18 @@ commit. Each helper resolves the relevant recipient user_ids and dispatches
 notifications through `notifications_service.dispatch_notification`.
 
 The functions are best-effort: they catch + log exceptions so a notification
-failure can never break the underlying write. Use `BackgroundTasks` from
-the router if you want true out-of-band dispatch (Phase 2).
+failure can never break the underlying write.
+
+Phase 1 split (this module):
+  - The synchronous half (`service.dispatch_notification` →
+    `deliveries.prepare_deliveries`) runs inline in the request thread.
+    It inserts the in-app `Notification` row + one PENDING
+    `NotificationDelivery` row per available channel, so the in-app
+    surface is durable before the HTTP response returns.
+  - The network-call half (`deliveries.dispatch_provider_phase`,
+    via `background.run_dispatch_in_background`) is scheduled on
+    FastAPI's `BackgroundTasks` so an unreachable SMTP server cannot
+    hang the request for tens of seconds.
 """
 
 from __future__ import annotations
@@ -12,11 +22,13 @@ from __future__ import annotations
 import uuid
 from datetime import date
 
+from fastapi import BackgroundTasks
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.logging import get_logger
 from src.modules.notifications import service as notifications_service
+from src.modules.notifications.background import run_dispatch_in_background
 from src.modules.patients.models import (
     PatientGuardianRelationship,
     PatientProfile,
@@ -26,6 +38,31 @@ from src.modules.visits.models import Visit
 from src.shared.domain.enums import NotificationType, UserRole
 
 log = get_logger(__name__)
+
+
+def _schedule_dispatch(
+    background_tasks: BackgroundTasks,
+    *,
+    actor_user_id: uuid.UUID,
+    actor_agency_id: uuid.UUID,
+    actor_role: UserRole,
+    notification_id: uuid.UUID,
+    deliveries: list[tuple[object, uuid.UUID]],
+) -> None:
+    """Schedule the provider-call phase on FastAPI's BackgroundTasks.
+
+    The actual `provider.send(...)` calls run after the HTTP response
+    is sent, so an unreachable SMTP server cannot block the request
+    thread. See `background.run_dispatch_in_background`.
+    """
+    background_tasks.add_task(
+        run_dispatch_in_background,
+        actor_user_id=actor_user_id,
+        actor_agency_id=actor_agency_id,
+        actor_role=actor_role,
+        notification_id=notification_id,
+        deliveries=deliveries,
+    )
 
 
 async def _recipient_ids_for_visit_patient(
@@ -88,12 +125,21 @@ async def _recipient_ids_for_visit_patient(
 
 
 async def notify_visit_checked_in(
+    background_tasks: BackgroundTasks,
     session: AsyncSession,
     *,
+    actor_user_id: uuid.UUID,
+    actor_agency_id: uuid.UUID,
+    actor_role: UserRole,
     visit_id: uuid.UUID,
     agency_id: uuid.UUID,
 ) -> None:
     """Fan out a VISIT_CHECKED_IN notification to the patient + their guardians.
+
+    The in-app Notification row + per-channel PENDING delivery rows
+    are inserted synchronously; the provider network calls
+    (EMAIL/SMS) are deferred to FastAPI's BackgroundTasks so an
+    unreachable SMTP server cannot block the request thread.
 
     Best-effort — exceptions are logged and swallowed.
     """
@@ -102,7 +148,7 @@ async def notify_visit_checked_in(
             session, visit_id=visit_id, agency_id=agency_id
         )
         for uid in user_ids:
-            await notifications_service.dispatch_notification(
+            result = await notifications_service.dispatch_notification(
                 session,
                 agency_id=agency_id,
                 recipient_user_id=uid,
@@ -114,6 +160,16 @@ async def notify_visit_checked_in(
                     "visit_id": str(visit_id),
                 },
             )
+            if result is not None:
+                notification, deliveries = result
+                _schedule_dispatch(
+                    background_tasks,
+                    actor_user_id=actor_user_id,
+                    actor_agency_id=actor_agency_id,
+                    actor_role=actor_role,
+                    notification_id=notification.id,
+                    deliveries=deliveries,
+                )
     except Exception as exc:
         log.warning(
             "notifications.notify_visit_checked_in_failed",
@@ -124,8 +180,12 @@ async def notify_visit_checked_in(
 
 
 async def notify_visit_checked_out(
+    background_tasks: BackgroundTasks,
     session: AsyncSession,
     *,
+    actor_user_id: uuid.UUID,
+    actor_agency_id: uuid.UUID,
+    actor_role: UserRole,
     visit_id: uuid.UUID,
     agency_id: uuid.UUID,
 ) -> None:
@@ -135,7 +195,7 @@ async def notify_visit_checked_out(
             session, visit_id=visit_id, agency_id=agency_id
         )
         for uid in user_ids:
-            await notifications_service.dispatch_notification(
+            result = await notifications_service.dispatch_notification(
                 session,
                 agency_id=agency_id,
                 recipient_user_id=uid,
@@ -147,6 +207,16 @@ async def notify_visit_checked_out(
                     "visit_id": str(visit_id),
                 },
             )
+            if result is not None:
+                notification, deliveries = result
+                _schedule_dispatch(
+                    background_tasks,
+                    actor_user_id=actor_user_id,
+                    actor_agency_id=actor_agency_id,
+                    actor_role=actor_role,
+                    notification_id=notification.id,
+                    deliveries=deliveries,
+                )
     except Exception as exc:
         log.warning(
             "notifications.notify_visit_checked_out_failed",
@@ -176,8 +246,12 @@ async def _staff_user_id_for_visit(
 
 
 async def notify_verification_status(
+    background_tasks: BackgroundTasks,
     session: AsyncSession,
     *,
+    actor_user_id: uuid.UUID,
+    actor_agency_id: uuid.UUID,
+    actor_role: UserRole,
     visit_id: uuid.UUID,
     agency_id: uuid.UUID,
     verified: bool,
@@ -190,7 +264,7 @@ async def notify_verification_status(
     if staff_user_id is None:
         return
     try:
-        await notifications_service.dispatch_notification(
+        result = await notifications_service.dispatch_notification(
             session,
             agency_id=agency_id,
             recipient_user_id=staff_user_id,
@@ -209,6 +283,16 @@ async def notify_verification_status(
             ),
             metadata={"entity_id": str(visit_id), "visit_id": str(visit_id)},
         )
+        if result is not None:
+            notification, deliveries = result
+            _schedule_dispatch(
+                background_tasks,
+                actor_user_id=actor_user_id,
+                actor_agency_id=actor_agency_id,
+                actor_role=actor_role,
+                notification_id=notification.id,
+                deliveries=deliveries,
+            )
     except Exception as exc:
         log.warning(
             "notifications.notify_verification_status_failed",
@@ -219,8 +303,12 @@ async def notify_verification_status(
 
 
 async def notify_visit_issue_filed(
+    background_tasks: BackgroundTasks,
     session: AsyncSession,
     *,
+    actor_user_id: uuid.UUID,
+    actor_agency_id: uuid.UUID,
+    actor_role: UserRole,
     visit_id: uuid.UUID,
     agency_id: uuid.UUID,
     issue_type: str,
@@ -230,7 +318,7 @@ async def notify_visit_issue_filed(
     if staff_user_id is None:
         return
     try:
-        await notifications_service.dispatch_notification(
+        result = await notifications_service.dispatch_notification(
             session,
             agency_id=agency_id,
             recipient_user_id=staff_user_id,
@@ -243,6 +331,16 @@ async def notify_visit_issue_filed(
                 "issue_type": issue_type,
             },
         )
+        if result is not None:
+            notification, deliveries = result
+            _schedule_dispatch(
+                background_tasks,
+                actor_user_id=actor_user_id,
+                actor_agency_id=actor_agency_id,
+                actor_role=actor_role,
+                notification_id=notification.id,
+                deliveries=deliveries,
+            )
     except Exception as exc:
         log.warning(
             "notifications.notify_visit_issue_filed_failed",
@@ -301,8 +399,12 @@ async def _agency_admin_user_ids(
 
 
 async def notify_appointment_confirmed(
+    background_tasks: BackgroundTasks,
     session: AsyncSession,
     *,
+    actor_user_id: uuid.UUID,
+    actor_agency_id: uuid.UUID,
+    actor_role: UserRole,
     appointment_id: uuid.UUID,
     agency_id: uuid.UUID,
 ) -> None:
@@ -313,7 +415,7 @@ async def notify_appointment_confirmed(
         )
         if staff_user_id is None:
             return
-        await notifications_service.dispatch_notification(
+        result = await notifications_service.dispatch_notification(
             session,
             agency_id=agency_id,
             recipient_user_id=staff_user_id,
@@ -322,6 +424,16 @@ async def notify_appointment_confirmed(
             body="The patient/guardian has confirmed this appointment.",
             metadata={"entity_id": str(appointment_id), "appointment_id": str(appointment_id)},
         )
+        if result is not None:
+            notification, deliveries = result
+            _schedule_dispatch(
+                background_tasks,
+                actor_user_id=actor_user_id,
+                actor_agency_id=actor_agency_id,
+                actor_role=actor_role,
+                notification_id=notification.id,
+                deliveries=deliveries,
+            )
     except Exception as exc:
         log.warning(
             "notifications.notify_appointment_confirmed_failed",
@@ -332,8 +444,12 @@ async def notify_appointment_confirmed(
 
 
 async def notify_appointment_reschedule_requested(
+    background_tasks: BackgroundTasks,
     session: AsyncSession,
     *,
+    actor_user_id: uuid.UUID,
+    actor_agency_id: uuid.UUID,
+    actor_role: UserRole,
     appointment_id: uuid.UUID,
     agency_id: uuid.UUID,
     proposed_start: object,
@@ -347,7 +463,7 @@ async def notify_appointment_reschedule_requested(
         admin_ids = await _agency_admin_user_ids(session, agency_id=agency_id)
         recipients = {uid for uid in (staff_user_id, *admin_ids) if uid is not None}
         for uid in recipients:
-            await notifications_service.dispatch_notification(
+            result = await notifications_service.dispatch_notification(
                 session,
                 agency_id=agency_id,
                 recipient_user_id=uid,
@@ -364,6 +480,16 @@ async def notify_appointment_reschedule_requested(
                     "proposed_end": str(proposed_end),
                 },
             )
+            if result is not None:
+                notification, deliveries = result
+                _schedule_dispatch(
+                    background_tasks,
+                    actor_user_id=actor_user_id,
+                    actor_agency_id=actor_agency_id,
+                    actor_role=actor_role,
+                    notification_id=notification.id,
+                    deliveries=deliveries,
+                )
     except Exception as exc:
         log.warning(
             "notifications.notify_appointment_reschedule_requested_failed",
@@ -374,8 +500,12 @@ async def notify_appointment_reschedule_requested(
 
 
 async def notify_appointment_cancellation_requested(
+    background_tasks: BackgroundTasks,
     session: AsyncSession,
     *,
+    actor_user_id: uuid.UUID,
+    actor_agency_id: uuid.UUID,
+    actor_role: UserRole,
     appointment_id: uuid.UUID,
     agency_id: uuid.UUID,
     reason: str,
@@ -384,7 +514,7 @@ async def notify_appointment_cancellation_requested(
     try:
         admin_ids = await _agency_admin_user_ids(session, agency_id=agency_id)
         for uid in admin_ids:
-            await notifications_service.dispatch_notification(
+            result = await notifications_service.dispatch_notification(
                 session,
                 agency_id=agency_id,
                 recipient_user_id=uid,
@@ -397,6 +527,16 @@ async def notify_appointment_cancellation_requested(
                     "reason": reason,
                 },
             )
+            if result is not None:
+                notification, deliveries = result
+                _schedule_dispatch(
+                    background_tasks,
+                    actor_user_id=actor_user_id,
+                    actor_agency_id=actor_agency_id,
+                    actor_role=actor_role,
+                    notification_id=notification.id,
+                    deliveries=deliveries,
+                )
     except Exception as exc:
         log.warning(
             "notifications.notify_appointment_cancellation_requested_failed",

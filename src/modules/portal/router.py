@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.logging import get_logger
@@ -116,6 +116,7 @@ async def verify_visit_endpoint(
     visit_id: uuid.UUID,
     payload: PortalVerifyRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> ServiceVerificationResponse:
@@ -128,14 +129,20 @@ async def verify_visit_endpoint(
     )
     await session.commit()
     await session.refresh(verification)
-    # Notify the assigned staff (best-effort).
+    # Notify the assigned staff (best-effort). In-app row + PENDING
+    # delivery rows are inserted synchronously; provider network
+    # calls (SMTP/Twilio) run on BackgroundTasks so an unreachable
+    # SMTP server cannot block the response.
     await notif_integrations.notify_verification_status(
+        background_tasks,
         session,
+        actor_user_id=ctx.user_id,
+        actor_agency_id=verification.agency_id,
+        actor_role=ctx.role,
         visit_id=visit_id,
         agency_id=verification.agency_id,
         verified=(verification.status.value == "VERIFIED"),
     )
-    await session.commit()
     # Best-effort audit log (never break the write path).
     try:
         ip, ua = audit_logs_service.request_ip_ua(request)
@@ -175,6 +182,7 @@ async def dispute_visit_endpoint(
     visit_id: uuid.UUID,
     payload: PortalDisputeRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> ServiceVerificationResponse:
@@ -188,14 +196,20 @@ async def dispute_visit_endpoint(
     )
     await session.commit()
     await session.refresh(verification)
-    # Notify the assigned staff (best-effort).
+    # Notify the assigned staff (best-effort). In-app row + PENDING
+    # delivery rows are inserted synchronously; provider network
+    # calls (SMTP/Twilio) run on BackgroundTasks so an unreachable
+    # SMTP server cannot block the response.
     await notif_integrations.notify_verification_status(
+        background_tasks,
         session,
+        actor_user_id=ctx.user_id,
+        actor_agency_id=verification.agency_id,
+        actor_role=ctx.role,
         visit_id=visit_id,
         agency_id=verification.agency_id,
         verified=False,
     )
-    await session.commit()
     # Best-effort audit log (never break the write path).
     try:
         ip, ua = audit_logs_service.request_ip_ua(request)
@@ -236,6 +250,7 @@ async def report_issue_endpoint(
     visit_id: uuid.UUID,
     payload: PortalReportIssueRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> VisitIssueResponse:
@@ -249,14 +264,20 @@ async def report_issue_endpoint(
     )
     await session.commit()
     await session.refresh(issue)
-    # Notify the assigned staff (best-effort).
+    # Notify the assigned staff (best-effort). In-app row + PENDING
+    # delivery rows are inserted synchronously; provider network
+    # calls (SMTP/Twilio) run on BackgroundTasks so an unreachable
+    # SMTP server cannot block the response.
     await notif_integrations.notify_visit_issue_filed(
+        background_tasks,
         session,
+        actor_user_id=ctx.user_id,
+        actor_agency_id=issue.agency_id,
+        actor_role=ctx.role,
         visit_id=visit_id,
         agency_id=issue.agency_id,
         issue_type=issue.issue_type,
     )
-    await session.commit()
     # Best-effort audit log (never break the write path).
     try:
         ip, ua = audit_logs_service.request_ip_ua(request)

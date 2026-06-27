@@ -1,25 +1,44 @@
-"""Multi-channel notification dispatcher.
+"""Multi-channel notification dispatcher — split into two phases.
 
-For one already-inserted `Notification` row, fans out to the set of
-channels the recipient is opted in to and writes one
-`NotificationDelivery` row per attempt.
+Phase 1 — `prepare_deliveries(session, notification)`:
+  Synchronous. Inserts one PENDING `NotificationDelivery` row per
+  available channel that the recipient is opted in to. Returns
+  `[(channel, delivery_id), ...]`. Called inside the request thread so
+  the in-app `Notification` row + per-channel delivery rows are durable
+  before the response returns.
 
-Ordering:
-  1. Caller (e.g. `service.dispatch_notification`) has inserted the
-     `Notification` row and flushed.
-  2. `dispatch_multichannel(session, notification=row)` is called in
-     the same session.
-  3. We look up prefs for `(recipient_user_id, type, channel)` for
-     each channel in `ProviderRegistry.enabled_channels()` plus IN_APP
-     (IN_APP is always enabled).
-  4. For each opted-in channel, call the provider and write a
-     `NotificationDelivery` row capturing success/failure.
-  5. The `Notification.status` is updated to `DELIVERED` if at least
-     one channel succeeded, `FAILED` otherwise.
+Phase 2 — `dispatch_provider_phase(session, notification, deliveries)`:
+  Background. For each `(channel, delivery_id)` from Phase 1, calls
+  `provider.send(...)` and UPDATEs the delivery row to DELIVERED or
+  FAILED. Flips the parent `Notification.status` to DELIVERED if any
+  channel succeeded, FAILED if all attempted channels failed.
 
-In-band only for Phase 1 — no background retry, no webhook callbacks.
-Per-channel try/except ensures a provider crash can't kill the whole
-dispatch; the next channel still runs.
+The split exists because the provider calls (EMAIL → SMTP,
+SMS → Twilio) are network-bound and can hang for tens of seconds when
+the upstream is unreachable. By deferring Phase 2 to FastAPI's
+`BackgroundTasks` (via `src/modules/notifications/background.py`), the
+HTTP response returns immediately and the slow provider call runs
+after the client has disconnected.
+
+Phase 1 ordering:
+  1. Caller (`service.dispatch_notification`) inserts the `Notification`
+     row and flushes.
+  2. `prepare_deliveries` runs in the same session, inserts one
+     `NotificationDelivery` row per channel at status=PENDING, flushes.
+
+Phase 2 ordering (in a background task on a fresh session):
+  1. `run_dispatch_in_background` reloads the `Notification` row by id,
+     establishes the actor's RLS context, and calls
+     `dispatch_provider_phase`.
+  2. For each delivery row: resolve the recipient's channel address
+     (email/phone), call `provider.send(...)`, UPDATE delivery row to
+     DELIVERED/FAILED.
+  3. After all channels run, update parent `Notification.status` based
+     on outcomes.
+  4. Commit.
+
+Per-channel try/except isolates provider crashes so one failing channel
+doesn't abort the rest.
 """
 
 from __future__ import annotations
@@ -155,28 +174,26 @@ async def _update_delivery_status(
     )
 
 
-async def dispatch_multichannel(
+async def prepare_deliveries(
     session: AsyncSession,
     *,
     notification: Notification,
-) -> None:
-    """Fan out one notification to every opted-in channel.
+) -> list[tuple[NotificationChannel, uuid.UUID]]:
+    """Phase 1 — insert one PENDING `NotificationDelivery` row per available
+    channel that the recipient is opted in to.
 
-    Updates `notification.status` based on outcomes:
-      - Any channel DELIVERED → status=DELIVERED
-      - All opted-in channels FAILED → status=FAILED
-      - User opted out of every channel → status unchanged
-        (the row stays SENT — the caller already marked it SENT, and
-        the in-app "delivery" is the row insert itself).
+    Returns the list of `(channel, delivery_id)` tuples that the
+    background task should process in Phase 2.
 
-    Per-channel try/except isolates provider crashes. Programmer
-    errors propagate (we don't want to swallow them silently).
+    Channels that are not physically enabled in this environment
+    (e.g. SMS when Twilio is not configured) are skipped, as are
+    channels the recipient has explicitly opted out of.
+
+    Called inside the request thread so the in-app `Notification` row
+    + delivery rows are durable before the HTTP response returns.
     """
-    # Channels that are *physically* available in this environment.
     available_channels = ProviderRegistry.enabled_channels()
-
-    any_succeeded = False
-    any_attempted = False
+    deliveries: list[tuple[NotificationChannel, uuid.UUID]] = []
 
     for channel in available_channels:
         opted_in = await _channel_opted_in(
@@ -199,7 +216,33 @@ async def dispatch_multichannel(
             notification_id=notification.id,
             channel=channel,
         )
+        deliveries.append((channel, delivery_id))
 
+    return deliveries
+
+
+async def dispatch_provider_phase(
+    session: AsyncSession,
+    *,
+    notification: Notification,
+    deliveries: list[tuple[NotificationChannel, uuid.UUID]],
+) -> None:
+    """Phase 2 — call each provider and UPDATE the delivery row to
+    DELIVERED/FAILED. Runs in a background task.
+
+    Updates `notification.status` based on outcomes:
+      - Any channel DELIVERED → status=DELIVERED
+      - All attempted channels FAILED → status=FAILED
+      - No channels attempted (empty `deliveries` list) → status
+        unchanged (row stays SENT).
+
+    Per-channel try/except isolates provider crashes. Programmer
+    errors propagate (we don't want to swallow them silently).
+    """
+    any_succeeded = False
+    any_attempted = False
+
+    for channel, delivery_id in deliveries:
         # Build the "to" address per channel.
         to_address = await _resolve_recipient_address(
             session,
@@ -213,6 +256,20 @@ async def dispatch_multichannel(
                 status_value=NotificationStatus.FAILED,
                 provider_message_id=None,
                 error=f"No {channel.value} address on file",
+            )
+            any_attempted = True
+            continue
+
+        provider: NotificationProvider | None = ProviderRegistry.get(channel)
+        if provider is None:
+            # Provider was removed between Phase 1 and Phase 2 — mark
+            # FAILED with a clear reason.
+            await _update_delivery_status(
+                session,
+                delivery_id=delivery_id,
+                status_value=NotificationStatus.FAILED,
+                provider_message_id=None,
+                error="Provider unavailable",
             )
             any_attempted = True
             continue
@@ -266,8 +323,7 @@ async def dispatch_multichannel(
         notification.status = NotificationStatus.DELIVERED
     elif any_attempted:
         notification.status = NotificationStatus.FAILED
-    # else: no channel attempted (user opted out of everything) — leave
-    # the row at SENT, which is the caller's pre-multichannel default.
+    # else: no channel attempted — leave the row at SENT.
 
 
 async def _resolve_recipient_address(
@@ -307,4 +363,4 @@ async def _resolve_recipient_address(
     return None
 
 
-__all__ = ["dispatch_multichannel"]
+__all__ = ["dispatch_provider_phase", "prepare_deliveries"]

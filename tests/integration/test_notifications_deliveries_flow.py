@@ -16,6 +16,7 @@ Skipped if no local Supabase is reachable.
 from __future__ import annotations
 
 import uuid
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -23,6 +24,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.core.config import settings
+from src.shared.domain.enums import NotificationChannel
 
 pytestmark = pytest.mark.asyncio
 
@@ -190,13 +192,22 @@ async def test_in_app_only_delivery_in_default_env() -> None:
 
 async def test_email_delivery_attempted_when_smtp_enabled() -> None:
     """With SMTP_ENABLED=true and no real SMTP server, EMAIL delivery
-    row is created and marked FAILED."""
+    row is created and marked FAILED.
+
+    Note: Phase 1 (the synchronous `dispatch_notification`) inserts the
+    PENDING delivery rows; the actual `provider.send(...)` call runs in
+    Phase 2 on a background task. This test invokes the background
+    phase directly so the assertion doesn't have to wait on
+    FastAPI's BackgroundTasks — we just call
+    `run_dispatch_in_background` here, the same code that the router
+    schedules via `background_tasks.add_task(...)`.
+    """
     test_engine = _make_test_engine()
     try:
         if not await _db_reachable(test_engine):
             pytest.skip("Database not reachable")
 
-        agency_id, _admin_id, patient_id = await _seed_agency_with_patient(test_engine)
+        agency_id, admin_id, patient_id = await _seed_agency_with_patient(test_engine)
 
         # Force SMTP_ENABLED=true and reset the registry so the new
         # setting is picked up.
@@ -209,6 +220,7 @@ async def test_email_delivery_attempted_when_smtp_enabled() -> None:
             mock_settings.SMTP_FROM_NAME = "QlockCare"
             mock_settings.SMTP_FROM_EMAIL = "noreply@qlockcare.local"
             mock_settings.SMTP_USE_TLS = False
+            mock_settings.SMTP_TIMEOUT_SECONDS = 2
             mock_settings.SMS_ENABLED = False
 
             from src.modules.notifications.channels import ProviderRegistry
@@ -216,11 +228,11 @@ async def test_email_delivery_attempted_when_smtp_enabled() -> None:
             ProviderRegistry._PROVIDERS = {}
 
             from src.modules.notifications.service import dispatch_notification
-            from src.shared.domain.enums import NotificationType
+            from src.shared.domain.enums import NotificationType, UserRole
 
             session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
             async with session_factory() as session, session.begin():
-                notif = await dispatch_notification(
+                result = await dispatch_notification(
                     session,
                     agency_id=uuid.UUID(agency_id),
                     recipient_user_id=uuid.UUID(patient_id),
@@ -229,8 +241,27 @@ async def test_email_delivery_attempted_when_smtp_enabled() -> None:
                     body="World",
                     metadata={"entity_id": str(uuid.uuid4())},
                 )
-                assert notif is not None
+                assert result is not None
+                notif, deliveries = result
                 notif_id = notif.id
+
+            # Phase 1 done — delivery rows are PENDING. Now run the
+            # background phase (the same function that
+            # BackgroundTasks.add_task(...) would schedule). We open a
+            # fresh session, re-establish RLS via set_session_context,
+            # and call the provider.
+            async with session_factory() as bg_session, bg_session.begin():
+                from src.modules.notifications.background import (
+                    run_dispatch_in_background,
+                )
+
+                await run_dispatch_in_background(
+                    actor_user_id=uuid.UUID(admin_id),
+                    actor_agency_id=uuid.UUID(agency_id),
+                    actor_role=UserRole.AGENCY_ADMIN,
+                    notification_id=notif_id,
+                    deliveries=deliveries,
+                )
 
         async with test_engine.begin() as conn:
             rows = (
@@ -250,6 +281,121 @@ async def test_email_delivery_attempted_when_smtp_enabled() -> None:
         assert by_channel["IN_APP"][1] == "DELIVERED"
         assert by_channel["EMAIL"][1] == "FAILED"
         assert by_channel["EMAIL"][2] is not None  # error message captured
+
+        await _cleanup(test_engine, agency_id)
+    finally:
+        await test_engine.dispose()
+
+
+async def test_request_thread_returns_before_smtp_completes() -> None:
+    """The whole point of the Phase 1 / Phase 2 split: the request
+    thread must NOT block on SMTP. We register a provider whose
+    `send` sleeps for 30 seconds (simulating an unreachable SMTP
+    server with the OS connect timeout). Then we assert that
+    `dispatch_notification` returns in well under that — proving the
+    request thread is no longer held hostage by the network call.
+
+    The provider is a sentinel: if `send` is ever called during
+    Phase 1, the test fails loudly with a clear message.
+    """
+    test_engine = _make_test_engine()
+    try:
+        if not await _db_reachable(test_engine):
+            pytest.skip("Database not reachable")
+
+        agency_id, _admin_id, patient_id = await _seed_agency_with_patient(test_engine)
+
+        # Register a "30-second-sleep" EmailProvider. Phase 1 must not
+        # call this. Phase 2 would, but we don't run Phase 2 in this
+        # test — we just need to confirm Phase 1 is decoupled.
+        sleep_seconds = 30
+
+        class _HangingProvider:
+            channel = NotificationChannel.EMAIL
+
+            async def send(self, **_: Any) -> Any:  # pragma: no cover
+                import asyncio
+
+                await asyncio.sleep(sleep_seconds)
+                raise AssertionError("Phase 2 reached — test should be done")
+
+        with patch("src.modules.notifications.channels.settings") as mock_settings:
+            mock_settings.SMTP_ENABLED = True
+            mock_settings.SMTP_HOST = "127.0.0.1"
+            mock_settings.SMTP_PORT = 25
+            mock_settings.SMTP_USERNAME = ""
+            mock_settings.SMTP_PASSWORD = None
+            mock_settings.SMTP_FROM_NAME = "QlockCare"
+            mock_settings.SMTP_FROM_EMAIL = "noreply@qlockcare.local"
+            mock_settings.SMTP_USE_TLS = False
+            mock_settings.SMTP_TIMEOUT_SECONDS = 1
+            mock_settings.SMS_ENABLED = False
+
+            from src.modules.notifications.channels import ProviderRegistry
+            from src.modules.notifications.service import dispatch_notification
+            from src.shared.domain.enums import NotificationType
+
+            # Force the registry to return our hanging provider for EMAIL.
+            ProviderRegistry._PROVIDERS = {
+                NotificationChannel.EMAIL: _HangingProvider(),
+                NotificationChannel.IN_APP: ProviderRegistry.get(
+                    NotificationChannel.IN_APP
+                ),
+                NotificationChannel.SMS: ProviderRegistry.get(
+                    NotificationChannel.SMS
+                ),
+            }
+
+            session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
+            import time
+
+            started = time.monotonic()
+            async with session_factory() as session, session.begin():
+                result = await dispatch_notification(
+                    session,
+                    agency_id=uuid.UUID(agency_id),
+                    recipient_user_id=uuid.UUID(patient_id),
+                    type=NotificationType.GENERIC,
+                    title="Hi",
+                    body="World",
+                    metadata={"entity_id": str(uuid.uuid4())},
+                )
+                assert result is not None
+                notif, deliveries = result
+            elapsed = time.monotonic() - started
+
+            # Phase 1 must return in <1s even though EMAIL provider
+            # would have slept for 30s. Generous bound: < 2s accounts
+            # for test runner / DB latency.
+            assert elapsed < 2.0, (
+                f"Phase 1 blocked for {elapsed:.2f}s — should be < 2s"
+            )
+
+            # EMAIL is in the returned deliveries list (the registry
+            # said it's enabled), but Phase 2 was never run, so the
+            # delivery row must still be PENDING in the DB.
+            assert any(
+                ch == NotificationChannel.EMAIL for ch, _ in deliveries
+            ), "EMAIL channel should have been queued for Phase 2"
+
+            async with test_engine.begin() as conn:
+                statuses = (
+                    await conn.execute(
+                        text(
+                            "SELECT channel, status FROM notification_deliveries "
+                            "WHERE notification_id = :n"
+                        ),
+                        {"n": str(notif.id)},
+                    )
+                ).all()
+            by_channel = {row[0]: row[1] for row in statuses}
+            assert by_channel.get("EMAIL") == "PENDING", (
+                "EMAIL row must be PENDING — Phase 1 never invokes the provider"
+            )
+            assert by_channel.get("IN_APP") == "PENDING", (
+                "IN_APP row is also PENDING at this point — it only flips "
+                "to DELIVERED after Phase 2 runs"
+            )
 
         await _cleanup(test_engine, agency_id)
     finally:

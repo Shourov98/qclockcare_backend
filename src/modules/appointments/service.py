@@ -1068,19 +1068,9 @@ async def confirm_appointment(
         user_agent=user_agent,
     )
 
-    # Best-effort staff notification (only on confirmed, not declined).
-    if not payload.declined:
-        try:
-            from src.modules.notifications.integrations import (
-                notify_appointment_confirmed,
-            )
-
-            await notify_appointment_confirmed(
-                session, appointment_id=appt.id, agency_id=agency_id
-            )
-        except Exception:
-            # Swallow — failures here must never break the write.
-            pass
+    # Best-effort staff notification (only on confirmed, not declined) is
+    # now scheduled by the router after commit via FastAPI BackgroundTasks,
+    # so the SMTP/Twilio call cannot block this endpoint.
 
     await session.flush()
     return appt, confirmation
@@ -1159,20 +1149,9 @@ async def request_reschedule(
         user_agent=user_agent,
     )
 
-    try:
-        from src.modules.notifications.integrations import (
-            notify_appointment_reschedule_requested,
-        )
-
-        await notify_appointment_reschedule_requested(
-            session,
-            appointment_id=appt.id,
-            agency_id=agency_id,
-            proposed_start=payload.proposed_start,
-            proposed_end=payload.proposed_end,
-        )
-    except Exception:
-        pass
+    # Best-effort reschedule notification is now scheduled by the
+    # router after commit via FastAPI BackgroundTasks, so the
+    # SMTP/Twilio call cannot block this endpoint.
 
     await session.flush()
     return appt
@@ -1247,19 +1226,9 @@ async def request_cancellation(
         user_agent=user_agent,
     )
 
-    try:
-        from src.modules.notifications.integrations import (
-            notify_appointment_cancellation_requested,
-        )
-
-        await notify_appointment_cancellation_requested(
-            session,
-            appointment_id=appt.id,
-            agency_id=agency_id,
-            reason=payload.reason,
-        )
-    except Exception:
-        pass
+    # Best-effort cancellation notification is now scheduled by the
+    # router after commit via FastAPI BackgroundTasks, so the
+    # SMTP/Twilio call cannot block this endpoint.
 
     await session.flush()
     return appt
