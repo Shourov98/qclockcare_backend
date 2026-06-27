@@ -26,7 +26,7 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Response, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.exceptions import CrossAgencyAccessDeniedError, ForbiddenError
@@ -43,12 +43,13 @@ from src.modules.appointments.schemas import (
     AppointmentSummaryResponse,
     AppointmentUpdateRequest,
 )
+from src.modules.audit_logs import service as audit_logs_service
 from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
     require_role,
 )
-from src.shared.domain.enums import AppointmentStatus, UserRole
+from src.shared.domain.enums import AppointmentStatus, AuditAction, UserRole
 from src.shared.schemas.pagination import build_offset_response
 
 logger = get_logger(__name__)
@@ -145,6 +146,7 @@ def _to_response(
 )
 async def create_appointment_endpoint(
     payload: AppointmentCreateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> AppointmentResponse:
@@ -158,6 +160,35 @@ async def create_appointment_endpoint(
     )
     await session.commit()
     await session.refresh(appt)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.CREATE,
+            entity_type="APPOINTMENT",
+            entity_id=appt.id,
+            new_data={
+                "patient_id": str(appt.patient_id),
+                "staff_id": str(appt.staff_id) if appt.staff_id else None,
+                "program_type": appt.program_type.value
+                if hasattr(appt.program_type, "value")
+                else str(appt.program_type),
+                "scheduled_start": appt.scheduled_start.isoformat()
+                if appt.scheduled_start
+                else None,
+                "scheduled_end": appt.scheduled_end.isoformat()
+                if appt.scheduled_end
+                else None,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return _to_response(appt, with_items=True)
 
 
@@ -256,6 +287,7 @@ async def get_appointment_with_items_endpoint(
 async def update_appointment_endpoint(
     appointment_id: uuid.UUID,
     payload: AppointmentUpdateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> AppointmentResponse:
@@ -266,6 +298,23 @@ async def update_appointment_endpoint(
     )
     await session.commit()
     await session.refresh(appt)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="APPOINTMENT",
+            entity_id=appt.id,
+            new_data=payload.model_dump(mode="json"),
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return _to_response(appt, with_items=False)
 
 
@@ -277,6 +326,7 @@ async def update_appointment_endpoint(
 async def cancel_appointment_endpoint(
     appointment_id: uuid.UUID,
     payload: AppointmentCancelRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> AppointmentResponse:
@@ -287,6 +337,26 @@ async def cancel_appointment_endpoint(
     )
     await session.commit()
     await session.refresh(appt)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.APPOINTMENT_CANCELLED,
+            entity_type="APPOINTMENT",
+            entity_id=appt.id,
+            new_data={
+                "reason_code": payload.reason_code,
+                "reason_text": payload.reason_text,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return _to_response(appt, with_items=False)
 
 
@@ -298,6 +368,7 @@ async def cancel_appointment_endpoint(
 async def transition_status_endpoint(
     appointment_id: uuid.UUID,
     payload: AppointmentStatusTransitionRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> AppointmentResponse:
@@ -313,6 +384,31 @@ async def transition_status_endpoint(
     )
     await session.commit()
     await session.refresh(appt)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.STATUS_TRANSITION,
+            entity_type="APPOINTMENT",
+            entity_id=appt.id,
+            new_data={
+                "from_status": payload.from_status.value
+                if hasattr(payload.from_status, "value")
+                else str(payload.from_status),
+                "to_status": payload.to_status.value
+                if hasattr(payload.to_status, "value")
+                else str(payload.to_status),
+                "note": payload.note,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return _to_response(appt, with_items=False)
 
 
@@ -324,6 +420,7 @@ async def transition_status_endpoint(
 async def assign_staff_endpoint(
     appointment_id: uuid.UUID,
     staff_id: uuid.UUID,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> AppointmentResponse:
@@ -337,6 +434,23 @@ async def assign_staff_endpoint(
     )
     await session.commit()
     await session.refresh(appt)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.APPOINTMENT_ASSIGNED,
+            entity_type="APPOINTMENT",
+            entity_id=appt.id,
+            new_data={"staff_id": str(staff_id)},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return _to_response(appt, with_items=False)
 
 
@@ -373,6 +487,7 @@ async def list_service_items_endpoint(
 async def add_service_item_endpoint(
     appointment_id: uuid.UUID,
     payload: AppointmentServiceItemCreateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> AppointmentServiceItemResponse:
@@ -383,6 +498,29 @@ async def add_service_item_endpoint(
     )
     await session.commit()
     await session.refresh(item)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.CREATE,
+            entity_type="APPOINTMENT_SERVICE_ITEM",
+            entity_id=item.id,
+            new_data={
+                "appointment_id": str(appointment_id),
+                "service_type": payload.service_type.value
+                if hasattr(payload.service_type, "value")
+                else str(payload.service_type),
+                "scheduled_minutes": payload.scheduled_minutes,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return AppointmentServiceItemResponse.model_validate(item)
 
 
@@ -395,6 +533,7 @@ async def update_service_item_endpoint(
     appointment_id: uuid.UUID,
     item_id: uuid.UUID,
     payload: AppointmentServiceItemUpdateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> AppointmentServiceItemResponse:
@@ -409,6 +548,26 @@ async def update_service_item_endpoint(
     )
     await session.commit()
     await session.refresh(item)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="APPOINTMENT_SERVICE_ITEM",
+            entity_id=item.id,
+            new_data={
+                "appointment_id": str(appointment_id),
+                **payload.model_dump(mode="json"),
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return AppointmentServiceItemResponse.model_validate(item)
 
 
@@ -420,6 +579,7 @@ async def update_service_item_endpoint(
 async def delete_service_item_endpoint(
     appointment_id: uuid.UUID,
     item_id: uuid.UUID,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> Response:
@@ -432,6 +592,23 @@ async def delete_service_item_endpoint(
         agency_id=agency_id,
     )
     await session.commit()
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.DELETE,
+            entity_type="APPOINTMENT_SERVICE_ITEM",
+            entity_id=item_id,
+            new_data={"appointment_id": str(appointment_id)},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

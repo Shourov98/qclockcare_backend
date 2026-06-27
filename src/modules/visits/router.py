@@ -35,11 +35,12 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Response, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.exceptions import CrossAgencyAccessDeniedError, ForbiddenError
 from src.core.logging import get_logger
+from src.modules.audit_logs import service as audit_logs_service
 from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
@@ -65,7 +66,7 @@ from src.modules.visits.schemas import (
     VisitStatusTransitionRequest,
     VisitSummaryResponse,
 )
-from src.shared.domain.enums import UserRole, VisitStatus
+from src.shared.domain.enums import AuditAction, UserRole, VisitStatus
 from src.shared.schemas.pagination import build_offset_response
 
 logger = get_logger(__name__)
@@ -170,6 +171,7 @@ def _to_response(
 )
 async def create_visit_endpoint(
     payload: VisitCreateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> VisitResponse:
@@ -183,6 +185,27 @@ async def create_visit_endpoint(
     )
     await session.commit()
     await session.refresh(visit, attribute_names=["service_items"])
+    # Audit (best-effort) — visit creation
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.VISIT_CHECKED_IN,
+            entity_type="VISIT",
+            entity_id=visit.id,
+            new_data={
+                "appointment_id": str(visit.appointment_id),
+                "staff_id": str(visit.staff_id),
+                "status": visit.status.value,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     # Fan-out notification to patient + guardians (best-effort).
     await notif_integrations.notify_visit_checked_in(
         session, visit_id=visit.id, agency_id=agency_id
@@ -288,6 +311,7 @@ async def check_in_visit_endpoint(
 async def check_out_visit_endpoint(
     visit_id: uuid.UUID,
     payload: VisitCheckOutRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> VisitResponse:
@@ -302,6 +326,25 @@ async def check_out_visit_endpoint(
     await notif_integrations.notify_visit_checked_out(
         session, visit_id=visit.id, agency_id=agency_id
     )
+    # Audit
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.VISIT_CHECKED_OUT,
+            entity_type="VISIT",
+            entity_id=visit.id,
+            new_data={
+                "duration_seconds": visit.duration_seconds,
+                "status": visit.status.value,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+    except Exception:
+        pass
     await session.commit()
     return _to_response(visit)
 
@@ -477,6 +520,7 @@ async def add_visit_note_endpoint(
 async def file_verification_endpoint(
     visit_id: uuid.UUID,
     payload: ServiceVerificationCreateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> ServiceVerificationResponse:
@@ -517,6 +561,31 @@ async def file_verification_endpoint(
         verified=(verification.status.value == "VERIFIED"),
     )
     await session.commit()
+    # Audit
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        action = (
+            AuditAction.SERVICE_VERIFIED
+            if verification.status.value == "VERIFIED"
+            else AuditAction.SERVICE_DISPUTED
+        )
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=action,
+            entity_type="SERVICE_VERIFICATION",
+            entity_id=verification.id,
+            new_data={
+                "visit_id": str(visit_id),
+                "status": verification.status.value,
+                "verifier_role": verification.verifier_role.value,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+    except Exception:
+        pass
     return ServiceVerificationResponse.model_validate(verification)
 
 
@@ -551,6 +620,7 @@ async def list_visit_issues_endpoint(
 async def add_visit_issue_endpoint(
     visit_id: uuid.UUID,
     payload: VisitIssueCreateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> VisitIssueResponse:
@@ -577,6 +647,25 @@ async def add_visit_issue_endpoint(
         issue_type=issue.issue_type,
     )
     await session.commit()
+    # Audit
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.CREATE,
+            entity_type="VISIT_ISSUE",
+            entity_id=issue.id,
+            new_data={
+                "visit_id": str(visit_id),
+                "issue_type": issue.issue_type,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+    except Exception:
+        pass
     return VisitIssueResponse.model_validate(issue)
 
 
@@ -589,11 +678,12 @@ async def resolve_visit_issue_endpoint(
     visit_id: uuid.UUID,
     issue_id: uuid.UUID,
     payload: VisitIssueResolveRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> VisitIssueResponse:
     """Mark an issue resolved (admin only)."""
-    _require_agency(ctx)
+    agency_id = _require_agency(ctx)
     issue = await visits_service.resolve_visit_issue(
         session,
         issue_id=issue_id,
@@ -603,6 +693,25 @@ async def resolve_visit_issue_endpoint(
     )
     await session.commit()
     await session.refresh(issue)
+    # Audit
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="VISIT_ISSUE",
+            entity_id=issue.id,
+            new_data={
+                "visit_id": str(visit_id),
+                "resolved": True,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+    except Exception:
+        pass
     return VisitIssueResponse.model_validate(issue)
 
 

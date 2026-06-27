@@ -30,11 +30,12 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path, Query, Response, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.exceptions import CrossAgencyAccessDeniedError, ForbiddenError
 from src.core.logging import get_logger
+from src.modules.audit_logs import service as audit_logs_service
 from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
@@ -53,9 +54,8 @@ from src.modules.staff.schemas import (
     StaffQualificationResponse,
     StaffQualificationUpdateRequest,
 )
-from src.shared.domain.enums import UserRole, UserStatus
+from src.shared.domain.enums import AuditAction, UserRole, UserStatus
 from src.shared.schemas.pagination import (
-    OffsetPagination,
     PaginatedResponse,
     build_offset_response,
 )
@@ -142,6 +142,7 @@ def _to_response(
 )
 async def create_staff_endpoint(
     payload: StaffProfileCreateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> StaffProfileResponse:
@@ -155,6 +156,26 @@ async def create_staff_endpoint(
     )
     await session.commit()
     await session.refresh(profile)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.CREATE,
+            entity_type="STAFF_PROFILE",
+            entity_id=profile.id,
+            new_data={
+                "staff_code": profile.staff_code,
+                "user_id": str(profile.user_id),
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return _to_response(profile, with_details=False)
 
 
@@ -231,6 +252,7 @@ async def get_staff_with_details_endpoint(
 async def update_staff_endpoint(
     staff_id: uuid.UUID,
     payload: StaffProfileUpdateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> StaffProfileResponse:
@@ -240,6 +262,23 @@ async def update_staff_endpoint(
     )
     await session.commit()
     await session.refresh(staff)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="STAFF_PROFILE",
+            entity_id=staff.id,
+            new_data=payload.model_dump(mode="json"),
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return _to_response(staff, with_details=False)
 
 
@@ -250,6 +289,7 @@ async def update_staff_endpoint(
 )
 async def archive_staff_endpoint(
     staff_id: uuid.UUID,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> StaffProfileResponse:
@@ -259,6 +299,23 @@ async def archive_staff_endpoint(
     )
     await session.commit()
     await session.refresh(staff)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.DELETE,
+            entity_type="STAFF_PROFILE",
+            entity_id=staff.id,
+            new_data={"status": staff.status.value if hasattr(staff.status, "value") else str(staff.status)},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return _to_response(staff, with_details=False)
 
 
@@ -294,6 +351,7 @@ async def list_qualifications_endpoint(
 async def add_qualification_endpoint(
     staff_id: uuid.UUID,
     payload: StaffQualificationCreateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> StaffQualificationResponse:
@@ -303,6 +361,26 @@ async def add_qualification_endpoint(
     )
     await session.commit()
     await session.refresh(qual)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.CREATE,
+            entity_type="STAFF_QUALIFICATION",
+            entity_id=qual.id,
+            new_data={
+                "staff_id": str(staff_id),
+                **payload.model_dump(mode="json"),
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return StaffQualificationResponse.model_validate(qual)
 
 
@@ -314,6 +392,7 @@ async def update_qualification_endpoint(
     staff_id: uuid.UUID,
     qualification_id: uuid.UUID,
     payload: StaffQualificationUpdateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> StaffQualificationResponse:
@@ -338,6 +417,23 @@ async def update_qualification_endpoint(
     )
     await session.commit()
     await session.refresh(qual)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="STAFF_QUALIFICATION",
+            entity_id=qual.id,
+            new_data={"staff_id": str(staff_id), **payload.model_dump(mode="json")},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return StaffQualificationResponse.model_validate(qual)
 
 
@@ -349,6 +445,7 @@ async def update_qualification_endpoint(
 async def revoke_qualification_endpoint(
     staff_id: uuid.UUID,
     qualification_id: uuid.UUID,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> Response:
@@ -360,6 +457,23 @@ async def revoke_qualification_endpoint(
         agency_id=agency_id,
     )
     await session.commit()
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.DELETE,
+            entity_type="STAFF_QUALIFICATION",
+            entity_id=qualification_id,
+            new_data={"staff_id": str(staff_id)},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -394,6 +508,7 @@ async def list_availability_endpoint(
 async def add_availability_endpoint(
     staff_id: uuid.UUID,
     payload: StaffAvailabilityCreateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> StaffAvailabilityResponse:
@@ -413,6 +528,23 @@ async def add_availability_endpoint(
     )
     await session.commit()
     await session.refresh(avail)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.CREATE,
+            entity_type="STAFF_AVAILABILITY",
+            entity_id=avail.id,
+            new_data={"staff_id": str(staff_id), **payload.model_dump(mode="json")},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return StaffAvailabilityResponse.model_validate(avail)
 
 
@@ -424,6 +556,7 @@ async def update_availability_endpoint(
     staff_id: uuid.UUID,
     availability_id: uuid.UUID,
     payload: StaffAvailabilityUpdateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> StaffAvailabilityResponse:
@@ -446,6 +579,23 @@ async def update_availability_endpoint(
     )
     await session.commit()
     await session.refresh(avail)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="STAFF_AVAILABILITY",
+            entity_id=avail.id,
+            new_data={"staff_id": str(staff_id), **payload.model_dump(mode="json")},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return StaffAvailabilityResponse.model_validate(avail)
 
 
@@ -456,6 +606,7 @@ async def update_availability_endpoint(
 async def delete_availability_endpoint(
     staff_id: uuid.UUID,
     availability_id: uuid.UUID,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> Response:
@@ -476,6 +627,23 @@ async def delete_availability_endpoint(
         agency_id=agency_id,
     )
     await session.commit()
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.DELETE,
+            entity_type="STAFF_AVAILABILITY",
+            entity_id=availability_id,
+            new_data={"staff_id": str(staff_id)},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

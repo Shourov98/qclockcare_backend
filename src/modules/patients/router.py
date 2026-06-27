@@ -29,11 +29,12 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Response, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.exceptions import CrossAgencyAccessDeniedError, ForbiddenError
 from src.core.logging import get_logger
+from src.modules.audit_logs import service as audit_logs_service
 from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
@@ -52,7 +53,7 @@ from src.modules.patients.schemas import (
     PatientProfileSummaryResponse,
     PatientProfileUpdateRequest,
 )
-from src.shared.domain.enums import UserRole, UserStatus
+from src.shared.domain.enums import AuditAction, UserRole, UserStatus
 from src.shared.schemas.pagination import build_offset_response
 
 logger = get_logger(__name__)
@@ -136,6 +137,7 @@ def _to_patient_response(
 )
 async def create_patient_endpoint(
     payload: PatientProfileCreateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> PatientProfileResponse:
@@ -148,6 +150,26 @@ async def create_patient_endpoint(
     )
     await session.commit()
     await session.refresh(patient)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.CREATE,
+            entity_type="PATIENT_PROFILE",
+            entity_id=patient.id,
+            new_data={
+                "patient_code": patient.patient_code,
+                "user_id": str(patient.user_id),
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return _to_patient_response(patient)
 
 
@@ -216,6 +238,7 @@ async def get_patient_with_relationships_endpoint(
 async def update_patient_endpoint(
     patient_id: uuid.UUID,
     payload: PatientProfileUpdateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> PatientProfileResponse:
@@ -225,6 +248,23 @@ async def update_patient_endpoint(
     )
     await session.commit()
     await session.refresh(patient)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="PATIENT_PROFILE",
+            entity_id=patient.id,
+            new_data=payload.model_dump(mode="json"),
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return _to_patient_response(patient)
 
 
@@ -235,6 +275,7 @@ async def update_patient_endpoint(
 )
 async def archive_patient_endpoint(
     patient_id: uuid.UUID,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> PatientProfileResponse:
@@ -244,6 +285,23 @@ async def archive_patient_endpoint(
     )
     await session.commit()
     await session.refresh(patient)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.DELETE,
+            entity_type="PATIENT_PROFILE",
+            entity_id=patient.id,
+            new_data={"status": patient.status.value if hasattr(patient.status, "value") else str(patient.status)},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return _to_patient_response(patient)
 
 
@@ -279,6 +337,7 @@ async def list_patient_guardians_endpoint(
 async def add_patient_guardian_endpoint(
     patient_id: uuid.UUID,
     payload: PatientGuardianRelationshipCreateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> PatientGuardianRelationshipResponse:
@@ -288,6 +347,29 @@ async def add_patient_guardian_endpoint(
     )
     await session.commit()
     await session.refresh(rel)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.LINK_PATIENT_GUARDIAN,
+            entity_type="PATIENT_GUARDIAN_RELATIONSHIP",
+            entity_id=rel.id,
+            new_data={
+                "patient_id": str(patient_id),
+                "guardian_id": str(rel.guardian_id),
+                "relationship_type": rel.relationship_type.value
+                if hasattr(rel.relationship_type, "value")
+                else str(rel.relationship_type),
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return PatientGuardianRelationshipResponse.model_validate(rel)
 
 
@@ -302,6 +384,7 @@ async def add_patient_guardian_endpoint(
 )
 async def create_guardian_endpoint(
     payload: GuardianProfileCreateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> GuardianProfileResponse:
@@ -314,6 +397,23 @@ async def create_guardian_endpoint(
     )
     await session.commit()
     await session.refresh(guardian)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.CREATE,
+            entity_type="GUARDIAN_PROFILE",
+            entity_id=guardian.id,
+            new_data={"user_id": str(guardian.user_id)},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return GuardianProfileResponse.model_validate(guardian)
 
 
@@ -360,6 +460,7 @@ async def get_guardian_endpoint(
 async def update_guardian_endpoint(
     guardian_id: uuid.UUID,
     payload: GuardianProfileUpdateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> GuardianProfileResponse:
@@ -369,6 +470,23 @@ async def update_guardian_endpoint(
     )
     await session.commit()
     await session.refresh(guardian)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="GUARDIAN_PROFILE",
+            entity_id=guardian.id,
+            new_data=payload.model_dump(mode="json"),
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return GuardianProfileResponse.model_validate(guardian)
 
 
@@ -379,6 +497,7 @@ async def update_guardian_endpoint(
 )
 async def archive_guardian_endpoint(
     guardian_id: uuid.UUID,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> GuardianProfileResponse:
@@ -388,6 +507,23 @@ async def archive_guardian_endpoint(
     )
     await session.commit()
     await session.refresh(guardian)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.DELETE,
+            entity_type="GUARDIAN_PROFILE",
+            entity_id=guardian.id,
+            new_data={"status": guardian.status.value if hasattr(guardian.status, "value") else str(guardian.status)},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return GuardianProfileResponse.model_validate(guardian)
 
 
@@ -402,6 +538,7 @@ async def archive_guardian_endpoint(
 async def update_patient_guardian_endpoint(
     relationship_id: uuid.UUID,
     payload: PatientGuardianRelationshipUpdateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> PatientGuardianRelationshipResponse:
@@ -414,6 +551,23 @@ async def update_patient_guardian_endpoint(
     )
     await session.commit()
     await session.refresh(rel)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="PATIENT_GUARDIAN_RELATIONSHIP",
+            entity_id=rel.id,
+            new_data=payload.model_dump(mode="json"),
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return PatientGuardianRelationshipResponse.model_validate(rel)
 
 
@@ -424,6 +578,7 @@ async def update_patient_guardian_endpoint(
 )
 async def delete_patient_guardian_endpoint(
     relationship_id: uuid.UUID,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> Response:
@@ -432,6 +587,23 @@ async def delete_patient_guardian_endpoint(
         session, relationship_id=relationship_id, agency_id=agency_id
     )
     await session.commit()
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UNLINK_PATIENT_GUARDIAN,
+            entity_type="PATIENT_GUARDIAN_RELATIONSHIP",
+            entity_id=relationship_id,
+            new_data={},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
