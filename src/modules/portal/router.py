@@ -10,10 +10,11 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.logging import get_logger
+from src.modules.audit_logs import service as audit_logs_service
 from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
@@ -31,6 +32,7 @@ from src.modules.visits.schemas import (
     ServiceVerificationResponse,
     VisitIssueResponse,
 )
+from src.shared.domain.enums import AuditAction
 
 router = APIRouter(prefix="/portal/visits", tags=["portal"])
 log = get_logger(__name__)
@@ -113,6 +115,7 @@ async def get_my_visit_endpoint(
 async def verify_visit_endpoint(
     visit_id: uuid.UUID,
     payload: PortalVerifyRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> ServiceVerificationResponse:
@@ -133,6 +136,27 @@ async def verify_visit_endpoint(
         verified=(verification.status.value == "VERIFIED"),
     )
     await session.commit()
+    # Best-effort audit log (never break the write path).
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=verification.agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.SERVICE_VERIFIED,
+            entity_type="SERVICE_VERIFICATION",
+            entity_id=verification.id,
+            new_data={
+                "visit_id": str(visit_id),
+                "status": verification.status.value,
+                "comment": payload.comment,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     log.info(
         "portal.verification.filed",
         visit_id=str(visit_id),
@@ -150,6 +174,7 @@ async def verify_visit_endpoint(
 async def dispute_visit_endpoint(
     visit_id: uuid.UUID,
     payload: PortalDisputeRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> ServiceVerificationResponse:
@@ -171,6 +196,28 @@ async def dispute_visit_endpoint(
         verified=False,
     )
     await session.commit()
+    # Best-effort audit log (never break the write path).
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=verification.agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.SERVICE_DISPUTED,
+            entity_type="SERVICE_VERIFICATION",
+            entity_id=verification.id,
+            new_data={
+                "visit_id": str(visit_id),
+                "status": verification.status.value,
+                "dispute_reason_code": payload.dispute_reason_code,
+                "comment": payload.comment,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     log.info(
         "portal.verification.disputed",
         visit_id=str(visit_id),
@@ -188,6 +235,7 @@ async def dispute_visit_endpoint(
 async def report_issue_endpoint(
     visit_id: uuid.UUID,
     payload: PortalReportIssueRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> VisitIssueResponse:
@@ -209,6 +257,27 @@ async def report_issue_endpoint(
         issue_type=issue.issue_type,
     )
     await session.commit()
+    # Best-effort audit log (never break the write path).
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=issue.agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.CREATE,
+            entity_type="VISIT_ISSUE",
+            entity_id=issue.id,
+            new_data={
+                "visit_id": str(visit_id),
+                "issue_type": payload.issue_type,
+                "comment": payload.comment,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     log.info(
         "portal.issue.filed",
         visit_id=str(visit_id),

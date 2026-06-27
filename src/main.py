@@ -39,6 +39,8 @@ from src.modules.appointments.models import (  # noqa: F401
     AppointmentServiceItem,
 )
 from src.modules.appointments.router import router as appointments_router
+from src.modules.audit_logs.models import AuditLog  # noqa: F401
+from src.modules.audit_logs.router import router as audit_logs_router
 from src.modules.identity.models import (  # noqa: F401
     AuthAuditEvent,
     EmailVerificationOtp,
@@ -229,6 +231,9 @@ def create_app() -> FastAPI:
 
     # Notifications — recipient-facing list/read endpoints.
     app.include_router(notifications_router)
+
+    # Audit logs — admin-facing list/get endpoints.
+    app.include_router(audit_logs_router)
 
     # NOTE: feature routers get registered here as modules land, e.g.
     #   app.include_router(staff_router, prefix="/staff", tags=["staff"])
