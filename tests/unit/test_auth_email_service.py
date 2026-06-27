@@ -240,6 +240,7 @@ class TestSendInBackground:
             mock_settings.LOG_INCLUDE_DEV_OTPS = False
             mock_settings.SMTP_FROM_NAME = "QlockCare"
             mock_settings.SMTP_FROM_EMAIL = "noreply@qlockcare.local"
+            mock_settings.SMTP_RETRY_MAX_ATTEMPTS = 1
             mock_scope.return_value = _null_scope()
 
             await _send_in_background(
@@ -280,6 +281,7 @@ class TestSendInBackground:
             mock_settings.LOG_INCLUDE_DEV_OTPS = True
             mock_settings.SMTP_FROM_NAME = "QlockCare"
             mock_settings.SMTP_FROM_EMAIL = "noreply@qlockcare.local"
+            mock_settings.SMTP_RETRY_MAX_ATTEMPTS = 1
             mock_scope.return_value = _null_scope()
 
             await _send_in_background(
@@ -325,6 +327,7 @@ class TestSendInBackground:
             mock_settings.LOG_INCLUDE_DEV_OTPS = False
             mock_settings.SMTP_FROM_NAME = "QlockCare"
             mock_settings.SMTP_FROM_EMAIL = "noreply@qlockcare.local"
+            mock_settings.SMTP_RETRY_MAX_ATTEMPTS = 1
             mock_scope.return_value = _null_scope()
 
             await _send_in_background(
@@ -364,6 +367,7 @@ class TestSendInBackground:
             mock_settings.LOG_INCLUDE_DEV_OTPS = False
             mock_settings.SMTP_FROM_NAME = "QlockCare"
             mock_settings.SMTP_FROM_EMAIL = "noreply@qlockcare.local"
+            mock_settings.SMTP_RETRY_MAX_ATTEMPTS = 1
             mock_scope.return_value = _null_scope()
 
             # Must not raise.

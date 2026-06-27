@@ -98,6 +98,19 @@ class Settings(BaseSettings):
     # Connect/send timeout for aiosmtplib. Background-task dispatch
     # also relies on this to avoid unbounded hangs in worker threads.
     SMTP_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=120)
+    # Retry policy for transactional auth emails (see
+    # src/modules/auth/email_service.py:_send_in_background). The
+    # background runner retries up to SMTP_RETRY_MAX_ATTEMPTS times
+    # with exponential backoff + jitter before giving up and logging
+    # at error level. The HTTP response is already flushed at this
+    # point, so the user is unaffected by retry duration. Set
+    # SMTP_RETRY_MAX_ATTEMPTS=1 to disable retries entirely.
+    SMTP_RETRY_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=10)
+    SMTP_RETRY_BASE_DELAY_SECONDS: float = Field(default=1.0, ge=0.0, le=60.0)
+    SMTP_RETRY_MAX_DELAY_SECONDS: float = Field(default=10.0, ge=0.0, le=600.0)
+    # Jitter as a fraction of the computed delay (+/-50% means the
+    # actual sleep is uniformly chosen from [0.5*base, 1.5*base]).
+    SMTP_RETRY_JITTER: float = Field(default=0.5, ge=0.0, le=1.0)
 
     # ----- Frontend (deep links in transactional emails) -----
     # Base URL of the SPA — used by transactional auth emails

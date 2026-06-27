@@ -44,6 +44,8 @@ accidentally ingest secrets. MUST stay False in production.
 
 from __future__ import annotations
 
+import asyncio
+import random
 import uuid
 from email.message import EmailMessage
 from typing import Final
@@ -195,16 +197,19 @@ async def _send_in_background(
     untrusted — it only matters if a future read-policy gates
     on `current_user_role`.
 
-    Never raises — exceptions are logged at error level. A failed
-    delivery row stays PENDING in our mental model: the request
-    thread has already returned 202, the user sees "sent=true",
-    and ops will see the failure in the application log.
+    Retries up to `settings.SMTP_RETRY_MAX_ATTEMPTS` times with
+    exponential backoff + jitter on `DeliveryResult(success=False)`.
+    On persistent failure, logs at error level and gives up — the
+    request thread has already returned 202, the user sees
+    "sent=true", and ops will see the failure in the application
+    log. Never raises.
     """
     # Dev escape hatch — log the OTP / reset token at INFO level so
     # local dev can complete the flow without configuring SMTP.
     # Logged with a clear "DEV ONLY" prefix and gated on
     # LOG_INCLUDE_DEV_OTPS so production log scanners do not ingest
-    # secrets.
+    # secrets. Runs once per request, before the retry loop, so we
+    # don't re-log secrets on retries.
     if settings.LOG_INCLUDE_DEV_OTPS and dev_otp_for_test_only:
         logger.info(
             f"auth.email.dev_{kind}_for_test_only",
@@ -215,34 +220,101 @@ async def _send_in_background(
             },
         )
 
-    try:
-        async with session_scope() as session:
-            await set_session_context(
-                session,
-                user_id=str(recipient_user_id),
-                agency_id=None,
-                user_role="SYSTEM",
-            )
-            # Lazy import — EmailProvider is constructed by the
-            # ProviderRegistry normally; we instantiate one directly
-            # here because transactional auth emails do not go
-            # through the multi-channel dispatcher.
-            from src.modules.notifications.channels import EmailProvider
+    last_error: str | None = None
+    recipient = str(message["To"])
+    max_attempts = settings.SMTP_RETRY_MAX_ATTEMPTS
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with session_scope() as session:
+                await set_session_context(
+                    session,
+                    user_id=str(recipient_user_id),
+                    agency_id=None,
+                    user_role="SYSTEM",
+                )
+                # Lazy import — EmailProvider is constructed by the
+                # ProviderRegistry normally; we instantiate one
+                # directly here because transactional auth emails do
+                # not go through the multi-channel dispatcher.
+                from src.modules.notifications.channels import EmailProvider
 
-            provider = EmailProvider()
-            await provider.send(
-                to=str(message["To"]),
-                subject=str(message["Subject"]),
-                body=_body_from_message(message),
-                metadata=None,
+                provider = EmailProvider()
+                result = await provider.send(
+                    to=recipient,
+                    subject=str(message["Subject"]),
+                    body=_body_from_message(message),
+                    metadata=None,
+                )
+            if result.success:
+                if attempt > 1:
+                    # Recovered after at least one failed attempt —
+                    # surface this so ops dashboards see the
+                    # retry actually paid off.
+                    logger.info(
+                        f"auth.email.{kind}_retry_succeeded",
+                        to=recipient,
+                        attempt=attempt,
+                        error=last_error,
+                    )
+                return
+            # Expected failure path — `EmailProvider.send` returned
+            # `success=False` instead of raising (this is the
+            # contract every provider follows).
+            last_error = result.error or "unknown error"
+        except Exception as exc:
+            # Backstop: `EmailProvider.send` is contractually not
+            # supposed to raise, but if it ever does (a future bug,
+            # aiohttp DNS weirdness, …), treat it as a transient
+            # failure and keep going. This way the retry loop still
+            # covers the unexpected case without propagating.
+            last_error = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                f"auth.email.{kind}_send_raised",
+                to=recipient,
+                attempt=attempt,
+                error=type(exc).__name__,
+                detail=str(exc),
             )
-    except Exception as exc:
-        logger.error(
-            f"auth.email.{kind}_send_failed",
-            to=str(message["To"]),
-            error=type(exc).__name__,
-            detail=str(exc),
-        )
+
+        if attempt < max_attempts:
+            delay = _compute_backoff_delay(attempt)
+            logger.warning(
+                f"auth.email.{kind}_send_failed",
+                to=recipient,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                delay_seconds=delay,
+                error=last_error,
+            )
+            await asyncio.sleep(delay)
+
+    # Exhausted all retries — log at error level so ops alerts fire.
+    logger.error(
+        f"auth.email.{kind}_send_exhausted",
+        to=recipient,
+        attempts=max_attempts,
+        error=last_error,
+    )
+
+
+def _compute_backoff_delay(attempt: int) -> float:
+    """Compute the sleep duration before retry `attempt + 1`.
+
+    Exponential backoff with jitter, capped at `SMTP_RETRY_MAX_DELAY_SECONDS`:
+
+        delay = min(base * 2 ** (attempt - 1), max_delay) * uniform(1 - jitter, 1 + jitter)
+
+    `attempt` is 1-indexed: `attempt=1` is the delay before the second
+    attempt (after the first failed attempt). Jitter spreads concurrent
+    retries so a recovering SMTP server doesn't get thundering-herded.
+
+    Pure function — no I/O — so it's trivially unit-testable.
+    """
+    base = settings.SMTP_RETRY_BASE_DELAY_SECONDS
+    max_delay = settings.SMTP_RETRY_MAX_DELAY_SECONDS
+    jitter = settings.SMTP_RETRY_JITTER
+    exp = min(base * (2 ** (attempt - 1)), max_delay)
+    return exp * random.uniform(1.0 - jitter, 1.0 + jitter)
 
 
 def _body_from_message(msg: EmailMessage) -> str:
