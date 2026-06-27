@@ -32,13 +32,14 @@ import contextlib
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
 from src.core.exceptions import CrossAgencyAccessDeniedError, ForbiddenError
 from src.core.logging import get_logger
 from src.modules.audit_logs import service as audit_logs_service
+from src.modules.auth import email_service as auth_email
 from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
@@ -181,21 +182,22 @@ async def _qualification_to_response(qual: object) -> StaffQualificationResponse
 async def create_staff_endpoint(
     payload: StaffProfileCreateRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> StaffProfileResponse:
     """Invite a new staff member at the caller's agency."""
     agency_id = _require_agency(ctx)
-    profile = await staff_service.create_staff(
+    result = await staff_service.create_staff(
         session,
         agency_id=agency_id,
         payload=payload,
         invited_by_user_id=ctx.user_id,
     )
     await session.commit()
-    await session.refresh(profile)
+    await session.refresh(result.profile)
     # Best-effort audit log.
-    try:
+    with contextlib.suppress(Exception):
         ip, ua = audit_logs_service.request_ip_ua(request)
         await audit_logs_service.audit_log(
             session,
@@ -203,18 +205,25 @@ async def create_staff_endpoint(
             actor_user_id=ctx.user_id,
             action=AuditAction.CREATE,
             entity_type="STAFF_PROFILE",
-            entity_id=profile.id,
+            entity_id=result.profile.id,
             new_data={
-                "staff_code": profile.staff_code,
-                "user_id": str(profile.user_id),
+                "staff_code": result.profile.staff_code,
+                "user_id": str(result.profile.user_id),
             },
             ip_address=ip,
             user_agent=ua,
         )
         await session.commit()
-    except Exception:
-        pass
-    return _to_response(profile, with_details=False)
+    # Schedule the invitation email after the response is flushed.
+    auth_email.send_invitation_email(
+        background_tasks,
+        to_email=result.email,
+        to_name=result.full_name,
+        invitation_token=result.invitation_token,
+        expires_in_days=settings.INVITATION_TOKEN_EXPIRY_DAYS,
+        recipient_user_id=result.user_id,
+    )
+    return _to_response(result.profile, with_details=False)
 
 
 @router.get(

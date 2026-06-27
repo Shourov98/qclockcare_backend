@@ -428,6 +428,51 @@ async def logout(
 
 
 # --------------------------------------------------------------------------
+# Invitation tokens
+# --------------------------------------------------------------------------
+async def issue_invitation_token(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+) -> tuple[str, str]:
+    """Issue a `SingleUseToken(purpose='invitation')` for `user_id`.
+
+    Returns `(plaintext_token, jti)`. The token is the value the
+    recipient pastes / clicks through to land on the SPA's
+    `/accept-invitation?token=…` page; the `jti` is the row's primary
+    key (used by `accept_invitation` to mark it consumed).
+
+    The TTL is sourced from
+    `settings.INVITATION_TOKEN_EXPIRY_DAYS` (default 7, range 1-30)
+    so operators have one knob to control invitation lifetime — the
+    `forgot_password` path hard-codes 2 h because password-reset is a
+    more sensitive, shorter-lived flow.
+
+    The caller is responsible for:
+      1. Scheduling the invitation email (use
+         `auth.email_service.send_invitation_email` with the returned
+         token).
+      2. Writing the `AuthAuditEventType.INVITATION_SENT` audit row
+         (the staff / patients services already do this).
+    """
+    ttl = timedelta(days=settings.INVITATION_TOKEN_EXPIRY_DAYS)
+    token, jti = jwt_service.issue_single_use_token(
+        purpose="invitation",
+        user_id=user_id,
+        ttl=ttl,
+    )
+    session.add(
+        SingleUseToken(
+            jti=jti,
+            user_id=user_id,
+            purpose="invitation",
+            expires_at=datetime.now(tz=UTC) + ttl,
+        )
+    )
+    return token, jti
+
+
+# --------------------------------------------------------------------------
 # Accept invitation
 # --------------------------------------------------------------------------
 async def accept_invitation(

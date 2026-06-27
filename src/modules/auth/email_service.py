@@ -1,9 +1,12 @@
-"""Transactional auth emails — OTP verify + password reset.
+"""Transactional auth emails — OTP verify, password reset, invitation.
 
 These are **not** domain notifications (visit check-in, appointment
 reschedule, etc.). They are direct user-facing transactional emails
 issued by the auth flow:
 
+  - Invitation email — sent when an admin invites a new staff,
+    patient, or guardian (`POST /staff`, `/patients`,
+    `/patients/{id}/guardians`).
   - OTP email — sent after `accept-invitation` and `resend-otp`.
   - Password reset email — sent after `forgot-password`.
 
@@ -15,25 +18,28 @@ block the request thread — same pattern as the just-shipped
 `notifications/background.py:run_dispatch_in_background`.
 
 Public API:
+  - `send_invitation_email(background_tasks, *, to_email, to_name,
+    invitation_token, expires_in_days)` — schedule an invitation
+    email.
   - `send_otp_email(background_tasks, *, to_email, to_name, otp,
     expires_in_minutes)` — schedule an OTP email.
   - `send_password_reset_email(background_tasks, *, to_email,
     to_name, reset_token, expires_in_minutes)` — schedule a reset
     link email.
 
-Both helpers build the `EmailMessage` synchronously and defer only
+All helpers build the `EmailMessage` synchronously and defer only
 the network call. The deep-link URL in the body uses
-`settings.FRONTEND_URL` so the SPA can deep-link to the verify/reset
-page with the OTP / token pre-filled.
+`settings.FRONTEND_URL` so the SPA can deep-link to the
+verify/reset/accept-invitation page with the OTP / token pre-filled.
 
 When SMTP is disabled (`SMTP_ENABLED=false`, the default in unit
 tests), `EmailProvider.send` returns a `DeliveryResult(success=False)`
 and the user is told "email sent" optimistically. Devs who need to
 test the flow end-to-end without configuring SMTP can set
-`LOG_INCLUDE_DEV_OTPS=true` — the OTP / reset token then appears in
-the application log at INFO level under a clearly-labelled
-`dev_*` field so production log scanners don't accidentally ingest
-secrets. MUST stay False in production.
+`LOG_INCLUDE_DEV_OTPS=true` — the OTP / reset token / invitation
+token then appears in the application log at INFO level under a
+clearly-labelled `dev_*` field so production log scanners don't
+accidentally ingest secrets. MUST stay False in production.
 """
 
 from __future__ import annotations
@@ -120,6 +126,49 @@ def _build_reset_email(
     msg["From"] = _from_address()
     msg["To"] = to_email
     msg["Subject"] = f"Reset your {_BRAND_NAME} password"
+    msg.set_content(body)
+    return msg
+
+
+def _build_invitation_email(
+    *,
+    to_email: str,
+    to_name: str | None,
+    invitation_token: str,
+    expires_in_days: int,
+) -> EmailMessage:
+    """Build the invitation email.
+
+    The deep-link points to `${FRONTEND_URL}/accept-invitation?token=…`
+    so the SPA can pre-fill the token when the recipient clicks
+    through. The body also includes the plaintext token as a fallback
+    for clients that strip query-string params (some corporate email
+    gateways do this for security).
+    """
+    query = urlencode({"token": invitation_token})
+    invite_url = f"{settings.FRONTEND_URL.rstrip('/')}/accept-invitation?{query}"
+
+    greeting = f"Hi {to_name}," if to_name else "Hi,"
+    body = (
+        f"{greeting}\n\n"
+        f"You've been invited to {_BRAND_NAME} — the home-care platform "
+        f"your team uses to schedule visits, track care plans, and "
+        f"coordinate with families. Click the link below to set your "
+        f"password and finish setting up your account. This invitation "
+        f"expires in {expires_in_days} days.\n\n"
+        f"  Accept your invitation: {invite_url}\n\n"
+        f"If the link doesn't work, paste this token into the "
+        f"accept-invitation page manually:\n"
+        f"  {invitation_token}\n\n"
+        f"If you weren't expecting this email, you can safely ignore "
+        f"it. The invitation will expire on its own.\n\n"
+        f"— The {_BRAND_NAME} team\n"
+    )
+
+    msg = EmailMessage()
+    msg["From"] = _from_address()
+    msg["To"] = to_email
+    msg["Subject"] = f"You've been invited to {_BRAND_NAME}"
     msg.set_content(body)
     return msg
 
@@ -266,7 +315,42 @@ def send_password_reset_email(
     )
 
 
+def send_invitation_email(
+    background_tasks: BackgroundTasks,
+    *,
+    to_email: str,
+    to_name: str | None,
+    invitation_token: str,
+    expires_in_days: int,
+    recipient_user_id: uuid.UUID,
+) -> None:
+    """Schedule an invitation email to be sent after the response.
+
+    Called by the staff / patients / patient-guardians routers after
+    `staff_service.create_staff` /
+    `patients_service.create_patient` /
+    `patients_service.create_guardian` issue a fresh
+    `SingleUseToken(purpose="invitation")`. The recipient gets a deep
+    link to `/accept-invitation?token=…` and a plaintext token fallback
+    for clients that strip query-string params.
+    """
+    message = _build_invitation_email(
+        to_email=to_email,
+        to_name=to_name,
+        invitation_token=invitation_token,
+        expires_in_days=expires_in_days,
+    )
+    background_tasks.add_task(
+        _send_in_background,
+        recipient_user_id=recipient_user_id,
+        message=message,
+        dev_otp_for_test_only=invitation_token,
+        kind="invitation",
+    )
+
+
 __all__ = [
+    "send_invitation_email",
     "send_otp_email",
     "send_password_reset_email",
 ]
