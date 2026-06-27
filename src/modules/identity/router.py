@@ -4,7 +4,7 @@ Endpoints:
   POST /auth/login                  → {access, refresh, ...}
   POST /auth/refresh                → {access, refresh, ...}
   POST /auth/logout                 → 204
-  POST /auth/accept-invitation      → {sent: true, expires_in}
+  POST /auth/accept-invitation      → {accepted, email, otp_sent}
   POST /auth/verify-email           → {access, refresh, ...}
   POST /auth/resend-otp             → {sent, cooldown_seconds_remaining}
   POST /auth/forgot-password        → {sent: true}
@@ -14,6 +14,11 @@ Endpoints:
 All routes use the public `get_session` dependency (no auth required).
 `/auth/me` uses `get_session_with_auth` so it both authenticates and
 sets RLS GUCs in one go.
+
+Every route attaches `summary=` (short), `description=` (long-form
+markdown), and `responses=` (pre-wired 401/403/422 examples via
+`standard_responses(...)`) so `/docs` shows the operation in the
+sidebar with realistic payloads.
 """
 
 from __future__ import annotations
@@ -44,6 +49,7 @@ from src.modules.identity.schemas import (
     VerifyEmailRequest,
     VerifyEmailResponse,
 )
+from src.shared.schemas.docs import standard_responses
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -59,7 +65,19 @@ def _user_agent(request: Request) -> str | None:
 # --------------------------------------------------------------------------
 # Login
 # --------------------------------------------------------------------------
-@router.post("/login", response_model=TokenPair)
+@router.post(
+    "/login",
+    response_model=TokenPair,
+    responses=standard_responses(include=[401, 422]),
+    summary="Log in with email and password",
+    description=(
+        "Authenticates a user with email + password and returns an "
+        "access/refresh token pair. The access token is short-lived "
+        "(default 15 minutes); the refresh token is long-lived "
+        "(default 30 days). 5 consecutive failures lock the account "
+        "for `settings.ACCOUNT_LOCKOUT_MINUTES` minutes."
+    ),
+)
 async def login_endpoint(
     payload: LoginRequest,
     request: Request,
@@ -83,7 +101,17 @@ async def login_endpoint(
 # --------------------------------------------------------------------------
 # Refresh
 # --------------------------------------------------------------------------
-@router.post("/refresh", response_model=TokenPair)
+@router.post(
+    "/refresh",
+    response_model=TokenPair,
+    responses=standard_responses(include=[401, 422]),
+    summary="Mint a fresh access token",
+    description=(
+        "Exchanges a valid refresh token for a new access/refresh pair. "
+        "The refresh token is **rotated** — store the new value and "
+        "discard the old one. Old refresh tokens cannot be reused."
+    ),
+)
 async def refresh_endpoint(
     payload: RefreshRequest,
     request: Request,
@@ -106,7 +134,19 @@ async def refresh_endpoint(
 # --------------------------------------------------------------------------
 # Logout
 # --------------------------------------------------------------------------
-@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+@router.post(
+    "/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses=standard_responses(include=[401, 422]),
+    summary="Log out (revoke refresh token)",
+    description=(
+        "Revokes the supplied refresh token (or all active refresh "
+        "tokens if `refresh_token` is omitted — useful for "
+        "\"log out everywhere\"). The access token in the "
+        "`Authorization` header is unaffected and remains valid until "
+        "its own expiry."
+    ),
+)
 async def logout_endpoint(
     payload: LogoutRequest,
     request: Request,
@@ -128,6 +168,15 @@ async def logout_endpoint(
 @router.post(
     "/accept-invitation",
     status_code=status.HTTP_202_ACCEPTED,
+    responses=standard_responses(include=[401, 404, 409, 422]),
+    summary="Accept an invitation and set a password",
+    description=(
+        "Step 1 of onboarding. The invitee submits the token from "
+        "their invitation email and a new password that satisfies the "
+        "project password policy. On success a 6-digit OTP is sent to "
+        "the invitee's email via the background SMTP runner — the "
+        "client should immediately follow up with `POST /auth/verify-email`."
+    ),
 )
 async def accept_invitation_endpoint(
     payload: AcceptInvitationRequest,
@@ -167,7 +216,18 @@ async def accept_invitation_endpoint(
 # --------------------------------------------------------------------------
 # Verify email (step 2 of onboarding)
 # --------------------------------------------------------------------------
-@router.post("/verify-email", response_model=VerifyEmailResponse)
+@router.post(
+    "/verify-email",
+    response_model=VerifyEmailResponse,
+    responses=standard_responses(include=[401, 422]),
+    summary="Verify the OTP and receive a session",
+    description=(
+        "Step 2 of onboarding. Submits the 6-digit code from the "
+        "welcome email. On success returns a fresh access/refresh "
+        "token pair and marks the user's email as verified. "
+        "Account is locked after 5 failed attempts."
+    ),
+)
 async def verify_email_endpoint(
     payload: VerifyEmailRequest,
     request: Request,
@@ -191,7 +251,19 @@ async def verify_email_endpoint(
 # --------------------------------------------------------------------------
 # Resend OTP
 # --------------------------------------------------------------------------
-@router.post("/resend-otp", response_model=ResendOtpResponse)
+@router.post(
+    "/resend-otp",
+    response_model=ResendOtpResponse,
+    responses=standard_responses(include=[422]),
+    summary="Resend the verification OTP",
+    description=(
+        "Issues a fresh OTP to the given email if (a) the account "
+        "exists, (b) it isn't already verified, and (c) the cooldown "
+        "has elapsed. Returns the same `sent=true` shape either way "
+        "to avoid leaking account presence. `cooldown_seconds_remaining` "
+        "tells the client how long to wait before the next request."
+    ),
+)
 async def resend_otp_endpoint(
     payload: ResendOtpRequest,
     request: Request,
@@ -227,6 +299,13 @@ async def resend_otp_endpoint(
     "/forgot-password",
     response_model=ForgotPasswordResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    responses=standard_responses(include=[422]),
+    summary="Request a password-reset link",
+    description=(
+        "Sends a password-reset link to the given email if the "
+        "account exists. Returns `sent=true` either way to avoid "
+        "leaking account presence. Reset tokens expire after 2 hours."
+    ),
 )
 async def forgot_password_endpoint(
     payload: ForgotPasswordRequest,
@@ -265,6 +344,14 @@ async def forgot_password_endpoint(
 @router.post(
     "/reset-password",
     status_code=status.HTTP_204_NO_CONTENT,
+    responses=standard_responses(include=[401, 422]),
+    summary="Set a new password with a reset token",
+    description=(
+        "Consumes a reset token (from the password-reset email) and "
+        "sets a new password that satisfies the project password "
+        "policy. The token is single-use; subsequent attempts return "
+        "`INVALID_RESET_TOKEN`."
+    ),
 )
 async def reset_password_endpoint(
     payload: ResetPasswordRequest,
@@ -283,7 +370,16 @@ async def reset_password_endpoint(
 # --------------------------------------------------------------------------
 # Me
 # --------------------------------------------------------------------------
-@router.get("/me", response_model=MeResponse)
+@router.get(
+    "/me",
+    response_model=MeResponse,
+    responses=standard_responses(include=[401, 403]),
+    summary="Get the currently authenticated user",
+    description=(
+        "Returns the `CurrentUser` derived from the bearer token. "
+        "Use this on app load to bootstrap the SPA's user state."
+    ),
+)
 async def me_endpoint(
     ctx: CurrentAuth,
     session: AsyncSession = Depends(get_session_with_auth),

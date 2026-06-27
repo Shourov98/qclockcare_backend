@@ -205,17 +205,26 @@ def _envelope(
     request_id: str,
     details: dict[str, Any] | list[Any] | None = None,
 ) -> dict[str, Any]:
-    body: dict[str, Any] = {
-        "error": {
-            "code": code,
-            "message": message,
-            "request_id": request_id,
-            "timestamp": _now_iso(),
-        }
-    }
-    if details is not None:
-        body["error"]["details"] = details
-    return body
+    """Build the error envelope dict on the wire.
+
+    Delegates to the typed `ErrorResponse` model in
+    `src/shared/schemas/error.py` so the runtime JSON and the
+    OpenAPI schema (`/openapi.json`) share a single source of
+    truth — a field added to the model automatically appears in
+    both. `exclude_none=True` keeps the body compact when `details`
+    isn't provided.
+    """
+    # Local import: `exceptions.py` is imported very early in the
+    # app lifespan and the schemas layer pulls in pydantic + typing
+    # we don't need at module-load time.
+    from src.shared.schemas.error import build_error_envelope
+
+    return build_error_envelope(
+        code=code,
+        message=message,
+        request_id=request_id,
+        details=details,
+    ).model_dump(mode="json", exclude_none=True)
 
 
 # --------------------------------------------------------------------------
