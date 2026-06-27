@@ -41,11 +41,11 @@ from src.shared.domain.enums import AuthAuditEventType, UserRole, UserStatus
 
 if TYPE_CHECKING:
     from src.modules.agencies.models import Agency
-    from src.modules.staff.models import StaffProfile
     from src.modules.patients.models import (
         GuardianProfile,
         PatientProfile,
     )
+    from src.modules.staff.models import StaffProfile
 
 
 # --------------------------------------------------------------------------
@@ -120,13 +120,13 @@ class User(IdMixin, TimestampedMixin, SoftDeleteMixin, Base):
         back_populates="user",
         cascade="all, delete-orphan",
     )
-    staff_profiles: Mapped[list["StaffProfile"]] = relationship(  # noqa: F821
+    staff_profiles: Mapped[list[StaffProfile]] = relationship(
         "StaffProfile", back_populates="user", cascade="all, delete-orphan"
     )
-    patient_profiles: Mapped[list["PatientProfile"]] = relationship(  # noqa: F821
+    patient_profiles: Mapped[list[PatientProfile]] = relationship(
         "PatientProfile", back_populates="user", cascade="all, delete-orphan"
     )
-    guardian_profiles: Mapped[list["GuardianProfile"]] = relationship(  # noqa: F821
+    guardian_profiles: Mapped[list[GuardianProfile]] = relationship(
         "GuardianProfile", back_populates="user", cascade="all, delete-orphan"
     )
 
@@ -177,7 +177,7 @@ class UserRoleAssignment(IdMixin, TimestampedMixin, Base):
     )
 
     user: Mapped[User] = relationship(back_populates="roles")
-    agency: Mapped["Agency | None"] = relationship(  # noqa: F821
+    agency: Mapped[Agency | None] = relationship(
         "Agency", back_populates="user_roles"
     )
 

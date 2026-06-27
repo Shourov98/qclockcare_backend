@@ -88,7 +88,7 @@ async def get_session_with_auth(
                     detail="Account disabled.",
                 )
             # Attach the auth context to the request for downstream handlers
-            from src.modules.identity.auth_service import _to_current_user, _pick_primary_role
+            from src.modules.identity.auth_service import _pick_primary_role, _to_current_user
 
             role, agency_id = _pick_primary_role(user.roles)
             request.state.auth = AuthContext(
@@ -115,7 +115,7 @@ def get_current_auth(
     # We depend on get_session_with_auth so FastAPI resolves the auth-bearing
     # session FIRST and populates `request.state.auth` before this runs.
     # The session itself is discarded — we only need the side effect.
-    _session: AsyncSession = Depends(get_session_with_auth),  # noqa: ARG001
+    _session: AsyncSession = Depends(get_session_with_auth),
 ) -> AuthContext:
     """Return the AuthContext populated by `get_session_with_auth`.
 

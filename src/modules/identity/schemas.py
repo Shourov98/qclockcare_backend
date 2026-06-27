@@ -58,7 +58,7 @@ class TokenPair(BaseModel):
     expires_in: int = Field(
         description="Access-token lifetime in seconds (mirrors JWT_ACCESS_TOKEN_TTL_MINUTES)."
     )
-    user: "CurrentUser"
+    user: CurrentUser
 
 
 class CurrentUser(BaseModel):
