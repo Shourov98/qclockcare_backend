@@ -270,6 +270,7 @@ async def list_visits(
     agency_id: uuid.UUID,
     appointment_id: uuid.UUID | None = None,
     staff_id: uuid.UUID | None = None,
+    patient_id: uuid.UUID | None = None,
     status_filter: VisitStatus | None = None,
     page: int = 1,
     page_size: int = 20,
@@ -289,6 +290,16 @@ async def list_visits(
     if staff_id is not None:
         base = base.where(Visit.staff_id == staff_id)
         count_base = count_base.where(Visit.staff_id == staff_id)
+    if patient_id is not None:
+        # Filter through the appointment join.
+        from src.modules.appointments.models import Appointment
+
+        base = base.join(
+            Appointment, Appointment.id == Visit.appointment_id
+        ).where(Appointment.patient_id == patient_id)
+        count_base = count_base.join(
+            Appointment, Appointment.id == Visit.appointment_id
+        ).where(Appointment.patient_id == patient_id)
     if status_filter is not None:
         base = base.where(Visit.status == status_filter)
         count_base = count_base.where(Visit.status == status_filter)
