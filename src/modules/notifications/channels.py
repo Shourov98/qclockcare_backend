@@ -134,6 +134,7 @@ class EmailProvider(NotificationProvider):
                     else None
                 ),
                 use_tls=settings.SMTP_USE_TLS,
+                timeout=settings.SMTP_TIMEOUT_SECONDS,
             )
         except Exception as exc:
             log.warning(

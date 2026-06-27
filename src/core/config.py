@@ -95,6 +95,9 @@ class Settings(BaseSettings):
     SMTP_FROM_EMAIL: str = "noreply@qlockcare.local"
     SMTP_FROM_NAME: str = "QlockCare"
     SMTP_USE_TLS: bool = False
+    # Connect/send timeout for aiosmtplib. Background-task dispatch
+    # also relies on this to avoid unbounded hangs in worker threads.
+    SMTP_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=120)
 
     # ----- SMS (Twilio) — Phase 2 -----
     SMS_ENABLED: bool = False
