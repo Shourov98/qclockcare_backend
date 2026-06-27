@@ -52,6 +52,11 @@ class StorageAdapter(ABC):
         """Generate a time-limited URL for direct client access.
 
         `method="PUT"` for uploads, `"GET"` for downloads.
+
+        The 900 s default here is a local safety net only. Production
+        callers should source `expires_in` from
+        `settings.S3_PRESIGNED_URL_TTL_SECONDS` (the canonical setting
+        shared by both adapters).
         """
 
     @abstractmethod
