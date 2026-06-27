@@ -50,6 +50,8 @@ from src.modules.identity.models import (  # noqa: F401
     UserRoleAssignment,
 )
 from src.modules.identity.router import router as auth_router
+from src.modules.locations.models import Location  # noqa: F401
+from src.modules.locations.router import router as locations_router
 from src.modules.notifications.models import Notification  # noqa: F401
 from src.modules.notifications.router import router as notifications_router
 from src.modules.patients.models import (  # noqa: F401
@@ -231,6 +233,9 @@ def create_app() -> FastAPI:
 
     # Notifications — recipient-facing list/read endpoints.
     app.include_router(notifications_router)
+
+    # Locations — service-delivery addresses (used by appointments/visits).
+    app.include_router(locations_router)
 
     # Audit logs — admin-facing list/get endpoints.
     app.include_router(audit_logs_router)
