@@ -54,6 +54,7 @@ from src.modules.patients.models import (  # noqa: F401
     PatientProfile,
 )
 from src.modules.patients.router import router as patients_router
+from src.modules.portal.router import router as portal_router
 from src.modules.staff.models import (  # noqa: F401
     StaffAvailability,
     StaffProfile,
@@ -220,6 +221,9 @@ def create_app() -> FastAPI:
 
     # Visits + service items + verification + issues.
     app.include_router(visits_router)
+
+    # Patient/Guardian portal — verify/dispute/report-issue surface.
+    app.include_router(portal_router)
 
     # NOTE: feature routers get registered here as modules land, e.g.
     #   app.include_router(staff_router, prefix="/staff", tags=["staff"])
