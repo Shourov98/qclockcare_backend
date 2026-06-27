@@ -45,6 +45,7 @@ from src.modules.identity.dependencies import (
     get_session_with_auth,
     require_role,
 )
+from src.modules.notifications import integrations as notif_integrations
 from src.modules.visits import service as visits_service
 from src.modules.visits.schemas import (
     ServiceVerificationCreateRequest,
@@ -182,6 +183,11 @@ async def create_visit_endpoint(
     )
     await session.commit()
     await session.refresh(visit, attribute_names=["service_items"])
+    # Fan-out notification to patient + guardians (best-effort).
+    await notif_integrations.notify_visit_checked_in(
+        session, visit_id=visit.id, agency_id=agency_id
+    )
+    await session.commit()
     return _to_response(visit, with_relations=True)
 
 
@@ -292,6 +298,11 @@ async def check_out_visit_endpoint(
     )
     await session.commit()
     await session.refresh(visit)
+    # Fan-out notification to patient + guardians (best-effort).
+    await notif_integrations.notify_visit_checked_out(
+        session, visit_id=visit.id, agency_id=agency_id
+    )
+    await session.commit()
     return _to_response(visit)
 
 
@@ -498,6 +509,14 @@ async def file_verification_endpoint(
     )
     await session.commit()
     await session.refresh(verification)
+    # Notify the assigned staff (best-effort).
+    await notif_integrations.notify_verification_status(
+        session,
+        visit_id=visit_id,
+        agency_id=agency_id,
+        verified=(verification.status.value == "VERIFIED"),
+    )
+    await session.commit()
     return ServiceVerificationResponse.model_validate(verification)
 
 
@@ -550,6 +569,14 @@ async def add_visit_issue_endpoint(
     )
     await session.commit()
     await session.refresh(issue)
+    # Notify the assigned staff (best-effort).
+    await notif_integrations.notify_visit_issue_filed(
+        session,
+        visit_id=visit_id,
+        agency_id=agency_id,
+        issue_type=issue.issue_type,
+    )
+    await session.commit()
     return VisitIssueResponse.model_validate(issue)
 
 

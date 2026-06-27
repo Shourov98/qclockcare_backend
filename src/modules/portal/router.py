@@ -18,6 +18,7 @@ from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
 )
+from src.modules.notifications import integrations as notif_integrations
 from src.modules.portal import service as portal_service
 from src.modules.portal.schemas import (
     PortalDisputeRequest,
@@ -124,6 +125,14 @@ async def verify_visit_endpoint(
     )
     await session.commit()
     await session.refresh(verification)
+    # Notify the assigned staff (best-effort).
+    await notif_integrations.notify_verification_status(
+        session,
+        visit_id=visit_id,
+        agency_id=verification.agency_id,
+        verified=(verification.status.value == "VERIFIED"),
+    )
+    await session.commit()
     log.info(
         "portal.verification.filed",
         visit_id=str(visit_id),
@@ -154,6 +163,14 @@ async def dispute_visit_endpoint(
     )
     await session.commit()
     await session.refresh(verification)
+    # Notify the assigned staff (best-effort).
+    await notif_integrations.notify_verification_status(
+        session,
+        visit_id=visit_id,
+        agency_id=verification.agency_id,
+        verified=False,
+    )
+    await session.commit()
     log.info(
         "portal.verification.disputed",
         visit_id=str(visit_id),
@@ -184,6 +201,14 @@ async def report_issue_endpoint(
     )
     await session.commit()
     await session.refresh(issue)
+    # Notify the assigned staff (best-effort).
+    await notif_integrations.notify_visit_issue_filed(
+        session,
+        visit_id=visit_id,
+        agency_id=issue.agency_id,
+        issue_type=issue.issue_type,
+    )
+    await session.commit()
     log.info(
         "portal.issue.filed",
         visit_id=str(visit_id),

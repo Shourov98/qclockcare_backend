@@ -48,6 +48,8 @@ from src.modules.identity.models import (  # noqa: F401
     UserRoleAssignment,
 )
 from src.modules.identity.router import router as auth_router
+from src.modules.notifications.models import Notification  # noqa: F401
+from src.modules.notifications.router import router as notifications_router
 from src.modules.patients.models import (  # noqa: F401
     GuardianProfile,
     PatientGuardianRelationship,
@@ -224,6 +226,9 @@ def create_app() -> FastAPI:
 
     # Patient/Guardian portal — verify/dispute/report-issue surface.
     app.include_router(portal_router)
+
+    # Notifications — recipient-facing list/read endpoints.
+    app.include_router(notifications_router)
 
     # NOTE: feature routers get registered here as modules land, e.g.
     #   app.include_router(staff_router, prefix="/staff", tags=["staff"])
