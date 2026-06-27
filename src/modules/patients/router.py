@@ -57,6 +57,7 @@ from src.modules.patients.schemas import (
     PatientProfileUpdateRequest,
 )
 from src.shared.domain.enums import AuditAction, UserRole, UserStatus
+from src.shared.schemas.docs import standard_responses
 from src.shared.schemas.pagination import build_offset_response
 
 logger = get_logger(__name__)
@@ -137,6 +138,14 @@ def _to_patient_response(
     response_model=PatientProfileResponse,
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    responses=standard_responses(include=[401, 403, 409, 422]),
+    summary="Admit a new patient at the caller's agency",
+    description=(
+        "Creates a user account + patient profile in `INVITED` "
+        "status and sends an invitation email with a 7-day token. "
+        "Requires `AGENCY_ADMIN`. `409 DUPLICATE_RESOURCE` if the "
+        "email or `patient_code` is already in use at this agency."
+    ),
 )
 async def create_patient_endpoint(
     payload: PatientProfileCreateRequest,
@@ -187,6 +196,15 @@ async def create_patient_endpoint(
 @router.get(
     "/patients",
     response_model=dict,
+    responses=standard_responses(include=[401, 403, 422]),
+    summary="List patients at the caller's agency",
+    description=(
+        "Paginated patient roster scoped to the caller's agency "
+        "(RLS-enforced). Filterable by `status` "
+        "(`INVITED` / `ACTIVE` / `INACTIVE` / `DISCHARGED`). Use "
+        "`GET /patients/{id}/with-relationships` to fetch nested "
+        "guardian links."
+    ),
 )
 async def list_patients_endpoint(
     ctx: CurrentAuth,
@@ -210,6 +228,13 @@ async def list_patients_endpoint(
 @router.get(
     "/patients/{patient_id}",
     response_model=PatientProfileResponse,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Get a single patient profile",
+    description=(
+        "Fetch a patient profile by ID. `AGENCY_ADMIN` and the "
+        "patient themselves can read; other roles get "
+        "`CROSS_AGENCY_ACCESS_DENIED`."
+    ),
 )
 async def get_patient_endpoint(
     patient_id: uuid.UUID,
@@ -227,6 +252,14 @@ async def get_patient_endpoint(
 @router.get(
     "/patients/{patient_id}/with-relationships",
     response_model=PatientProfileResponse,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Get a patient with nested guardian links",
+    description=(
+        "Same as `GET /patients/{id}` but inlines every "
+        "patient<->guardian relationship for this patient. Slower "
+        "(extra joins); use it for the patient detail page, not for "
+        "list rendering."
+    ),
 )
 async def get_patient_with_relationships_endpoint(
     patient_id: uuid.UUID,
@@ -245,6 +278,13 @@ async def get_patient_with_relationships_endpoint(
     "/patients/{patient_id}",
     response_model=PatientProfileResponse,
     dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    responses=standard_responses(include=[401, 403, 404, 422]),
+    summary="Update a patient profile",
+    description=(
+        "Partial update. Only the fields you set are applied. "
+        "Requires `AGENCY_ADMIN`. Audit row written with action "
+        "`UPDATE`."
+    ),
 )
 async def update_patient_endpoint(
     patient_id: uuid.UUID,
@@ -283,6 +323,14 @@ async def update_patient_endpoint(
     "/patients/{patient_id}",
     response_model=PatientProfileResponse,
     dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Archive (discharge) a patient",
+    description=(
+        "Soft-archives a patient: flips `status` to `INACTIVE` "
+        "and sets `discharged_at` to today. The row stays in the DB "
+        "for audit history. Use this to discharge rather than "
+        "hard-delete."
+    ),
 )
 async def archive_patient_endpoint(
     patient_id: uuid.UUID,
@@ -322,6 +370,13 @@ async def archive_patient_endpoint(
 @router.get(
     "/patients/{patient_id}/guardians",
     response_model=list[PatientGuardianRelationshipResponse],
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="List a patient's guardian relationships",
+    description=(
+        "Returns every patient<->guardian relationship for the "
+        "given patient (active + expired). `AGENCY_ADMIN` and the "
+        "patient themselves can read."
+    ),
 )
 async def list_patient_guardians_endpoint(
     patient_id: uuid.UUID,
@@ -344,6 +399,15 @@ async def list_patient_guardians_endpoint(
     response_model=PatientGuardianRelationshipResponse,
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    responses=standard_responses(include=[401, 403, 404, 409, 422]),
+    summary="Link a guardian to a patient",
+    description=(
+        "Link an existing guardian (`guardian_id`) OR create a "
+        "brand-new guardian in the same call (`new_guardian`). "
+        "Exactly one must be provided. If a new guardian was "
+        "created, an invitation email is sent with a 7-day token. "
+        "Requires `AGENCY_ADMIN`."
+    ),
 )
 async def add_patient_guardian_endpoint(
     patient_id: uuid.UUID,
@@ -403,6 +467,14 @@ async def add_patient_guardian_endpoint(
     response_model=GuardianProfileResponse,
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    responses=standard_responses(include=[401, 403, 409, 422]),
+    summary="Add a standalone guardian profile",
+    description=(
+        "Creates a guardian profile + user account without linking "
+        "to a patient. The guardian is invited by email and can be "
+        "linked to one or more patients later via `POST "
+        "/patients/{id}/guardians`. Requires `AGENCY_ADMIN`."
+    ),
 )
 async def create_guardian_endpoint(
     payload: GuardianProfileCreateRequest,
@@ -450,6 +522,14 @@ async def create_guardian_endpoint(
 @router.get(
     "/guardians",
     response_model=dict,
+    responses=standard_responses(include=[401, 403, 422]),
+    summary="List guardians at the caller's agency",
+    description=(
+        "Paginated guardian roster scoped to the caller's agency. "
+        "Use the `patient_id` query param via `POST "
+        "/patients/{id}/guardians` to list guardians for a single "
+        "patient instead."
+    ),
 )
 async def list_guardians_endpoint(
     ctx: CurrentAuth,
@@ -468,6 +548,13 @@ async def list_guardians_endpoint(
 @router.get(
     "/guardians/{guardian_id}",
     response_model=GuardianProfileResponse,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Get a single guardian profile",
+    description=(
+        "Fetch a guardian profile by ID. `AGENCY_ADMIN` and the "
+        "guardian themselves can read; other roles get "
+        "`CROSS_AGENCY_ACCESS_DENIED`."
+    ),
 )
 async def get_guardian_endpoint(
     guardian_id: uuid.UUID,
@@ -486,6 +573,13 @@ async def get_guardian_endpoint(
     "/guardians/{guardian_id}",
     response_model=GuardianProfileResponse,
     dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    responses=standard_responses(include=[401, 403, 404, 422]),
+    summary="Update a guardian profile",
+    description=(
+        "Partial update. Only the fields you set are applied. "
+        "Requires `AGENCY_ADMIN`. Audit row written with action "
+        "`UPDATE`."
+    ),
 )
 async def update_guardian_endpoint(
     guardian_id: uuid.UUID,
@@ -524,6 +618,13 @@ async def update_guardian_endpoint(
     "/guardians/{guardian_id}",
     response_model=GuardianProfileResponse,
     dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Archive a guardian profile",
+    description=(
+        "Soft-archives a guardian: flips `status` to `INACTIVE`. "
+        "Existing patient<->guardian relationships are preserved "
+        "for audit history. Requires `AGENCY_ADMIN`."
+    ),
 )
 async def archive_guardian_endpoint(
     guardian_id: uuid.UUID,
@@ -564,6 +665,14 @@ async def archive_guardian_endpoint(
     "/patient-guardian-relationships/{relationship_id}",
     response_model=PatientGuardianRelationshipResponse,
     dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    responses=standard_responses(include=[401, 403, 404, 422]),
+    summary="Edit a patient<->guardian relationship",
+    description=(
+        "Update the link metadata (`is_legal`, `valid_from`, "
+        "`valid_until`). The patient + guardian identities are "
+        "immutable — delete + re-create to switch who is linked. "
+        "Requires `AGENCY_ADMIN`."
+    ),
 )
 async def update_patient_guardian_endpoint(
     relationship_id: uuid.UUID,
@@ -605,6 +714,14 @@ async def update_patient_guardian_endpoint(
     "/patient-guardian-relationships/{relationship_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Remove a patient<->guardian relationship",
+    description=(
+        "Hard-delete the link. The patient + guardian profiles "
+        "themselves stay intact — only the link is removed. Audit "
+        "row written with action `UNLINK_PATIENT_GUARDIAN`. "
+        "Requires `AGENCY_ADMIN`."
+    ),
 )
 async def delete_patient_guardian_endpoint(
     relationship_id: uuid.UUID,

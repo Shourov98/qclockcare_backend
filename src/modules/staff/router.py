@@ -60,6 +60,7 @@ from src.modules.staff.schemas import (
     StaffQualificationUpdateRequest,
 )
 from src.shared.domain.enums import AuditAction, UserRole, UserStatus
+from src.shared.schemas.docs import standard_responses
 from src.shared.schemas.pagination import (
     PaginatedResponse,
     build_offset_response,
@@ -178,6 +179,15 @@ async def _qualification_to_response(qual: object) -> StaffQualificationResponse
     response_model=StaffProfileResponse,
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    responses=standard_responses(include=[401, 403, 409, 422]),
+    summary="Invite a new staff member",
+    description=(
+        "Creates a user account in `INVITED` status and sends an "
+        "invitation email with a 7-day token (see "
+        "`POST /auth/accept-invitation`). Requires `AGENCY_ADMIN`. "
+        "`409 DUPLICATE_RESOURCE` if the email or `staff_code` is "
+        "already in use at this agency."
+    ),
 )
 async def create_staff_endpoint(
     payload: StaffProfileCreateRequest,
@@ -229,6 +239,15 @@ async def create_staff_endpoint(
 @router.get(
     "",
     response_model=PaginatedResponse[StaffProfileSummaryResponse],
+    responses=standard_responses(include=[401, 403, 422]),
+    summary="List staff at the caller's agency",
+    description=(
+        "Paginated roster of staff profiles scoped to the caller's "
+        "agency (RLS-enforced). Filterable by `status` "
+        "(`INVITED` / `ACTIVE` / `INACTIVE` / etc.). Use "
+        "`GET /staff/{id}/with-details` to fetch nested "
+        "qualifications + availability."
+    ),
 )
 async def list_staff_endpoint(
     ctx: CurrentAuth,
@@ -258,6 +277,13 @@ async def list_staff_endpoint(
 @router.get(
     "/{staff_id}",
     response_model=StaffProfileResponse,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Get a single staff profile",
+    description=(
+        "Fetch a single staff profile by ID. RLS scopes the read to "
+        "the caller's agency; `AGENCY_ADMIN` and `STAFF` (own "
+        "profile only) can read."
+    ),
 )
 async def get_staff_endpoint(
     staff_id: uuid.UUID,
@@ -276,6 +302,14 @@ async def get_staff_endpoint(
 @router.get(
     "/{staff_id}/with-details",
     response_model=StaffProfileResponse,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Get a staff profile with nested qualifications + availability",
+    description=(
+        "Same as `GET /staff/{id}` but inlines the staff member's "
+        "qualifications and availability windows. Slightly slower "
+        "than the summary endpoint (extra joins); use it for the "
+        "staff detail page, not for list rendering."
+    ),
 )
 async def get_staff_with_details_endpoint(
     staff_id: uuid.UUID,
@@ -295,6 +329,13 @@ async def get_staff_with_details_endpoint(
     "/{staff_id}",
     response_model=StaffProfileResponse,
     dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    responses=standard_responses(include=[401, 403, 404, 422]),
+    summary="Update a staff profile",
+    description=(
+        "Partial update. Only the fields you set are applied. "
+        "Requires `AGENCY_ADMIN`. Audit row written with action "
+        "`UPDATE`."
+    ),
 )
 async def update_staff_endpoint(
     staff_id: uuid.UUID,
@@ -333,6 +374,14 @@ async def update_staff_endpoint(
     "/{staff_id}",
     response_model=StaffProfileResponse,
     dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Archive a staff profile",
+    description=(
+        "Soft-archives a staff member: flips `status` to `INACTIVE` "
+        "and sets `terminated_at` to today. The row stays in the DB "
+        "for audit history. Hard delete is not supported — use this "
+        "endpoint to deactivate."
+    ),
 )
 async def archive_staff_endpoint(
     staff_id: uuid.UUID,
@@ -372,6 +421,13 @@ async def archive_staff_endpoint(
 @router.get(
     "/{staff_id}/qualifications",
     response_model=list[StaffQualificationResponse],
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="List a staff member's qualifications",
+    description=(
+        "Returns every qualification row attached to the staff "
+        "member, including any short-lived signed download URLs for "
+        "attached documents."
+    ),
 )
 async def list_qualifications_endpoint(
     staff_id: uuid.UUID,
@@ -394,6 +450,14 @@ async def list_qualifications_endpoint(
     response_model=StaffQualificationResponse,
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    responses=standard_responses(include=[401, 403, 404, 422]),
+    summary="Add a qualification to a staff member",
+    description=(
+        "Adds a credential row. Defaults to status "
+        "`PENDING_VERIFICATION` — an admin reviews the uploaded "
+        "document and flips it to `ACTIVE`. Audit row written with "
+        "action `CREATE`."
+    ),
 )
 async def add_qualification_endpoint(
     staff_id: uuid.UUID,
@@ -432,6 +496,15 @@ async def add_qualification_endpoint(
 @router.patch(
     "/{staff_id}/qualifications/{qualification_id}",
     response_model=StaffQualificationResponse,
+    responses=standard_responses(include=[401, 403, 404, 422]),
+    summary="Update a qualification",
+    description=(
+        "Used to attach a verified document (set "
+        "`document_storage_key`) or to flip status "
+        "(`PENDING_VERIFICATION` → `ACTIVE` / `REVOKED` / `EXPIRED`). "
+        "Authorisation: `AGENCY_ADMIN`, or the staff member "
+        "themselves."
+    ),
 )
 async def update_qualification_endpoint(
     staff_id: uuid.UUID,
@@ -484,6 +557,13 @@ async def update_qualification_endpoint(
     "/{staff_id}/qualifications/{qualification_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Revoke a qualification",
+    description=(
+        "Soft-revokes a qualification by flipping status to "
+        "`REVOKED`. The row stays in the DB for audit history. "
+        "Requires `AGENCY_ADMIN`."
+    ),
 )
 async def revoke_qualification_endpoint(
     staff_id: uuid.UUID,
@@ -521,6 +601,14 @@ async def revoke_qualification_endpoint(
 @router.get(
     "/{staff_id}/qualifications/{qualification_id}/download",
     response_model=QualificationDownloadResponse,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Get a signed download URL for a qualification document",
+    description=(
+        "Returns a short-lived signed URL (default 15 minutes) for "
+        "the credential document. Hand it to a browser or `wget` — "
+        "no further auth needed. Authorisation: `AGENCY_ADMIN`, or "
+        "the staff member themselves."
+    ),
 )
 async def get_qualification_download_endpoint(
     staff_id: uuid.UUID,
@@ -568,6 +656,13 @@ async def get_qualification_download_endpoint(
 @router.get(
     "/{staff_id}/availability",
     response_model=list[StaffAvailabilityResponse],
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="List a staff member's availability windows",
+    description=(
+        "Returns every availability row (recurring weekly windows "
+        "and one-off blocks). `AGENCY_ADMIN` and the staff member "
+        "themselves can read."
+    ),
 )
 async def list_availability_endpoint(
     staff_id: uuid.UUID,
@@ -589,6 +684,16 @@ async def list_availability_endpoint(
     "/{staff_id}/availability",
     response_model=StaffAvailabilityResponse,
     status_code=status.HTTP_201_CREATED,
+    responses=standard_responses(include=[401, 403, 404, 422]),
+    summary="Add an availability window",
+    description=(
+        "Adds a single availability row. Authorisation: "
+        "`AGENCY_ADMIN`, or the staff member themselves. Provide "
+        "either a recurring weekly window (`day_of_week` + "
+        "`start_time` + `end_time`) or a one-off block "
+        "(`specific_date` + optional `specific_start/end`) — not "
+        "both."
+    ),
 )
 async def add_availability_endpoint(
     staff_id: uuid.UUID,
@@ -636,6 +741,14 @@ async def add_availability_endpoint(
 @router.patch(
     "/{staff_id}/availability/{availability_id}",
     response_model=StaffAvailabilityResponse,
+    responses=standard_responses(include=[401, 403, 404, 422]),
+    summary="Update an availability window",
+    description=(
+        "Flip `is_unavailable` (e.g. \"actually I AM free on "
+        "Friday\") or change the `reason`. Authorisation: "
+        "`AGENCY_ADMIN`, or the staff member themselves. To change "
+        "the time window itself, DELETE + re-create."
+    ),
 )
 async def update_availability_endpoint(
     staff_id: uuid.UUID,
@@ -687,6 +800,12 @@ async def update_availability_endpoint(
 @router.delete(
     "/{staff_id}/availability/{availability_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Delete an availability window",
+    description=(
+        "Hard delete of an availability row. Authorisation: "
+        "`AGENCY_ADMIN`, or the staff member themselves."
+    ),
 )
 async def delete_availability_endpoint(
     staff_id: uuid.UUID,

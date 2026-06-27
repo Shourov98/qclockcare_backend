@@ -19,14 +19,13 @@ Lifecycle notes:
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime
+from datetime import date
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Date,
-    DateTime,
     Enum,
     ForeignKey,
     Index,
@@ -40,12 +39,11 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from src.shared.domain.base_entity import Base, IdMixin, TimestampedMixin
 from src.shared.domain.enum_mapping import pg_name
 from src.shared.domain.enums import RelationshipType, UserStatus
-from src.shared.utils.datetime_utils import utc_now
 
 if TYPE_CHECKING:
     from src.modules.agencies.models import Agency
-    from src.modules.identity.models import User
     from src.modules.appointments.models import Appointment
+    from src.modules.identity.models import User
 
 
 # --------------------------------------------------------------------------
@@ -95,17 +93,17 @@ class PatientProfile(IdMixin, TimestampedMixin, Base):
     discharged_at: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     # Relationships
-    agency: Mapped["Agency"] = relationship(  # noqa: F821
+    agency: Mapped[Agency] = relationship(
         "Agency", back_populates="patient_profiles"
     )
-    user: Mapped["User"] = relationship(  # noqa: F821
+    user: Mapped[User] = relationship(
         "User", back_populates="patient_profiles"
     )
-    guardian_links: Mapped[list["PatientGuardianRelationship"]] = relationship(
+    guardian_links: Mapped[list[PatientGuardianRelationship]] = relationship(
         back_populates="patient",
         cascade="all, delete-orphan",
     )
-    appointments: Mapped[list["Appointment"]] = relationship(  # noqa: F821
+    appointments: Mapped[list[Appointment]] = relationship(
         "Appointment", back_populates="patient", cascade="all, delete-orphan"
     )
 
@@ -165,13 +163,13 @@ class GuardianProfile(IdMixin, TimestampedMixin, Base):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Relationships
-    agency: Mapped["Agency"] = relationship(  # noqa: F821
+    agency: Mapped[Agency] = relationship(
         "Agency", back_populates="guardian_profiles"
     )
-    user: Mapped["User"] = relationship(  # noqa: F821
+    user: Mapped[User] = relationship(
         "User", back_populates="guardian_profiles"
     )
-    patient_links: Mapped[list["PatientGuardianRelationship"]] = relationship(
+    patient_links: Mapped[list[PatientGuardianRelationship]] = relationship(
         back_populates="guardian",
         cascade="all, delete-orphan",
     )
