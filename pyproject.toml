@@ -52,6 +52,9 @@ dependencies = [
     # HTTP client (used by services for outbound calls)
     "httpx>=0.28.0",
 
+    # Email (notifications SMTP provider)
+    "aiosmtplib>=3.0.0",
+
     # Misc
     "python-json-logger>=2.0.7",
     "orjson>=3.10.0",
