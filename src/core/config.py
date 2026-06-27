@@ -123,6 +123,11 @@ class Settings(BaseSettings):
     NOTIFICATION_RETRY_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=10)
     NOTIFICATION_RETRY_BACKOFF_SECONDS: int = Field(default=60, ge=1, le=3600)
     NOTIFICATION_BATCH_SIZE: int = Field(default=50, ge=1, le=500)
+    # How long the unread badge can be cached. Currently a no-op —
+    # the badge endpoint hits the DB on every request. When Redis is
+    # wired up, the badge endpoint should cache `unread_count` under
+    # the user_id with this TTL.
+    NOTIFICATION_BADGE_CACHE_TTL_SECONDS: int = Field(default=30, ge=0, le=3600)
 
     # ----- Rate Limiting -----
     RATE_LIMIT_ENABLED: bool = True

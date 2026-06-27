@@ -17,6 +17,7 @@ Two halves:
 from __future__ import annotations
 
 import uuid
+from builtins import type as _type
 from datetime import UTC, datetime
 from typing import Any
 
@@ -42,12 +43,23 @@ async def dispatch_notification(
     body: str,
     metadata: dict[str, Any] | None = None,
 ) -> Notification | None:
-    """Create a notification row for a single recipient.
+    """Create a notification row for a single recipient and fan out.
 
-    Returns None if an equivalent notification was already dispatched
-    for the same recipient + type + entity_id within the last 60
-    seconds (dedup window). This protects against double-fire from
-    retry storms without needing a unique constraint.
+    Returns None in two cases:
+      - dedup: an equivalent (recipient + type + entity_id) notification
+        was already dispatched within the last 60 seconds.
+      - opted-out: the recipient has explicitly opted out of
+        `(type, IN_APP)`. The in-app row is the primary surface; if
+        the user has opted out of it, we skip everything (no rows
+        inserted; downstream channels are also skipped because their
+        delivery rows would orphan without a parent notification).
+
+    Otherwise:
+      - Insert a `Notification` row with status SENT.
+      - Fan out to other enabled channels via `dispatch_multichannel`.
+        The multichannel call updates the row's status to DELIVERED
+        (any channel succeeded) or FAILED (all attempted channels
+        failed) before returning.
 
     Caller is responsible for committing the surrounding transaction.
     """
@@ -73,6 +85,21 @@ async def dispatch_notification(
         if existing is not None and existing.created_at.timestamp() >= cutoff:
             return None
 
+    # Opt-out check for the IN_APP channel — the surface that holds the
+    # notification row. If the user has opted out of in-app for this
+    # type, we don't create any row (and therefore no other channels
+    # are dispatched either).
+    from src.modules.notifications.preferences import is_opted_in
+    from src.shared.domain.enums import NotificationChannel
+
+    if not await is_opted_in(
+        session,
+        user_id=recipient_user_id,
+        type=type,
+        channel=NotificationChannel.IN_APP,
+    ):
+        return None
+
     notification = Notification(
         agency_id=agency_id,
         recipient_user_id=recipient_user_id,
@@ -83,6 +110,26 @@ async def dispatch_notification(
         metadata_=metadata,
     )
     session.add(notification)
+    await session.flush()
+
+    # Fan out to other enabled channels (EMAIL/SMS/etc.). Per-channel
+    # try/except inside the dispatcher isolates provider crashes.
+    from src.modules.notifications.deliveries import dispatch_multichannel
+
+    try:
+        await dispatch_multichannel(session, notification=notification)
+    except Exception as exc:
+        from src.core.logging import get_logger
+
+        get_logger(__name__).error(
+            "notifications.dispatch_multichannel_failed",
+            notification_id=str(notification.id),
+            error=_type(exc).__name__,
+            detail=str(exc),
+        )
+        # Leave the row at SENT — the in-app delivery is real even if
+        # the multichannel fan-out crashed.
+
     await session.flush()
     return notification
 
@@ -194,7 +241,10 @@ async def mark_all_read(
         )
         .values(read_at=now, status=NotificationStatus.READ)
     )
-    return int(result.rowcount or 0)
+    # `rowcount` is on the underlying `CursorResult`; SQLAlchemy's async
+    # `Result` exposes it but mypy can't see it through the generic.
+    rowcount = getattr(result, "rowcount", 0) or 0
+    return int(rowcount)
 
 
 __all__ = [
