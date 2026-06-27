@@ -99,6 +99,15 @@ class Settings(BaseSettings):
     # also relies on this to avoid unbounded hangs in worker threads.
     SMTP_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=120)
 
+    # ----- Frontend (deep links in transactional emails) -----
+    # Base URL of the SPA — used by transactional auth emails
+    # (OTP verify, password reset) to build a clickable deep link.
+    FRONTEND_URL: str = "http://localhost:3000"
+    # When True, OTP / reset tokens are logged at INFO with a clear
+    # `dev_*` prefix so local dev can test without configuring SMTP.
+    # MUST stay False in production.
+    LOG_INCLUDE_DEV_OTPS: bool = False
+
     # ----- SMS (Twilio) — Phase 2 -----
     SMS_ENABLED: bool = False
     TWILIO_ACCOUNT_SID: str | None = None

@@ -18,15 +18,15 @@ sets RLS GUCs in one go.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import settings
 from src.core.database import get_session
-from src.core.logging import get_logger
+from src.modules.auth import email_service as auth_email
 from src.modules.identity import auth_service
 from src.modules.identity.dependencies import (
     CurrentAuth,
-    get_current_auth,
     get_session_with_auth,
 )
 from src.modules.identity.schemas import (
@@ -44,8 +44,6 @@ from src.modules.identity.schemas import (
     VerifyEmailRequest,
     VerifyEmailResponse,
 )
-
-logger = get_logger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -134,6 +132,7 @@ async def logout_endpoint(
 async def accept_invitation_endpoint(
     payload: AcceptInvitationRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     user, otp = await auth_service.accept_invitation(
@@ -143,15 +142,25 @@ async def accept_invitation_endpoint(
         ip_address=_client_ip(request),
         user_agent=_user_agent(request),
     )
-    # The OTP is returned in the response in dev mode so you can verify
-    # without configuring an SMTP server. In production, the OTP should
-    # be emailed and NOT returned — TODO once SMTP is wired.
+    # Schedule the OTP email to be sent after the response is flushed.
+    # The SMTP call runs in the background via FastAPI's
+    # BackgroundTasks (see src/modules/auth/email_service.py) so an
+    # unreachable SMTP server cannot block this endpoint.
+    # When `LOG_INCLUDE_DEV_OTPS=true`, the OTP is also logged at
+    # INFO so devs can test without configuring SMTP.
+    if otp is not None:
+        auth_email.send_otp_email(
+            background_tasks,
+            to_email=user.email,
+            to_name=user.full_name,
+            otp=otp,
+            expires_in_minutes=settings.OTP_EXPIRY_MINUTES,
+            recipient_user_id=user.id,
+        )
     return {
         "accepted": True,
         "email": user.email,
         "otp_sent": True,
-        # DEV ONLY: remove once SMTP is wired
-        "dev_otp": otp,
     }
 
 
@@ -186,14 +195,28 @@ async def verify_email_endpoint(
 async def resend_otp_endpoint(
     payload: ResendOtpRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
 ) -> ResendOtpResponse:
-    cooldown = await auth_service.resend_otp(
+    cooldown, issued = await auth_service.resend_otp(
         session,
         email=payload.email,
         ip_address=_client_ip(request),
         user_agent=_user_agent(request),
     )
+    # Schedule the new OTP email. We schedule even when `issued` is
+    # None (user not found) — the email_service is a no-op in that
+    # case since we don't have an OTP to embed. Doing it
+    # unconditionally keeps the "don't leak existence" property.
+    if issued is not None:
+        auth_email.send_otp_email(
+            background_tasks,
+            to_email=issued.email,
+            to_name=issued.full_name,
+            otp=issued.otp,
+            expires_in_minutes=settings.OTP_EXPIRY_MINUTES,
+            recipient_user_id=issued.user_id,
+        )
     return ResendOtpResponse(sent=True, cooldown_seconds_remaining=cooldown)
 
 
@@ -208,21 +231,30 @@ async def resend_otp_endpoint(
 async def forgot_password_endpoint(
     payload: ForgotPasswordRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
 ) -> ForgotPasswordResponse:
-    token = await auth_service.forgot_password(
+    user_id, email, token = await auth_service.forgot_password(
         session,
         email=payload.email,
         ip_address=_client_ip(request),
         user_agent=_user_agent(request),
     )
-    # DEV ONLY: include the token in the response when SMTP isn't wired.
-    # The endpoint always returns 202 with `sent: true` regardless of whether
-    # the email exists.
-    if token is not None and logger.isEnabledFor(5):  # DEBUG
-        logger.debug(
-            "auth.dev_password_reset_token",
-            token=token,
+    # Schedule the reset-link email. Same SMTP-via-BackgroundTasks
+    # pattern as the OTP email — see src/modules/auth/email_service.py.
+    # `user_id` is None when the email is not registered; we no-op
+    # in that case to avoid leaking account existence.
+    if user_id is not None and token is not None:
+        assert email is not None  # invariant: user_id implies email
+        auth_email.send_password_reset_email(
+            background_tasks,
+            to_email=email,
+            to_name=None,  # full_name not loaded by forgot_password path
+            reset_token=token,
+            # 2-hour TTL matches jwt_service.issue_single_use_token
+            # `ttl=timedelta(hours=2)` above.
+            expires_in_minutes=120,
+            recipient_user_id=user_id,
         )
     return ForgotPasswordResponse(sent=True)
 
