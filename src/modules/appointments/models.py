@@ -27,17 +27,19 @@ from sqlalchemy import (
     Text,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.shared.domain.base_entity import Base, IdMixin, TimestampedMixin
 from src.shared.domain.enum_mapping import pg_name
 from src.shared.domain.enums import (
+    AppointmentEventType,
     AppointmentStatus,
     ConfirmationStatus,
     ProgramType,
     ServiceItemStatus,
     ServiceType,
+    UserRole,
 )
 
 if TYPE_CHECKING:
@@ -248,4 +250,138 @@ class AppointmentServiceItem(IdMixin, TimestampedMixin, Base):
     )
 
 
-__all__ = ["Appointment", "AppointmentServiceItem"]
+__all__ = [
+    "Appointment",
+    "AppointmentConfirmation",
+    "AppointmentEvent",
+    "AppointmentServiceItem",
+]
+
+
+# --------------------------------------------------------------------------
+# appointment_confirmations (1:1 with appointments)
+# --------------------------------------------------------------------------
+class AppointmentConfirmation(IdMixin, Base):
+    """One row per confirmed appointment — captures WHO confirmed + HOW.
+
+    Schema doc §10.3. The row is upserted on every confirmation attempt
+    so a patient can re-confirm after a reschedule and the latest action
+    wins. `confirmation_role` is captured at the time of the action
+    (a guardian may confirm on behalf of the patient — the role is
+    recorded so we can render an audit-quality timeline).
+    """
+
+    __tablename__ = "appointment_confirmations"
+
+    appointment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("appointments.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    confirmed_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    confirmation_role: Mapped[UserRole] = mapped_column(
+        Enum(UserRole, name=pg_name(UserRole)),
+        nullable=False,
+    )
+    status: Mapped[ConfirmationStatus] = mapped_column(
+        Enum(ConfirmationStatus, name=pg_name(ConfirmationStatus)),
+        nullable=False,
+    )
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "confirmation_role IN ('PATIENT', 'GUARDIAN')",
+            name="ck_appointment_confirmations_role",
+        ),
+        Index(
+            "idx_appointment_confirmations_confirmed_by",
+            "confirmed_by",
+        ),
+    )
+
+
+# --------------------------------------------------------------------------
+# appointment_events (append-only domain timeline)
+# --------------------------------------------------------------------------
+class AppointmentEvent(IdMixin, Base):
+    """Immutable per-action event row for an appointment.
+
+    Schema doc §10.4. Append-only at the application layer; the DB also
+    enforces no UPDATE/DELETE via trigger (`trg_appointment_events_no_modify`).
+
+    `event_type` is `text` (not a Postgres enum) so adding new event types
+    doesn't require a migration. The app-layer enum `AppointmentEventType`
+    is the source of truth for valid values.
+    """
+
+    __tablename__ = "appointment_events"
+
+    appointment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("appointments.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    agency_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agencies.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    event_type: Mapped[AppointmentEventType] = mapped_column(
+        Enum(AppointmentEventType, name=pg_name(AppointmentEventType), create_type=False),
+        nullable=False,
+    )
+    from_status: Mapped[AppointmentStatus | None] = mapped_column(
+        Enum(AppointmentStatus, name=pg_name(AppointmentStatus)),
+        nullable=True,
+    )
+    to_status: Mapped[AppointmentStatus | None] = mapped_column(
+        Enum(AppointmentStatus, name=pg_name(AppointmentStatus)),
+        nullable=True,
+    )
+    metadata_: Mapped[dict] = mapped_column(
+        "metadata",
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+    )
+    ip_address: Mapped[str | None] = mapped_column(INET, nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+
+    __table_args__ = (
+        Index(
+            "idx_appointment_events_appointment",
+            "appointment_id",
+            text("created_at"),
+        ),
+        Index(
+            "idx_appointment_events_agency_date",
+            "agency_id",
+            text("created_at DESC"),
+        ),
+        CheckConstraint(
+            "length(trim(event_type)) > 0",
+            name="ck_appointment_events_type_non_empty",
+        ),
+    )

@@ -23,7 +23,7 @@ from src.modules.patients.models import (
 )
 from src.modules.staff.models import StaffProfile
 from src.modules.visits.models import Visit
-from src.shared.domain.enums import NotificationType
+from src.shared.domain.enums import NotificationType, UserRole
 
 log = get_logger(__name__)
 
@@ -252,7 +252,164 @@ async def notify_visit_issue_filed(
         )
 
 
+# --------------------------------------------------------------------------
+# Appointment lifecycle helpers
+# --------------------------------------------------------------------------
+async def _staff_user_id_for_appointment(
+    session: AsyncSession,
+    *,
+    appointment_id: uuid.UUID,
+) -> uuid.UUID | None:
+    """Return the user_id of the staff assigned to this appointment, if any."""
+    from src.modules.appointments.models import Appointment
+
+    appt = (
+        await session.execute(
+            select(Appointment).where(Appointment.id == appointment_id)
+        )
+    ).scalar_one_or_none()
+    if appt is None or appt.staff_id is None:
+        return None
+    staff = (
+        await session.execute(
+            select(StaffProfile).where(StaffProfile.id == appt.staff_id)
+        )
+    ).scalar_one_or_none()
+    return staff.user_id if staff else None
+
+
+async def _agency_admin_user_ids(
+    session: AsyncSession,
+    *,
+    agency_id: uuid.UUID,
+) -> list[uuid.UUID]:
+    """Return the user_ids of all AGENCY_ADMINs at an agency.
+
+    Used by lifecycle helpers to route review requests to humans.
+    """
+    from src.modules.identity.models import UserRoleAssignment
+
+    rows = (
+        await session.execute(
+            select(UserRoleAssignment.user_id).where(
+                UserRoleAssignment.agency_id == agency_id,
+                UserRoleAssignment.role == UserRole.AGENCY_ADMIN,
+            )
+        )
+    ).scalars().all()
+    return list(rows)
+
+
+async def notify_appointment_confirmed(
+    session: AsyncSession,
+    *,
+    appointment_id: uuid.UUID,
+    agency_id: uuid.UUID,
+) -> None:
+    """Notify the assigned staff that the appointment is locked in."""
+    try:
+        staff_user_id = await _staff_user_id_for_appointment(
+            session, appointment_id=appointment_id
+        )
+        if staff_user_id is None:
+            return
+        await notifications_service.dispatch_notification(
+            session,
+            agency_id=agency_id,
+            recipient_user_id=staff_user_id,
+            type=NotificationType.APPOINTMENT_CONFIRMED,
+            title="Appointment confirmed",
+            body="The patient/guardian has confirmed this appointment.",
+            metadata={"entity_id": str(appointment_id), "appointment_id": str(appointment_id)},
+        )
+    except Exception as exc:
+        log.warning(
+            "notifications.notify_appointment_confirmed_failed",
+            appointment_id=str(appointment_id),
+            error=type(exc).__name__,
+            detail=str(exc),
+        )
+
+
+async def notify_appointment_reschedule_requested(
+    session: AsyncSession,
+    *,
+    appointment_id: uuid.UUID,
+    agency_id: uuid.UUID,
+    proposed_start: object,
+    proposed_end: object,
+) -> None:
+    """Fan out to staff + AGENCY_ADMIN: patient has requested a reschedule."""
+    try:
+        staff_user_id = await _staff_user_id_for_appointment(
+            session, appointment_id=appointment_id
+        )
+        admin_ids = await _agency_admin_user_ids(session, agency_id=agency_id)
+        recipients = {uid for uid in (staff_user_id, *admin_ids) if uid is not None}
+        for uid in recipients:
+            await notifications_service.dispatch_notification(
+                session,
+                agency_id=agency_id,
+                recipient_user_id=uid,
+                type=NotificationType.APPOINTMENT_RESCHEDULE_REQUESTED,
+                title="Reschedule requested",
+                body=(
+                    f"A reschedule was requested for appointment {appointment_id}: "
+                    f"{proposed_start} → {proposed_end}."
+                ),
+                metadata={
+                    "entity_id": str(appointment_id),
+                    "appointment_id": str(appointment_id),
+                    "proposed_start": str(proposed_start),
+                    "proposed_end": str(proposed_end),
+                },
+            )
+    except Exception as exc:
+        log.warning(
+            "notifications.notify_appointment_reschedule_requested_failed",
+            appointment_id=str(appointment_id),
+            error=type(exc).__name__,
+            detail=str(exc),
+        )
+
+
+async def notify_appointment_cancellation_requested(
+    session: AsyncSession,
+    *,
+    appointment_id: uuid.UUID,
+    agency_id: uuid.UUID,
+    reason: str,
+) -> None:
+    """Fan out to AGENCY_ADMIN: patient/guardian has requested cancellation."""
+    try:
+        admin_ids = await _agency_admin_user_ids(session, agency_id=agency_id)
+        for uid in admin_ids:
+            await notifications_service.dispatch_notification(
+                session,
+                agency_id=agency_id,
+                recipient_user_id=uid,
+                type=NotificationType.APPOINTMENT_CANCELLATION_REQUESTED,
+                title="Cancellation requested",
+                body=f"Reason: {reason}",
+                metadata={
+                    "entity_id": str(appointment_id),
+                    "appointment_id": str(appointment_id),
+                    "reason": reason,
+                },
+            )
+    except Exception as exc:
+        log.warning(
+            "notifications.notify_appointment_cancellation_requested_failed",
+            appointment_id=str(appointment_id),
+            error=type(exc).__name__,
+            detail=str(exc),
+        )
+
+
 __all__ = [
+    "notify_appointment_cancellation_requested",
+    "notify_appointment_confirmed",
+    "notify_appointment_reschedule_requested",
     "notify_verification_status",
     "notify_visit_checked_in",
     "notify_visit_checked_out",
