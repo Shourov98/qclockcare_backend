@@ -26,15 +26,18 @@ Endpoints:
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import settings
 from src.core.exceptions import CrossAgencyAccessDeniedError, ForbiddenError
 from src.core.logging import get_logger
 from src.modules.audit_logs import service as audit_logs_service
+from src.modules.auth import email_service as auth_email
 from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
@@ -138,20 +141,21 @@ def _to_patient_response(
 async def create_patient_endpoint(
     payload: PatientProfileCreateRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> PatientProfileResponse:
     agency_id = _require_agency(ctx)
-    patient = await patients_service.create_patient(
+    result = await patients_service.create_patient(
         session,
         agency_id=agency_id,
         payload=payload,
         admitted_by_user_id=ctx.user_id,
     )
     await session.commit()
-    await session.refresh(patient)
+    await session.refresh(result.profile)
     # Best-effort audit log.
-    try:
+    with contextlib.suppress(Exception):
         ip, ua = audit_logs_service.request_ip_ua(request)
         await audit_logs_service.audit_log(
             session,
@@ -159,18 +163,25 @@ async def create_patient_endpoint(
             actor_user_id=ctx.user_id,
             action=AuditAction.CREATE,
             entity_type="PATIENT_PROFILE",
-            entity_id=patient.id,
+            entity_id=result.profile.id,
             new_data={
-                "patient_code": patient.patient_code,
-                "user_id": str(patient.user_id),
+                "patient_code": result.profile.patient_code,
+                "user_id": str(result.profile.user_id),
             },
             ip_address=ip,
             user_agent=ua,
         )
         await session.commit()
-    except Exception:
-        pass
-    return _to_patient_response(patient)
+    # Schedule the invitation email after the response is flushed.
+    auth_email.send_invitation_email(
+        background_tasks,
+        to_email=result.email,
+        to_name=result.full_name,
+        invitation_token=result.invitation_token,
+        expires_in_days=settings.INVITATION_TOKEN_EXPIRY_DAYS,
+        recipient_user_id=result.user_id,
+    )
+    return _to_patient_response(result.profile)
 
 
 @router.get(
@@ -338,17 +349,18 @@ async def add_patient_guardian_endpoint(
     patient_id: uuid.UUID,
     payload: PatientGuardianRelationshipCreateRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> PatientGuardianRelationshipResponse:
     agency_id = _require_agency(ctx)
-    rel = await patients_service.add_patient_guardian(
+    result = await patients_service.add_patient_guardian(
         session, patient_id=patient_id, agency_id=agency_id, payload=payload
     )
     await session.commit()
-    await session.refresh(rel)
+    await session.refresh(result.relationship)
     # Best-effort audit log.
-    try:
+    with contextlib.suppress(Exception):
         ip, ua = audit_logs_service.request_ip_ua(request)
         await audit_logs_service.audit_log(
             session,
@@ -356,21 +368,31 @@ async def add_patient_guardian_endpoint(
             actor_user_id=ctx.user_id,
             action=AuditAction.LINK_PATIENT_GUARDIAN,
             entity_type="PATIENT_GUARDIAN_RELATIONSHIP",
-            entity_id=rel.id,
+            entity_id=result.relationship.id,
             new_data={
                 "patient_id": str(patient_id),
-                "guardian_id": str(rel.guardian_id),
-                "relationship_type": rel.relationship_type.value
-                if hasattr(rel.relationship_type, "value")
-                else str(rel.relationship_type),
+                "guardian_id": str(result.relationship.guardian_id),
+                "relationship_type": result.relationship.relationship_type.value
+                if hasattr(result.relationship.relationship_type, "value")
+                else str(result.relationship.relationship_type),
             },
             ip_address=ip,
             user_agent=ua,
         )
         await session.commit()
-    except Exception:
-        pass
-    return PatientGuardianRelationshipResponse.model_validate(rel)
+    # Only schedule an invitation email when a NEW guardian was
+    # created in this call. Linking an existing guardian doesn't
+    # generate a fresh invite — the guardian already has a login path.
+    if result.new_guardian is not None:
+        auth_email.send_invitation_email(
+            background_tasks,
+            to_email=result.new_guardian.email,
+            to_name=result.new_guardian.full_name,
+            invitation_token=result.new_guardian.invitation_token,
+            expires_in_days=settings.INVITATION_TOKEN_EXPIRY_DAYS,
+            recipient_user_id=result.new_guardian.user_id,
+        )
+    return PatientGuardianRelationshipResponse.model_validate(result.relationship)
 
 
 # --------------------------------------------------------------------------
@@ -385,20 +407,21 @@ async def add_patient_guardian_endpoint(
 async def create_guardian_endpoint(
     payload: GuardianProfileCreateRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> GuardianProfileResponse:
     agency_id = _require_agency(ctx)
-    guardian = await patients_service.create_guardian(
+    result = await patients_service.create_guardian(
         session,
         agency_id=agency_id,
         payload=payload,
         invited_by_user_id=ctx.user_id,
     )
     await session.commit()
-    await session.refresh(guardian)
+    await session.refresh(result.profile)
     # Best-effort audit log.
-    try:
+    with contextlib.suppress(Exception):
         ip, ua = audit_logs_service.request_ip_ua(request)
         await audit_logs_service.audit_log(
             session,
@@ -406,15 +429,22 @@ async def create_guardian_endpoint(
             actor_user_id=ctx.user_id,
             action=AuditAction.CREATE,
             entity_type="GUARDIAN_PROFILE",
-            entity_id=guardian.id,
-            new_data={"user_id": str(guardian.user_id)},
+            entity_id=result.profile.id,
+            new_data={"user_id": str(result.profile.user_id)},
             ip_address=ip,
             user_agent=ua,
         )
         await session.commit()
-    except Exception:
-        pass
-    return GuardianProfileResponse.model_validate(guardian)
+    # Schedule the invitation email after the response is flushed.
+    auth_email.send_invitation_email(
+        background_tasks,
+        to_email=result.email,
+        to_name=result.full_name,
+        invitation_token=result.invitation_token,
+        expires_in_days=settings.INVITATION_TOKEN_EXPIRY_DAYS,
+        recipient_user_id=result.user_id,
+    )
+    return GuardianProfileResponse.model_validate(result.profile)
 
 
 @router.get(
