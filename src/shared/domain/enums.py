@@ -117,6 +117,25 @@ class ServiceItemStatus(StrEnum):
 
 
 # --------------------------------------------------------------------------
+# Appointment event log (immutable domain timeline)
+# --------------------------------------------------------------------------
+class AppointmentEventType(StrEnum):
+    """Domain-level events appended to `appointment_events`.
+
+    Distinct from `AuditAction` (security/compliance trail) — events
+    capture *what happened* to the appointment in business terms,
+    not who audited it. Stored as `text` on the row (rather than a
+    Postgres enum) so new event types can ship without a migration.
+    """
+
+    STATUS_TRANSITION = "STATUS_TRANSITION"
+    CONFIRMATION_FILED = "CONFIRMATION_FILED"
+    RESCHEDULE_REQUESTED = "RESCHEDULE_REQUESTED"
+    CANCELLATION_REQUESTED = "CANCELLATION_REQUESTED"
+    CANCELLED_BY_ADMIN = "CANCELLED_BY_ADMIN"
+
+
+# --------------------------------------------------------------------------
 # Visits
 # --------------------------------------------------------------------------
 class VisitStatus(StrEnum):
@@ -284,6 +303,7 @@ class QualificationStatus(StrEnum):
 
 __all__ = [
     "AgencyStatus",
+    "AppointmentEventType",
     "AppointmentStatus",
     "AuditAction",
     "AuthAuditEventType",

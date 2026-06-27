@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from src.shared.domain.enums import (
     AgencyStatus,
+    AppointmentEventType,
     AppointmentStatus,
     AuditAction,
     AuthAuditEventType,
@@ -33,6 +34,7 @@ from src.shared.domain.enums import (
 # Python enum class -> Postgres ENUM name
 ENUM_TYPE_NAMES: dict[type, str] = {
     AgencyStatus: "agency_status",
+    AppointmentEventType: "appointment_event_type",
     AppointmentStatus: "appointment_status",
     AuditAction: "audit_action",
     AuthAuditEventType: "auth_audit_event_type",

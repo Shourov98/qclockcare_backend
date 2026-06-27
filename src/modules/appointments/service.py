@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from datetime import date
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -48,27 +49,43 @@ from sqlalchemy.orm import selectinload
 
 from src.core.exceptions import (
     ConflictError,
+    CrossAgencyAccessDeniedError,
     DuplicateResourceError,
     InvalidStateTransitionError,
     NotFoundError,
     ValidationError,
 )
 from src.modules.agencies.models import Agency
-from src.modules.appointments.models import Appointment, AppointmentServiceItem
+from src.modules.appointments.events import append_appointment_event
+from src.modules.appointments.models import (
+    Appointment,
+    AppointmentConfirmation,
+    AppointmentEvent,
+    AppointmentServiceItem,
+)
 from src.modules.appointments.schemas import (
+    AppointmentCancellationRequest,
     AppointmentCancelRequest,
+    AppointmentConfirmRequest,
     AppointmentCreateRequest,
+    AppointmentRescheduleRequest,
     AppointmentServiceItemCreateRequest,
     AppointmentServiceItemUpdateRequest,
     AppointmentStatusTransitionRequest,
     AppointmentUpdateRequest,
 )
-from src.modules.patients.models import PatientProfile
+from src.modules.patients.models import (
+    GuardianProfile,
+    PatientGuardianRelationship,
+    PatientProfile,
+)
 from src.modules.staff.models import StaffProfile
 from src.shared.domain.enums import (
+    AppointmentEventType,
     AppointmentStatus,
     ConfirmationStatus,
     ServiceItemStatus,
+    UserRole,
 )
 from src.shared.utils.datetime_utils import utc_now
 
@@ -105,6 +122,7 @@ _ALLOWED_TRANSITIONS: dict[AppointmentStatus, frozenset[AppointmentStatus]] = {
         {
             AppointmentStatus.CONFIRMED,
             AppointmentStatus.CANCELLATION_REQUESTED,
+            AppointmentStatus.RESCHEDULE_REQUESTED,
             AppointmentStatus.NO_SHOW,
             AppointmentStatus.REJECTED,
         }
@@ -227,6 +245,7 @@ async def _get_appointment_or_404(
     appointment_id: uuid.UUID,
     agency_id: uuid.UUID,
     with_items: bool = False,
+    with_patient: bool = False,
 ) -> Appointment:
     stmt = select(Appointment).where(
         Appointment.id == appointment_id,
@@ -234,6 +253,8 @@ async def _get_appointment_or_404(
     )
     if with_items:
         stmt = stmt.options(selectinload(Appointment.service_items))
+    if with_patient:
+        stmt = stmt.options(selectinload(Appointment.patient))
     appt = (await session.execute(stmt)).scalar_one_or_none()
     if appt is None:
         raise NotFoundError(
@@ -289,6 +310,104 @@ async def _assert_staff_exists(
     )
     if (await session.execute(stmt)).scalar_one_or_none() is None:
         raise NotFoundError(details={"resource": "staff_profile", "id": str(staff_id)})
+
+
+async def _assert_actor_may_act_for_patient(
+    session: AsyncSession,
+    *,
+    actor_user_id: uuid.UUID,
+    actor_role: UserRole,
+    patient_id: uuid.UUID,
+    agency_id: uuid.UUID,
+) -> None:
+    """Authorise an actor to act on behalf of a patient.
+
+    Rules:
+      - AGENCY_ADMIN at the agency: always allowed.
+      - PATIENT: must own the appointment (patient.user_id == actor).
+      - GUARDIAN: must have an active legal guardian relationship to
+        the patient at the agency.
+      - STAFF / SUPER_ADMIN: not allowed on patient-initiated actions.
+    Raises:
+        CrossAgencyAccessDeniedError: actor has no relationship to the
+            patient at the agency.
+    """
+    if actor_role == UserRole.AGENCY_ADMIN:
+        return
+
+    if actor_role == UserRole.PATIENT:
+        owner = (
+            await session.execute(
+                select(PatientProfile.user_id).where(
+                    PatientProfile.id == patient_id,
+                    PatientProfile.agency_id == agency_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if owner != actor_user_id:
+            # Privacy: don't leak the existence of an appointment to a
+            # patient who doesn't own it. 404 is the right answer.
+            raise NotFoundError(
+                details={"resource": "appointment", "id": str(patient_id)}
+            )
+        return
+
+    if actor_role == UserRole.GUARDIAN:
+        # Resolve the guardian profile for this user at the agency.
+        guardian = (
+            await session.execute(
+                select(GuardianProfile.id).where(
+                    GuardianProfile.user_id == actor_user_id,
+                    GuardianProfile.agency_id == agency_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if guardian is None:
+            # Privacy: don't leak the existence of an appointment to a
+            # guardian who has no link at this agency.
+            raise NotFoundError(
+                details={"resource": "appointment", "id": str(patient_id)}
+            )
+        # Look up an active (non-expired) legal relationship.
+        today = date.today()
+        rel = (
+            await session.execute(
+                select(PatientGuardianRelationship.id).where(
+                    PatientGuardianRelationship.guardian_id == guardian,
+                    PatientGuardianRelationship.patient_id == patient_id,
+                    PatientGuardianRelationship.agency_id == agency_id,
+                    PatientGuardianRelationship.is_legal.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+        if rel is None:
+            raise NotFoundError(
+                details={"resource": "appointment", "id": str(patient_id)}
+            )
+        # Check the optional validity window.
+        validity = (
+            await session.execute(
+                select(
+                    PatientGuardianRelationship.valid_from,
+                    PatientGuardianRelationship.valid_until,
+                ).where(PatientGuardianRelationship.id == rel)
+            )
+        ).one_or_none()
+        if validity is not None:
+            vfrom, vuntil = validity
+            if vfrom is not None and vfrom > today:
+                raise NotFoundError(
+                    details={"resource": "appointment", "id": str(patient_id)}
+                )
+            if vuntil is not None and vuntil < today:
+                raise NotFoundError(
+                    details={"resource": "appointment", "id": str(patient_id)}
+                )
+        return
+
+    raise CrossAgencyAccessDeniedError(
+        details={"reason": f"role {actor_role.value} may not act on patient behalf"}
+    )
 
 
 def _extract_constraint(exc: IntegrityError) -> str:
@@ -379,13 +498,16 @@ async def get_appointment(
     appointment_id: uuid.UUID,
     agency_id: uuid.UUID,
     with_items: bool = False,
+    with_patient: bool = False,
 ) -> Appointment:
-    """Fetch a single appointment, optionally with nested service items."""
+    """Fetch a single appointment, optionally with nested service items
+    and/or the linked PatientProfile eager-loaded."""
     return await _get_appointment_or_404(
         session,
         appointment_id=appointment_id,
         agency_id=agency_id,
         with_items=with_items,
+        with_patient=with_patient,
     )
 
 
@@ -511,12 +633,16 @@ async def transition_status(
     appointment_id: uuid.UUID,
     agency_id: uuid.UUID,
     payload: AppointmentStatusTransitionRequest,
+    actor_user_id: uuid.UUID | None = None,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
 ) -> Appointment:
     """Move the appointment through the lifecycle state machine.
 
     Validates the (current → requested) edge exists; otherwise raises
     `InvalidStateTransitionError`. Also stamps the lifecycle timestamps
-    (confirmed_at, checked_in_at, etc.) when applicable.
+    (confirmed_at, checked_in_at, etc.) when applicable. Appends one
+    `STATUS_TRANSITION` event on success.
     """
     appt = await _get_appointment_or_404(
         session, appointment_id=appointment_id, agency_id=agency_id
@@ -561,8 +687,22 @@ async def transition_status(
     if payload.status == AppointmentStatus.COMPLETED and appt.completed_at is None:
         appt.completed_at = utc_now()
 
+    from_status = appt.status
     appt.status = payload.status
     await session.flush()
+
+    await append_appointment_event(
+        session,
+        agency_id=agency_id,
+        appointment_id=appt.id,
+        event_type=AppointmentEventType.STATUS_TRANSITION,
+        actor_user_id=actor_user_id,
+        from_status=from_status,
+        to_status=appt.status,
+        metadata={"note": payload.note},
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
     return appt
 
 
@@ -572,19 +712,22 @@ async def cancel_appointment(
     appointment_id: uuid.UUID,
     agency_id: uuid.UUID,
     payload: AppointmentCancelRequest,
+    actor_user_id: uuid.UUID | None = None,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
 ) -> Appointment:
     """Cancel an appointment.
 
     Cancellation is only allowed BEFORE the visit is checked in. After
     that, use `transition_status` to mark NO_SHOW or to walk the dispute
-    flow.
+    flow. Appends one `CANCELLED_BY_ADMIN` event on success.
     """
     appt = await _get_appointment_or_404(
         session, appointment_id=appointment_id, agency_id=agency_id
     )
 
     if appt.status == AppointmentStatus.CANCELLED:
-        # Idempotent — return as-is
+        # Idempotent — return as-is (no event)
         return appt
 
     if appt.status in {
@@ -603,10 +746,24 @@ async def cancel_appointment(
             details={"current_status": appt.status.value},
         )
 
+    from_status = appt.status
     appt.status = AppointmentStatus.CANCELLED
     appt.cancelled_reason = payload.reason
     appt.cancelled_at = utc_now()
     await session.flush()
+
+    await append_appointment_event(
+        session,
+        agency_id=agency_id,
+        appointment_id=appt.id,
+        event_type=AppointmentEventType.CANCELLED_BY_ADMIN,
+        actor_user_id=actor_user_id,
+        from_status=from_status,
+        to_status=appt.status,
+        metadata={"reason": payload.reason},
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
     return appt
 
 
@@ -795,15 +952,373 @@ async def delete_service_item(
     await session.flush()
 
 
+# --------------------------------------------------------------------------
+# Lifecycle — patient-facing confirm / reschedule / cancel-request
+# --------------------------------------------------------------------------
+async def confirm_appointment(
+    session: AsyncSession,
+    *,
+    appointment_id: uuid.UUID,
+    agency_id: uuid.UUID,
+    actor_user_id: uuid.UUID,
+    actor_role: UserRole,
+    payload: AppointmentConfirmRequest,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> tuple[Appointment, AppointmentConfirmation]:
+    """Patient/guardian/admin confirms or declines an appointment.
+
+    Allowed from `AWAITING_CONFIRMATION`, `SCHEDULED`, `NOTIFICATION_SENT`
+    (admin override). Writes a row to `appointment_confirmations` (1:1
+    upsert — re-confirming overwrites the prior row) and appends an
+    `AppointmentEvent`. Best-effort fan-out to staff notifications.
+    """
+    appt = await _get_appointment_or_404(
+        session, appointment_id=appointment_id, agency_id=agency_id
+    )
+
+    # Role gate.
+    if actor_role not in {UserRole.PATIENT, UserRole.GUARDIAN, UserRole.AGENCY_ADMIN}:
+        raise CrossAgencyAccessDeniedError(
+            details={"reason": "only PATIENT/GUARDIAN/AGENCY_ADMIN may confirm"}
+        )
+
+    # Ownership/relationship check (AGENCY_ADMIN passes through).
+    await _assert_actor_may_act_for_patient(
+        session,
+        actor_user_id=actor_user_id,
+        actor_role=actor_role,
+        patient_id=appt.patient_id,
+        agency_id=agency_id,
+    )
+
+    # State-machine gate.
+    allowed_from = {
+        AppointmentStatus.AWAITING_CONFIRMATION,
+        AppointmentStatus.SCHEDULED,
+        AppointmentStatus.NOTIFICATION_SENT,
+    }
+    if appt.status not in allowed_from:
+        raise InvalidStateTransitionError(
+            "Cannot confirm an appointment in its current state.",
+            details={"current_status": appt.status.value},
+        )
+
+    from_status = appt.status
+    new_confirmation_status = (
+        ConfirmationStatus.DECLINED if payload.declined else ConfirmationStatus.CONFIRMED
+    )
+
+    # Upsert the confirmation row (1:1 with the appointment).
+    confirmation_role = (
+        UserRole.GUARDIAN if actor_role == UserRole.GUARDIAN else UserRole.PATIENT
+    )
+
+    existing = (
+        await session.execute(
+            select(AppointmentConfirmation).where(
+                AppointmentConfirmation.appointment_id == appt.id
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        existing.confirmed_by = actor_user_id
+        existing.confirmation_role = confirmation_role
+        existing.status = new_confirmation_status
+        existing.comment = payload.comment
+        existing.created_at = utc_now()
+        confirmation = existing
+    else:
+        confirmation = AppointmentConfirmation(
+            appointment_id=appt.id,
+            confirmed_by=actor_user_id,
+            confirmation_role=confirmation_role,
+            status=new_confirmation_status,
+            comment=payload.comment,
+        )
+        session.add(confirmation)
+        await session.flush()
+
+    # Move the appointment forward only on CONFIRMED; DECLINED leaves
+    # the status as-is (admin still has to /cancel to finalise).
+    if not payload.declined:
+        if not _is_transition_allowed(appt.status, AppointmentStatus.CONFIRMED):
+            raise InvalidStateTransitionError(
+                f"Cannot transition from {appt.status.value} to CONFIRMED.",
+                details={"from": appt.status.value},
+            )
+        appt.status = AppointmentStatus.CONFIRMED
+        appt.confirmation_status = ConfirmationStatus.CONFIRMED
+        appt.confirmed_at = utc_now()
+        if payload.comment:
+            appt.confirmation_note = payload.comment
+
+    to_status = appt.status
+
+    await append_appointment_event(
+        session,
+        agency_id=agency_id,
+        appointment_id=appt.id,
+        event_type=AppointmentEventType.CONFIRMATION_FILED,
+        actor_user_id=actor_user_id,
+        from_status=from_status,
+        to_status=to_status,
+        metadata={"declined": payload.declined, "comment": payload.comment},
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
+
+    # Best-effort staff notification (only on confirmed, not declined).
+    if not payload.declined:
+        try:
+            from src.modules.notifications.integrations import (
+                notify_appointment_confirmed,
+            )
+
+            await notify_appointment_confirmed(
+                session, appointment_id=appt.id, agency_id=agency_id
+            )
+        except Exception:
+            # Swallow — failures here must never break the write.
+            pass
+
+    await session.flush()
+    return appt, confirmation
+
+
+async def request_reschedule(
+    session: AsyncSession,
+    *,
+    appointment_id: uuid.UUID,
+    agency_id: uuid.UUID,
+    actor_user_id: uuid.UUID,
+    actor_role: UserRole,
+    payload: AppointmentRescheduleRequest,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> Appointment:
+    """Patient/guardian/admin proposes a new visit window.
+
+    The appointment moves to `RESCHEDULE_REQUESTED`; the admin reviews
+    and either patches the existing `scheduled_start`/`scheduled_end`
+    (via PATCH) or cancels. The proposed window is stored in the event's
+    `metadata` so it's visible in the timeline.
+    """
+    appt = await _get_appointment_or_404(
+        session, appointment_id=appointment_id, agency_id=agency_id
+    )
+
+    if actor_role not in {UserRole.PATIENT, UserRole.GUARDIAN, UserRole.AGENCY_ADMIN}:
+        raise CrossAgencyAccessDeniedError(
+            details={"reason": "only PATIENT/GUARDIAN/AGENCY_ADMIN may request"}
+        )
+
+    await _assert_actor_may_act_for_patient(
+        session,
+        actor_user_id=actor_user_id,
+        actor_role=actor_role,
+        patient_id=appt.patient_id,
+        agency_id=agency_id,
+    )
+
+    allowed_from = {
+        AppointmentStatus.AWAITING_CONFIRMATION,
+        AppointmentStatus.SCHEDULED,
+        AppointmentStatus.NOTIFICATION_SENT,
+        AppointmentStatus.CONFIRMED,
+    }
+    if appt.status not in allowed_from:
+        raise InvalidStateTransitionError(
+            "Cannot request a reschedule in the current state.",
+            details={"current_status": appt.status.value},
+        )
+    if not _is_transition_allowed(appt.status, AppointmentStatus.RESCHEDULE_REQUESTED):
+        raise InvalidStateTransitionError(
+            f"Cannot transition from {appt.status.value} to RESCHEDULE_REQUESTED.",
+            details={"from": appt.status.value},
+        )
+
+    from_status = appt.status
+    appt.status = AppointmentStatus.RESCHEDULE_REQUESTED
+    to_status = appt.status
+
+    await append_appointment_event(
+        session,
+        agency_id=agency_id,
+        appointment_id=appt.id,
+        event_type=AppointmentEventType.RESCHEDULE_REQUESTED,
+        actor_user_id=actor_user_id,
+        from_status=from_status,
+        to_status=to_status,
+        metadata={
+            "proposed_start": payload.proposed_start.isoformat(),
+            "proposed_end": payload.proposed_end.isoformat(),
+            "comment": payload.comment,
+        },
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
+
+    try:
+        from src.modules.notifications.integrations import (
+            notify_appointment_reschedule_requested,
+        )
+
+        await notify_appointment_reschedule_requested(
+            session,
+            appointment_id=appt.id,
+            agency_id=agency_id,
+            proposed_start=payload.proposed_start,
+            proposed_end=payload.proposed_end,
+        )
+    except Exception:
+        pass
+
+    await session.flush()
+    return appt
+
+
+async def request_cancellation(
+    session: AsyncSession,
+    *,
+    appointment_id: uuid.UUID,
+    agency_id: uuid.UUID,
+    actor_user_id: uuid.UUID,
+    actor_role: UserRole,
+    payload: AppointmentCancellationRequest,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> Appointment:
+    """Patient/guardian/admin requests cancellation. Moves the appointment
+    to `CANCELLATION_REQUESTED`; admin finalises via the existing /cancel."""
+    appt = await _get_appointment_or_404(
+        session, appointment_id=appointment_id, agency_id=agency_id
+    )
+
+    if actor_role not in {UserRole.PATIENT, UserRole.GUARDIAN, UserRole.AGENCY_ADMIN}:
+        raise CrossAgencyAccessDeniedError(
+            details={"reason": "only PATIENT/GUARDIAN/AGENCY_ADMIN may request"}
+        )
+
+    await _assert_actor_may_act_for_patient(
+        session,
+        actor_user_id=actor_user_id,
+        actor_role=actor_role,
+        patient_id=appt.patient_id,
+        agency_id=agency_id,
+    )
+
+    allowed_from = {
+        AppointmentStatus.AWAITING_CONFIRMATION,
+        AppointmentStatus.CONFIRMED,
+        AppointmentStatus.SCHEDULED,
+        AppointmentStatus.NOTIFICATION_SENT,
+        AppointmentStatus.RESCHEDULE_REQUESTED,
+    }
+    if appt.status not in allowed_from:
+        raise InvalidStateTransitionError(
+            "Cannot request cancellation in the current state.",
+            details={"current_status": appt.status.value},
+        )
+    if not _is_transition_allowed(
+        appt.status, AppointmentStatus.CANCELLATION_REQUESTED
+    ):
+        raise InvalidStateTransitionError(
+            f"Cannot transition from {appt.status.value} to CANCELLATION_REQUESTED.",
+            details={"from": appt.status.value},
+        )
+
+    from_status = appt.status
+    appt.status = AppointmentStatus.CANCELLATION_REQUESTED
+    # Stash the reason so admin reviewers see it on the row.
+    appt.cancelled_reason = payload.reason
+    to_status = appt.status
+
+    await append_appointment_event(
+        session,
+        agency_id=agency_id,
+        appointment_id=appt.id,
+        event_type=AppointmentEventType.CANCELLATION_REQUESTED,
+        actor_user_id=actor_user_id,
+        from_status=from_status,
+        to_status=to_status,
+        metadata={"reason": payload.reason},
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
+
+    try:
+        from src.modules.notifications.integrations import (
+            notify_appointment_cancellation_requested,
+        )
+
+        await notify_appointment_cancellation_requested(
+            session,
+            appointment_id=appt.id,
+            agency_id=agency_id,
+            reason=payload.reason,
+        )
+    except Exception:
+        pass
+
+    await session.flush()
+    return appt
+
+
+async def list_appointment_events(
+    session: AsyncSession,
+    *,
+    appointment_id: uuid.UUID,
+    agency_id: uuid.UUID,
+) -> list[AppointmentEvent]:
+    """List events for one appointment, oldest first (timeline order)."""
+    await _get_appointment_or_404(
+        session, appointment_id=appointment_id, agency_id=agency_id
+    )
+    stmt = (
+        select(AppointmentEvent)
+        .where(
+            AppointmentEvent.appointment_id == appointment_id,
+            AppointmentEvent.agency_id == agency_id,
+        )
+        .order_by(AppointmentEvent.created_at.asc(), AppointmentEvent.id)
+    )
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def get_latest_confirmation(
+    session: AsyncSession,
+    *,
+    appointment_id: uuid.UUID,
+    agency_id: uuid.UUID,
+) -> AppointmentConfirmation | None:
+    """Return the (single) confirmation row for an appointment, or None."""
+    await _get_appointment_or_404(
+        session, appointment_id=appointment_id, agency_id=agency_id
+    )
+    return (
+        await session.execute(
+            select(AppointmentConfirmation).where(
+                AppointmentConfirmation.appointment_id == appointment_id
+            )
+        )
+    ).scalar_one_or_none()
+
+
 __all__ = [
     "add_service_item",
     "assign_staff",
     "cancel_appointment",
+    "confirm_appointment",
     "create_appointment",
     "delete_service_item",
     "get_appointment",
+    "get_latest_confirmation",
+    "list_appointment_events",
     "list_appointments",
     "list_service_items",
+    "request_cancellation",
+    "request_reschedule",
     "transition_status",
     "update_appointment",
     "update_service_item",
