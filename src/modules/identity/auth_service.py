@@ -490,7 +490,6 @@ async def accept_invitation(
     issued (e.g. account was already verified).
     """
     payload = jwt_service.verify_single_use_token(invitation_token, expected_purpose="invitation")
-    payload = jwt_service.verify_single_use_token(invitation_token, expected_purpose="invitation")
 
     row = (
         await session.execute(
