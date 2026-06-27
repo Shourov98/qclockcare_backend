@@ -87,8 +87,8 @@ class StaffProfileResponse(BaseModel):
     updated_at: datetime
     # Optional nested projections — populated only by endpoints that
     # opt in (e.g. GET /staff/{id}/with-details).
-    qualifications: list["StaffQualificationResponse"] | None = None
-    availability: list["StaffAvailabilityResponse"] | None = None
+    qualifications: list[StaffQualificationResponse] | None = None
+    availability: list[StaffAvailabilityResponse] | None = None
 
 
 class StaffProfileSummaryResponse(BaseModel):
@@ -129,7 +129,7 @@ class StaffQualificationCreateRequest(BaseModel):
     status: QualificationStatus = QualificationStatus.PENDING_VERIFICATION
 
     @model_validator(mode="after")
-    def _validate_dates(self) -> "StaffQualificationCreateRequest":
+    def _validate_dates(self) -> StaffQualificationCreateRequest:
         if self.issued_at and self.expires_at and self.expires_at < self.issued_at:
             raise ValueError("expires_at must be on or after issued_at")
         return self
@@ -151,7 +151,7 @@ class StaffQualificationUpdateRequest(BaseModel):
     program_type: ProgramType | None = None
 
     @model_validator(mode="after")
-    def _validate_dates(self) -> "StaffQualificationUpdateRequest":
+    def _validate_dates(self) -> StaffQualificationUpdateRequest:
         if self.issued_at and self.expires_at and self.expires_at < self.issued_at:
             raise ValueError("expires_at must be on or after issued_at")
         return self
@@ -165,12 +165,35 @@ class StaffQualificationResponse(BaseModel):
     agency_id: UUID
     qualification_type: QualificationType
     program_type: ProgramType | None
-    document_storage_key: str | None
+    # Short-lived signed download URL, or None if the qualification has
+    # no attached document. Generated server-side from the underlying
+    # storage key — the raw key is never returned to clients.
+    download_url: str | None = None
+    # Storage key TTL in seconds (matches `settings.S3_PRESIGNED_URL_TTL_SECONDS`).
+    # `None` when `download_url` is None. Surfaced so the client can
+    # show "expires in N minutes" or schedule a refresh.
+    expires_in: int | None = None
     issued_at: date | None
     expires_at: date | None
     status: QualificationStatus
     created_at: datetime
     updated_at: datetime
+
+
+class QualificationDownloadResponse(BaseModel):
+    """GET /staff/{staff_id}/qualifications/{qualification_id}/download.
+
+    Returns a short-lived signed URL the client can hand to a browser.
+    `expires_in` and `expires_at` are the same number expressed two
+    ways — `expires_in` for display ("expires in N minutes"),
+    `expires_at` for scheduling a refresh.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    download_url: str
+    expires_in: int = Field(ge=60, le=86400)
+    expires_at: datetime
 
 
 # --------------------------------------------------------------------------
@@ -205,7 +228,7 @@ class _AvailabilityBase(BaseModel):
     specific_end: datetime | None = None
 
     @model_validator(mode="after")
-    def _validate_flavor(self) -> "_AvailabilityBase":
+    def _validate_flavor(self) -> _AvailabilityBase:
         recurring = self.day_of_week is not None
         one_off = self.specific_date is not None
         if recurring == one_off:  # both set or both unset

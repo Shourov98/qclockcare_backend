@@ -12,13 +12,15 @@ take an `agency_id` parameter for defence in depth and to make logging
 from __future__ import annotations
 
 import uuid
-from typing import Sequence
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from src.core.config import settings
 from src.core.exceptions import (
     ConflictError,
     DuplicateResourceError,
@@ -42,6 +44,8 @@ from src.modules.staff.schemas import (
     StaffQualificationUpdateRequest,
 )
 from src.shared.domain.enums import UserRole, UserStatus
+from src.shared.storage import get_storage
+
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -88,6 +92,24 @@ async def _get_qualification_or_404(
             details={"resource": "staff_qualification", "id": str(qualification_id)}
         )
     return qual
+
+
+async def get_qualification(
+    session: AsyncSession,
+    *,
+    qualification_id: uuid.UUID,
+    staff_id: uuid.UUID,
+    agency_id: uuid.UUID,
+) -> StaffQualification:
+    """Public wrapper around `_get_qualification_or_404` so router
+    code can fetch a single qualification without reaching into a
+    private helper."""
+    return await _get_qualification_or_404(
+        session,
+        qualification_id=qualification_id,
+        staff_id=staff_id,
+        agency_id=agency_id,
+    )
 
 
 async def _get_availability_or_404(
@@ -548,3 +570,46 @@ def _extract_constraint(exc: IntegrityError) -> str:
     if diag is not None and getattr(diag, "constraint_name", None):
         return diag.constraint_name
     return "unknown"
+
+
+# --------------------------------------------------------------------------
+# Storage (download URL signing)
+# --------------------------------------------------------------------------
+def _qualifications_bucket() -> str:
+    """Bucket name for staff-qualification documents, resolved from
+    the active storage backend's setting."""
+    if settings.STORAGE_BACKEND == "supabase":
+        return settings.SUPABASE_STORAGE_BUCKET_QUALIFICATIONS
+    return settings.S3_BUCKET_QUALIFICATIONS
+
+
+async def build_download_url(
+    *,
+    storage_key: str,
+) -> tuple[str, datetime]:
+    """Generate a short-lived signed URL for `storage_key`.
+
+    Returns `(url, expires_at)`. The TTL is read from
+    `settings.S3_PRESIGNED_URL_TTL_SECONDS` so operators have one knob
+    to control signed-URL lifetime for both backends.
+
+    Raises:
+        ValidationError: if `storage_key` is empty (the qualification
+            has no attached document).
+    """
+    if not storage_key:
+        raise ValidationError(
+            "Qualification has no attached document.",
+            details={"reason": "document_storage_key_is_null"},
+        )
+
+    bucket = _qualifications_bucket()
+    expires_in = settings.S3_PRESIGNED_URL_TTL_SECONDS
+    url = get_storage().presigned_url(
+        bucket=bucket,
+        key=storage_key,
+        expires_in=expires_in,
+        method="GET",
+    )
+    expires_at = datetime.now(UTC) + timedelta(seconds=expires_in)
+    return url, expires_at

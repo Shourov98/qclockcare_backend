@@ -50,8 +50,8 @@ from src.shared.utils.datetime_utils import utc_now
 
 if TYPE_CHECKING:
     from src.modules.agencies.models import Agency
-    from src.modules.identity.models import User
     from src.modules.appointments.models import Appointment
+    from src.modules.identity.models import User
 
 
 # --------------------------------------------------------------------------
@@ -93,10 +93,10 @@ class StaffProfile(IdMixin, TimestampedMixin, Base):
     terminated_at: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     # Relationships
-    agency: Mapped["Agency"] = relationship(  # noqa: F821
+    agency: Mapped[Agency] = relationship(
         "Agency", back_populates="staff_profiles"
     )
-    user: Mapped["User"] = relationship(  # noqa: F821
+    user: Mapped[User] = relationship(
         "User", back_populates="staff_profiles"
     )
     qualifications: Mapped[list[StaffQualification]] = relationship(
@@ -107,7 +107,7 @@ class StaffProfile(IdMixin, TimestampedMixin, Base):
         back_populates="staff",
         cascade="all, delete-orphan",
     )
-    appointments: Mapped[list["Appointment"]] = relationship(  # noqa: F821
+    appointments: Mapped[list[Appointment]] = relationship(
         "Appointment", back_populates="staff"
     )
 

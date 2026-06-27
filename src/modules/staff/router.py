@@ -18,6 +18,7 @@ Endpoints:
   POST   /staff/{id}/qualifications
   PATCH  /staff/{id}/qualifications/{qid}
   DELETE /staff/{id}/qualifications/{qid}             — revoke
+  GET    /staff/{id}/qualifications/{qid}/download    — signed URL
 
   GET    /staff/{id}/availability
   POST   /staff/{id}/availability
@@ -27,12 +28,14 @@ Endpoints:
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import settings
 from src.core.exceptions import CrossAgencyAccessDeniedError, ForbiddenError
 from src.core.logging import get_logger
 from src.modules.audit_logs import service as audit_logs_service
@@ -43,6 +46,7 @@ from src.modules.identity.dependencies import (
 )
 from src.modules.staff import service as staff_service
 from src.modules.staff.schemas import (
+    QualificationDownloadResponse,
     StaffAvailabilityCreateRequest,
     StaffAvailabilityResponse,
     StaffAvailabilityUpdateRequest,
@@ -129,6 +133,40 @@ def _to_response(
         data["qualifications"] = None
         data["availability"] = None
     return StaffProfileResponse.model_validate(data)
+
+
+async def _qualification_to_response(qual: object) -> StaffQualificationResponse:
+    """Build a `StaffQualificationResponse`, populating `download_url`
+    + `expires_in` from the underlying storage key.
+
+    When the qualification has no attached document
+    (`document_storage_key is None`), both fields stay `None` — the
+    raw key is never leaked to the client.
+    """
+    storage_key = getattr(qual, "document_storage_key", None)
+    download_url: str | None = None
+    expires_in: int | None = None
+    if storage_key:
+        url, _expires_at = await staff_service.build_download_url(
+            storage_key=storage_key,
+        )
+        download_url = url
+        expires_in = settings.S3_PRESIGNED_URL_TTL_SECONDS
+
+    return StaffQualificationResponse(
+        id=qual.id,
+        staff_id=qual.staff_id,
+        agency_id=qual.agency_id,
+        qualification_type=qual.qualification_type,
+        program_type=qual.program_type,
+        download_url=download_url,
+        expires_in=expires_in,
+        issued_at=qual.issued_at,
+        expires_at=qual.expires_at,
+        status=qual.status,
+        created_at=qual.created_at,
+        updated_at=qual.updated_at,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -339,7 +377,7 @@ async def list_qualifications_endpoint(
     quals = await staff_service.list_qualifications(
         session, staff_id=staff_id, agency_id=agency_id
     )
-    return [StaffQualificationResponse.model_validate(q) for q in quals]
+    return [await _qualification_to_response(q) for q in quals]
 
 
 @router.post(
@@ -362,7 +400,7 @@ async def add_qualification_endpoint(
     await session.commit()
     await session.refresh(qual)
     # Best-effort audit log.
-    try:
+    with contextlib.suppress(Exception):
         ip, ua = audit_logs_service.request_ip_ua(request)
         await audit_logs_service.audit_log(
             session,
@@ -379,9 +417,7 @@ async def add_qualification_endpoint(
             user_agent=ua,
         )
         await session.commit()
-    except Exception:
-        pass
-    return StaffQualificationResponse.model_validate(qual)
+    return await _qualification_to_response(qual)
 
 
 @router.patch(
@@ -418,7 +454,7 @@ async def update_qualification_endpoint(
     await session.commit()
     await session.refresh(qual)
     # Best-effort audit log.
-    try:
+    with contextlib.suppress(Exception):
         ip, ua = audit_logs_service.request_ip_ua(request)
         await audit_logs_service.audit_log(
             session,
@@ -432,9 +468,7 @@ async def update_qualification_endpoint(
             user_agent=ua,
         )
         await session.commit()
-    except Exception:
-        pass
-    return StaffQualificationResponse.model_validate(qual)
+    return await _qualification_to_response(qual)
 
 
 @router.delete(
@@ -458,7 +492,7 @@ async def revoke_qualification_endpoint(
     )
     await session.commit()
     # Best-effort audit log.
-    try:
+    with contextlib.suppress(Exception):
         ip, ua = audit_logs_service.request_ip_ua(request)
         await audit_logs_service.audit_log(
             session,
@@ -472,9 +506,51 @@ async def revoke_qualification_endpoint(
             user_agent=ua,
         )
         await session.commit()
-    except Exception:
-        pass
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/{staff_id}/qualifications/{qualification_id}/download",
+    response_model=QualificationDownloadResponse,
+)
+async def get_qualification_download_endpoint(
+    staff_id: uuid.UUID,
+    qualification_id: uuid.UUID,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> QualificationDownloadResponse:
+    """Generate a short-lived signed URL for the attached document.
+
+    Authorisation: AGENCY_ADMIN at the agency, or the staff member
+    themselves (mirrors the PATCH rules).
+    """
+    agency_id = _require_agency(ctx)
+    staff = await staff_service.get_staff(
+        session, staff_id=staff_id, agency_id=agency_id
+    )
+    _ensure_can_view(ctx, staff.user_id)
+    if ctx.role == UserRole.STAFF and staff.user_id != ctx.user_id:
+        raise ForbiddenError("Staff can only download their own qualifications.")
+
+    qual = await staff_service.get_qualification(
+        session,
+        qualification_id=qualification_id,
+        staff_id=staff_id,
+        agency_id=agency_id,
+    )
+    url, expires_at = await staff_service.build_download_url(
+        storage_key=qual.document_storage_key or "",
+    )
+    # NOTE: We do not write an audit row here. The Postgres
+    # `audit_action` enum doesn't have a READ value; adding one is a
+    # schema migration that is out of scope for this PR. The download
+    # itself is logged at the storage layer via the signed-URL access
+    # log (CloudFront / S3 / Supabase audit log).
+    return QualificationDownloadResponse(
+        download_url=url,
+        expires_in=settings.S3_PRESIGNED_URL_TTL_SECONDS,
+        expires_at=expires_at,
+    )
 
 
 # --------------------------------------------------------------------------
