@@ -1,0 +1,140 @@
+# Newman-driven API smoke test.
+#
+# Runs on every PR that touches src/** or postman/**, and on every push to
+# develop. Boots a fresh Postgres, runs migrations, seeds a test user,
+# starts the API, and runs the Postman collection via Newman.
+#
+# The pytest integration suite is a richer test of business logic; this
+# job is a *fast contract check* — it makes sure the routes still work
+# end-to-end against a real DB. If a route's response envelope changes,
+# or a route returns 500, this job fails.
+
+name: API Smoke (Newman)
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "postman/**"
+      - "scripts/seed_test_user.py"
+      - ".github/workflows/api-smoke.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "alembic/**"
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+# Don't cancel a previous run on a new push — let it finish and upload.
+concurrency:
+  group: api-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  newman:
+    name: Newman vs running API
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: qlockcare_test
+          POSTGRES_USER: qlockcare_test
+          POSTGRES_PASSWORD: qlockcare_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # pyproject.toml requires DATABASE_URL — set it before anything
+      # touches the Settings model.
+      DATABASE_URL: postgresql+asyncpg://qlockcare_test:qlockcare_test@localhost:5432/qlockcare_test
+      APP_ENV: test
+      JWT_SECRET: ci-only-do-not-use-in-prod-please-rotate-32chars
+      SUPABASE_JWT_SECRET: ci-only-do-not-use-in-prod-please-rotate-32chars
+      CORS_ORIGINS: "http://localhost:8000"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node 20 (for Newman)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install uv
+        run: pip install --upgrade pip && pip install uv
+
+      - name: Cache uv dependencies
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+          restore-keys: |
+            venv-${{ runner.os }}-
+
+      - name: Install Python dependencies
+        run: uv sync --all-extras
+
+      # The RLS migration (0002) requires `app_user` to exist when seeded.
+      # The seed user inserts go through `postgres`, so RLS doesn't fire
+      # for them — that's intentional. We just need the schema present.
+      - name: Run migrations
+        run: uv run alembic upgrade head
+
+      - name: Seed dev users
+        run: uv run python scripts/seed_test_user.py
+
+      - name: Install Newman + HTML reporter
+        run: npm install -g newman newman-reporter-html
+
+      - name: Start uvicorn (background)
+        run: |
+          nohup uv run uvicorn src.main:app --host 127.0.0.1 --port 8000 \
+            > uvicorn.log 2>&1 &
+          echo "uvicorn pid: $!"
+
+      - name: Wait for /health
+        run: |
+          for i in {1..30}; do
+            if curl -fs http://127.0.0.1:8000/health > /dev/null; then
+              echo "API is up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "ERROR: API never came up"
+          tail -50 uvicorn.log
+          exit 1
+
+      - name: Run Newman
+        run: bash scripts/run_newman.sh postman/environments/CI.postman_environment.json
+
+      - name: Upload Newman report (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: newman-report
+          path: postman/reports/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload uvicorn log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uvicorn-log
+          path: uvicorn.log
+          retention-days: 7
