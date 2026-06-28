@@ -1,0 +1,141 @@
+// Agencies module — Flow 2: Suspend → reactivate (status transition stamping)
+// PATCH /agencies/{id} {status: SUSPENDED} → PATCH {status: ACTIVE}
+//
+// Render:   dot -Tpng agencies_flow_patch.dot -o agencies_flow_patch.png
+//           dot -Tsvg agencies_flow_patch.dot -o agencies_flow_patch.svg
+
+digraph agencies_patch_flow {
+    rankdir=TB;
+    splines=true;
+    nodesep=0.45;
+    ranksep=0.7;
+    bgcolor="#0f1115";
+    fontname="Helvetica";
+    fontcolor="#e6e6e6";
+    label=<<B>agencies / status transition flow</B><BR/>
+           <FONT POINT-SIZE="11" COLOR="#9aa3b2">SUSPENDED → ACTIVE · settings.suspended_at / reactivated_at stamping</FONT>>;
+    labelloc="t";
+
+    node [shape=box, style="rounded,filled", fontname="Helvetica",
+          color="#3a4252", penwidth=1.2, fontcolor="#e6e6e6",
+          fillcolor="#1a1f29"];
+
+    edge [fontname="Helvetica", fontsize=10, color="#7e8aa3",
+          fontcolor="#9aa3b2", arrowsize=0.8];
+
+    start  [shape=circle, label="START", fillcolor="#0d6e3a",
+            fontcolor="#ffffff", width=0.7, fixedsize=true];
+    end    [shape=doublecircle, label="END", fillcolor="#7a1f2b",
+            fontcolor="#ffffff", width=0.7, fixedsize=true];
+
+    // ---- pre-state ----
+    state_active [label="PRE-STATE\nagency = {\n  name='Acme Home Care',\n  status='ACTIVE',\n  settings={theme:'dark'}\n}",
+                  fillcolor="#1c2540"];
+
+    // ---- step 1: suspend ----
+    suspend_req [label="STEP 1 — PATCH /agencies/{id}\n{\n  status: 'SUSPENDED'\n}\nPydantic strips 'unset' fields\n→ updates = {status: 'SUSPENDED'}",
+                  fillcolor="#1a3a2a"];
+
+    fetch [label="update_agency()\n  1. _get_agency_or_404(include_deleted=False)\n  2. updates = payload.model_dump(exclude_unset=True)\n  3. new_status = updates.get('status')\n  4. Branch on new_status (see next column)",
+            fillcolor="#1a3a2a"];
+
+    branch_susp [label="new_status ==\n'SUSPENDED' ?", shape=diamond,
+                 fillcolor="#3a2a1a", fontcolor="#ffcb6b"];
+
+    stamp_susp [label="Stamp settings.suspended_at\n  settings = dict(agency.settings or {})\n  settings.setdefault('suspended_at', now().isoformat())\n  updates['settings'] = settings",
+                 fillcolor="#1a3a2a"];
+
+    db_update_susp [label="UPDATE agencies\n  SET status='SUSPENDED',\n      settings=jsonb_merge(...),\n      updated_at=now()\n  WHERE id=:id",
+                    shape=note, fillcolor="#22273a"];
+
+    audit_susp [label="audit_logs row\n  action=UPDATE\n  entity_type='AGENCY'\n  new_data = {status: 'SUSPENDED'}\n  (only the changed field is logged)",
+                 shape=note, fillcolor="#22273a"];
+
+    resp_susp [label="200 OK\n{\n  id, name='Acme Home Care',\n  status='SUSPENDED',\n  settings={\n    theme:'dark',\n    suspended_at:'2026-06-29T10:30:00Z'\n  }\n}",
+                fillcolor="#0d6e3a", fontcolor="#ffffff"];
+
+    // ---- step 2: reactivate ----
+    reactivate_req [label="STEP 2 — PATCH /agencies/{id}\n{\n  status: 'ACTIVE'\n}",
+                     fillcolor="#1a3a2a"];
+
+    branch_react [label="new_status ∈\n{ACTIVE, TRIAL} ?", shape=diamond,
+                  fillcolor="#3a2a1a", fontcolor="#ffcb6b"];
+
+    stamp_react [label="Clear suspension / churn flags\n  if 'suspended_at' in settings:\n    settings['reactivated_at'] = now().isoformat()\n    del settings['suspended_at']\n  if 'churned_at' in settings:\n    del settings['churned_at']\n  updates['settings'] = settings",
+                  fillcolor="#1a3a2a"];
+
+    db_update_react [label="UPDATE agencies\n  SET status='ACTIVE',\n      settings=jsonb_merge(...),\n      updated_at=now()\n  WHERE id=:id",
+                     shape=note, fillcolor="#22273a"];
+
+    audit_react [label="audit_logs row\n  action=UPDATE\n  new_data = {status: 'ACTIVE'}",
+                  shape=note, fillcolor="#22273a"];
+
+    resp_react [label="200 OK\n{\n  id, name='Acme Home Care',\n  status='ACTIVE',\n  settings={\n    theme:'dark',\n    reactivated_at:'2026-06-29T10:35:00Z'\n  }\n}",
+                 fillcolor="#0d6e3a", fontcolor="#ffffff"];
+
+    // ---- churn branch (not walked but documented) ----
+    branch_churn [label="new_status ==\n'CHURNED' ?", shape=diamond,
+                  fillcolor="#3a2a1a", fontcolor="#ffcb6b"];
+
+    stamp_churn [label="Stamp settings.churned_at\n  settings.setdefault('churned_at', now())",
+                  fillcolor="#1a3a2a"];
+
+    // ---- side branch: no status field ----
+    branch_none [label="new_status is None ?\n(rename / timezone / settings patch only)",
+                 shape=diamond, fillcolor="#3a2a1a", fontcolor="#ffcb6b"];
+
+    no_stamp [label="No status transition →\nno settings stamping\nJust write the changed fields",
+              fillcolor="#1a3a2a"];
+
+    // ---- error branches ----
+    nf [label="404 NOT_FOUND\n(unknown id / soft-deleted)", fillcolor="#7a1f2b",
+        fontcolor="#ffffff"];
+    val [label="422 VALIDATION_ERROR\n(blank name / name>255 / bad timezone)",
+         fillcolor="#7a1f2b", fontcolor="#ffffff"];
+
+    {rank=same; state_active; suspend_req; fetch;}
+    {rank=same; branch_susp; branch_react; branch_churn; branch_none;}
+    {rank=same; stamp_susp; stamp_react; stamp_churn; no_stamp;}
+    {rank=same; db_update_susp; db_update_react; audit_susp; audit_react;}
+    {rank=same; resp_susp; reactivate_req; resp_react; nf; val;}
+
+    // ---- edges ----
+    start -> state_active;
+    state_active -> suspend_req;
+
+    suspend_req -> val      [label="schema invalid", color="#c95a5a"];
+    suspend_req -> fetch    [label="Pydantic OK", color="#5fa86f"];
+    fetch -> nf             [label="agency not found", color="#c95a5a"];
+
+    fetch -> branch_susp;
+    fetch -> branch_react;
+    fetch -> branch_churn;
+    fetch -> branch_none;
+
+    branch_susp -> stamp_susp   [label="Yes", color="#5fa86f"];
+    branch_susp -> branch_churn [label="No", color="#7e8aa3"];
+    branch_churn -> stamp_churn [label="Yes", color="#5fa86f"];
+    branch_churn -> branch_none [label="No", color="#7e8aa3"];
+
+    branch_none -> no_stamp [label="Yes (no status change)", color="#5fa86f"];
+    no_stamp -> db_update_susp [style=invis];
+
+    stamp_susp -> db_update_susp  [label="apply updates", color="#5fa86f"];
+    db_update_susp -> audit_susp  [style=dotted, color="#7e8aa3"];
+    db_update_susp -> resp_susp   [label="commit()", color="#5fa86f"];
+
+    resp_susp -> reactivate_req;
+    reactivate_req -> branch_react [label="(from update_agency entry)", style=invis];
+
+    branch_react -> stamp_react   [label="Yes", color="#5fa86f"];
+    branch_react -> no_stamp      [label="No (rare — straight to write)", color="#7e8aa3"];
+
+    stamp_react -> db_update_react  [label="apply updates", color="#5fa86f"];
+    db_update_react -> audit_react  [style=dotted, color="#7e8aa3"];
+    db_update_react -> resp_react   [label="commit()", color="#5fa86f"];
+
+    resp_react -> end;
+
+    audit_susp -> resp_susp   [style=invis];
+    audit_react -> resp_react [style=invis];
+}

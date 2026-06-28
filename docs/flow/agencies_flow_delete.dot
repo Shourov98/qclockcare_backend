@@ -1,0 +1,111 @@
+// Agencies module — Flow 3: Soft delete + restore
+// DELETE /agencies/{id} → GET → 404 → GET?include_deleted=true → 200
+//
+// Render:   dot -Tpng agencies_flow_delete.dot -o agencies_flow_delete.png
+//           dot -Tsvg agencies_flow_delete.dot -o agencies_flow_delete.svg
+
+digraph agencies_delete_flow {
+    rankdir=TB;
+    splines=true;
+    nodesep=0.45;
+    ranksep=0.7;
+    bgcolor="#0f1115";
+    fontname="Helvetica";
+    fontcolor="#e6e6e6";
+    label=<<B>agencies / soft-delete + restore flow</B><BR/>
+           <FONT POINT-SIZE="11" COLOR="#9aa3b2">DELETE → read default 404 → read include_deleted=true</FONT>>;
+    labelloc="t";
+
+    node [shape=box, style="rounded,filled", fontname="Helvetica",
+          color="#3a4252", penwidth=1.2, fontcolor="#e6e6e6",
+          fillcolor="#1a1f29"];
+
+    edge [fontname="Helvetica", fontsize=10, color="#7e8aa3",
+          fontcolor="#9aa3b2", arrowsize=0.8];
+
+    start  [shape=circle, label="START", fillcolor="#0d6e3a",
+            fontcolor="#ffffff", width=0.7, fixedsize=true];
+    end    [shape=doublecircle, label="END", fillcolor="#7a1f2b",
+            fontcolor="#ffffff", width=0.7, fixedsize=true];
+
+    // ---- pre-state ----
+    pre [label="PRE-STATE\nagency = {\n  id, name,\n  status='SUSPENDED',\n  deleted_at=NULL\n}",
+         fillcolor="#1c2540"];
+
+    // ---- step 1: delete ----
+    del_req [label="STEP 1 — DELETE /agencies/{id}\n(no body)",
+              fillcolor="#1a3a2a"];
+
+    del_svc [label="soft_delete_agency(session, agency_id)\n  1. _get_agency_or_404(include_deleted=True)\n     → find even if previously deleted\n  2. if agency.deleted_at is None:\n       agency.deleted_at = datetime.now(UTC)\n  3. flush()\nIdempotent: deleting an already-deleted\nrow returns the same row without\nre-stamping deleted_at",
+              fillcolor="#1a3a2a"];
+
+    db_del [label="UPDATE agencies\n  SET deleted_at = NOW()\n  WHERE id = :id\nRow stays in DB — preserves FK references\nfrom staff/patient/guardian profiles,\nappointments, visits, audit_logs",
+             shape=note, fillcolor="#22273a"];
+
+    audit_del [label="audit_logs row\n  action=DELETE\n  entity_type='AGENCY'\n  new_data = {soft_delete: true}",
+                shape=note, fillcolor="#22273a"];
+
+    resp_del [label="204 No Content\n(empty body)",
+               fillcolor="#0d6e3a", fontcolor="#ffffff"];
+
+    nf_del [label="404 NOT_FOUND\n(unknown id)",
+             fillcolor="#7a1f2b", fontcolor="#ffffff"];
+
+    // ---- step 2: read default → 404 ----
+    get_def [label="STEP 2 — GET /agencies/{id}\n(include_deleted defaults to False)",
+              fillcolor="#1a3a2a"];
+
+    svc_def [label="_get_agency_or_404(include_deleted=False)\n  stmt = SELECT * FROM agencies\n          WHERE id=:id\n            AND deleted_at IS NULL\n  → row is filtered out → None → raise NotFoundError",
+              fillcolor="#1a3a2a"];
+
+    resp_404 [label="404 NOT_FOUND\n{\n  error: {\n    code:'NOT_FOUND',\n    message:'Agency not found',\n    request_id, timestamp\n  }\n}",
+              fillcolor="#7a1f2b", fontcolor="#ffffff"];
+
+    // ---- step 3: read with include_deleted ----
+    get_inc [label="STEP 3 — GET /agencies/{id}?include_deleted=true",
+              fillcolor="#1a3a2a"];
+
+    svc_inc [label="_get_agency_or_404(include_deleted=True)\n  stmt = SELECT * FROM agencies\n          WHERE id=:id\n          (deleted_at filter removed)\n  → row is found → return agency",
+              fillcolor="#1a3a2a"];
+
+    resp_200 [label="200 OK\n{\n  id, name, status='SUSPENDED',\n  timezone, settings,\n  deleted_at='2026-06-29T10:40:00Z',\n  created_at, updated_at\n}\nUse case: admin / audit tools need to\ninspect the deleted record's history",
+              fillcolor="#0d6e3a", fontcolor="#ffffff"];
+
+    // ---- list-level parallel ----
+    list_default [label="GET /agencies?page=1&page_size=20\nlist_agencies(include_deleted=False)\n→ deleted agency excluded",
+                   fillcolor="#1a3a2a"];
+
+    list_inc [label="GET /agencies?include_deleted=true&page=1\nlist_agencies(include_deleted=True)\n→ deleted agency included",
+               fillcolor="#1a3a2a"];
+
+    {rank=same; pre; del_req; del_svc;}
+    {rank=same; db_del; audit_del; resp_del; nf_del;}
+    {rank=same; get_def; svc_def; resp_404;}
+    {rank=same; get_inc; svc_inc; resp_200; list_default; list_inc;}
+
+    // ---- edges ----
+    start -> pre;
+    pre -> del_req;
+
+    del_req -> del_svc [label="path param uuid", color="#5fa86f"];
+    del_svc -> nf_del  [label="agency_id missing", color="#c95a5a"];
+    del_svc -> db_del  [style=dotted, color="#7e8aa3"];
+    del_svc -> audit_del [style=dotted, color="#7e8aa3"];
+    del_svc -> resp_del [label="commit()", color="#5fa86f"];
+
+    resp_del -> get_def;
+    get_def -> svc_def;
+    svc_def -> resp_404 [label="deleted_at IS NOT NULL\n→ row filtered out", color="#c95a5a"];
+
+    resp_404 -> get_inc [label="admin flips the flag"];
+    get_inc -> svc_inc;
+    svc_inc -> resp_200 [label="row found", color="#5fa86f"];
+    resp_200 -> end;
+
+    // list-level parallels (visible from response_del)
+    resp_del -> list_default [style=dotted, color="#7e8aa3", label="list variant"];
+    resp_del -> list_inc     [style=dotted, color="#7e8aa3", label="list variant"];
+
+    db_del -> del_svc    [style=invis];
+    audit_del -> del_svc [style=invis];
+}
