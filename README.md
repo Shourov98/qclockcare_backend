@@ -106,6 +106,30 @@ floci logs
 
 ---
 
+## Manual API testing (Postman)
+
+For clicking through endpoints by hand (with auto-extracted tokens and
+realistic example bodies), import the Postman collection:
+
+```bash
+# 1. Seed dev users (creates SUPER_ADMIN, AGENCY_ADMIN, STAFF, PATIENT)
+uv run python scripts/seed_test_user.py
+
+# 2. Start the API
+uv run uvicorn src.main:app --port 8001
+
+# 3. In Postman: File → Import → upload
+#      postman/QlockCare_API.postman_collection.json
+#      postman/environments/Local.postman_environment.json
+# 4. Send auth > Login — tokens auto-populate the env.
+```
+
+See [`postman/README.md`](postman/README.md) for the full walkthrough.
+The same collection runs under Newman in CI — see
+`.github/workflows/api-smoke.yml`.
+
+---
+
 ## Documentation
 
 All design docs live in `qclockcare_backend_docs/` (sibling directory):
