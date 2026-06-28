@@ -1,0 +1,111 @@
+// Agencies module — Flow 1: Create + verify a new agency
+// POST /agencies → GET /agencies/{id} → GET /agencies/{id}/programs
+//
+// Render:   dot -Tpng agencies_flow_create.dot -o agencies_flow_create.png
+//           dot -Tsvg agencies_flow_create.dot -o agencies_flow_create.svg
+
+digraph agencies_create_flow {
+    rankdir=TB;
+    splines=true;
+    nodesep=0.45;
+    ranksep=0.7;
+    bgcolor="#0f1115";
+    fontname="Helvetica";
+    fontcolor="#e6e6e6";
+    label=<<B>agencies / create + verify flow</B><BR/>
+           <FONT POINT-SIZE="11" COLOR="#9aa3b2">POST → GET one → GET programs · SUPER_ADMIN only</FONT>>;
+    labelloc="t";
+
+    node [shape=box, style="rounded,filled", fontname="Helvetica",
+          color="#3a4252", penwidth=1.2, fontcolor="#e6e6e6",
+          fillcolor="#1a1f29"];
+
+    edge [fontname="Helvetica", fontsize=10, color="#7e8aa3",
+          fontcolor="#9aa3b2", arrowsize=0.8];
+
+    start  [shape=circle, label="START", fillcolor="#0d6e3a",
+            fontcolor="#ffffff", width=0.7, fixedsize=true];
+    end    [shape=doublecircle, label="END", fillcolor="#7a1f2b",
+            fontcolor="#ffffff", width=0.7, fixedsize=true];
+
+    // ---- auth gate ----
+    auth    [label="STEP 0 — authenticate\nPOST /auth/login\n{email, password}\n→ access_token (15 min JWT)",
+              fillcolor="#1c2540"];
+
+    gate    [label="role check\nrequire_role(SUPER_ADMIN)\n(applied at every endpoint via Depends)",
+              shape=diamond, fillcolor="#3a2a1a", fontcolor="#ffcb6b"];
+
+    forbid  [label="403 INSUFFICIENT_PERMISSIONS\n(AGENCY_ADMIN, STAFF, PATIENT, GUARDIAN)",
+              fillcolor="#7a1f2b", fontcolor="#ffffff"];
+    unauth  [label="401 UNAUTHORIZED\n(missing / expired / malformed token)",
+              fillcolor="#7a1f2b", fontcolor="#ffffff"];
+
+    // ---- step 1: create ----
+    create  [label="STEP 1 — POST /agencies\n{\n  name: str (required, 1..255),\n  timezone: str (default 'America/Chicago'),\n  settings: dict (default {}),\n  initial_program_codes: list[str] (default [])\n}\nPydantic validates:\n  - name/timezone non-empty after strip\n  - program codes ∈ ProgramType enum\n  - dedup program codes preserving order",
+              fillcolor="#1a3a2a"];
+
+    val_bad [label="422 VALIDATION_ERROR\n(blank name, name>255, unknown program code)",
+              fillcolor="#7a1f2b", fontcolor="#ffffff"];
+
+    service_create [label="agencies_service.create_agency(session, payload)\n1. Build Agency(name, timezone, settings)\n   session.add(agency); flush()\n2. IntegrityError → 409 ConflictError\n3. If initial_program_codes:\n     _resolve_program_codes(session, codes)\n     INSERT agency_programs rows (is_enabled=true)\n4. flush()",
+              fillcolor="#1a3a2a"];
+
+    db_create [label="agencies table\n  id (uuid, PK)\n  name, timezone, status='ACTIVE'\n  settings (jsonb), deleted_at (null)\n\nagency_programs table\n  agency_id (FK), program_id (FK)\n  is_enabled=true",
+                shape=note, fillcolor="#22273a"];
+
+    audit_create [label="audit_logs row\n  agency_id=NULL\n  actor_user_id = caller\n  action=CREATE\n  entity_type='AGENCY'\n  entity_id = new agency.id\n  new_data = {name, timezone, status, initial_program_codes}\n  (best-effort: try/except, never breaks the write)",
+                  shape=note, fillcolor="#22273a"];
+
+    resp_201 [label="201 Created\n{\n  id, name, status='ACTIVE',\n  timezone, settings,\n  created_at, updated_at\n}",
+              fillcolor="#0d6e3a", fontcolor="#ffffff"];
+
+    // ---- step 2: get one ----
+    get_one [label="STEP 2 — GET /agencies/{id}\n[include_deleted=false (default)]\n  → _get_agency_or_404()\n    .where(deleted_at IS NULL)",
+              fillcolor="#1a3a2a"];
+
+    resp_200_get [label="200 OK\n{same AgencyResponse body}",
+                   fillcolor="#0d6e3a", fontcolor="#ffffff"];
+
+    nf_get  [label="404 NOT_FOUND\n(unknown id, OR soft-deleted + default)",
+              fillcolor="#7a1f2b", fontcolor="#ffffff"];
+
+    // ---- step 3: list programs ----
+    list_prog [label="STEP 3 — GET /agencies/{id}/programs\nlist_agency_programs(session, agency_id)\n  1. _get_agency_or_404(include_deleted=True)\n  2. SELECT ap, p\n       FROM agency_programs ap\n       JOIN programs p ON p.id = ap.program_id\n      WHERE ap.agency_id = :id\n      ORDER BY p.code\n  → list[(AgencyProgram, Program)]",
+                fillcolor="#1a3a2a"];
+
+    resp_prog [label="200 OK\n{\n  data: [\n    {\n      id, program_id,\n      program_code, program_name,\n      is_enabled, created_at\n    }, ...\n  ]\n}",
+                fillcolor="#0d6e3a", fontcolor="#ffffff"];
+
+    {rank=same; auth; gate;}
+    {rank=same; create; service_create;}
+    {rank=same; resp_201; get_one; list_prog;}
+    {rank=same; val_bad; nf_get; unauth; forbid;}
+    {rank=same; db_create; audit_create; resp_200_get; resp_prog;}
+
+    // ---- edges ----
+    start -> auth;
+    auth -> gate [label="token issued"];
+    gate -> forbid [label="role ∉ {SUPER_ADMIN}", color="#c95a5a"];
+    gate -> unauth  [label="token missing/expired", color="#c95a5a"];
+    gate -> create  [label="role = SUPER_ADMIN", color="#5fa86f"];
+
+    create -> val_bad      [label="schema invalid", color="#c95a5a"];
+    create -> service_create [label="Pydantic OK", color="#5fa86f"];
+
+    service_create -> db_create    [style=dotted, color="#7e8aa3"];
+    service_create -> audit_create [style=dotted, color="#7e8aa3"];
+    service_create -> resp_201     [label="commit()", color="#5fa86f"];
+
+    resp_201 -> get_one [label="client uses new id"];
+    get_one -> nf_get       [label="missing / deleted", color="#c95a5a"];
+    get_one -> resp_200_get [label="found", color="#5fa86f"];
+
+    resp_200_get -> list_prog [label="verify programs"];
+    list_prog -> nf_get      [label="agency_id missing", color="#c95a5a"];
+    list_prog -> resp_prog   [label="agency exists", color="#5fa86f"];
+
+    resp_prog -> end;
+
+    db_create -> service_create    [style=invis];
+    audit_create -> service_create [style=invis];
+}
