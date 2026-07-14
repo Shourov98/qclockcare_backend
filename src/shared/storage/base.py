@@ -55,8 +55,8 @@ class StorageAdapter(ABC):
 
         The 900 s default here is a local safety net only. Production
         callers should source `expires_in` from
-        `settings.S3_PRESIGNED_URL_TTL_SECONDS` (the canonical setting
-        shared by both adapters).
+        `settings.storage_presigned_url_ttl_seconds` (the canonical
+        setting shared by both adapters).
         """
 
     @abstractmethod

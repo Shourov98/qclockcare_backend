@@ -128,21 +128,29 @@ class Settings(BaseSettings):
     TWILIO_FROM_NUMBER: str | None = None
 
     # ----- Storage (ADR-0018) -----
-    STORAGE_BACKEND: Literal["s3", "supabase"] = "s3"
+    # Default is `supabase` — clients already running on Supabase don't
+    # need to set up a separate S3-compatible service. Switch to `s3`
+    # for AWS S3 / Floci / MinIO / Cloudflare R2 deployments.
+    STORAGE_BACKEND: Literal["s3", "supabase"] = "supabase"
     STORAGE_MAX_FILE_SIZE_MB: int = Field(default=10, ge=1, le=100)
     # `NoDecode` — same as CORS_ORIGINS, we want the raw CSV from env.
     STORAGE_ALLOWED_MIME_TYPES: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["image/png", "image/jpeg", "application/pdf"]
     )
+    # Signed-URL TTL — canonical setting shared by every storage backend.
+    STORAGE_PRESIGNED_URL_TTL_SECONDS: int = Field(default=900, ge=60, le=86400)
 
-    # ----- S3-Compatible -----
+    # ----- S3-Compatible (only used when STORAGE_BACKEND=s3) -----
     S3_ENDPOINT_URL: str | None = None
     S3_REGION: str = "us-east-1"
     S3_ACCESS_KEY_ID: SecretStr = SecretStr("any")
     S3_SECRET_ACCESS_KEY: SecretStr = SecretStr("any")
     S3_FORCE_PATH_STYLE: bool = False
     S3_BUCKET_QUALIFICATIONS: str = "qualifications"
-    S3_PRESIGNED_URL_TTL_SECONDS: int = Field(default=900, ge=60, le=86400)
+    # Deprecated alias for `STORAGE_PRESIGNED_URL_TTL_SECONDS`. Kept so
+    # existing deployments with `S3_PRESIGNED_URL_TTL_SECONDS=...` in
+    # their `.env` keep working after the rename.
+    S3_PRESIGNED_URL_TTL_SECONDS: int | None = Field(default=None)
 
     # ----- Notifications -----
     NOTIFICATION_RETRY_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=10)
@@ -238,6 +246,18 @@ class Settings(BaseSettings):
             if self.DATABASE_POOL_URL is not None
             else self.DATABASE_URL.get_secret_value()
         )
+
+    @property
+    def storage_presigned_url_ttl_seconds(self) -> int:
+        """Canonical signed-URL TTL, shared by every storage backend.
+
+        Prefers `STORAGE_PRESIGNED_URL_TTL_SECONDS`. Falls back to the
+        deprecated `S3_PRESIGNED_URL_TTL_SECONDS` alias so deployments
+        that still set the old name keep working after the rename.
+        """
+        if self.S3_PRESIGNED_URL_TTL_SECONDS is not None:
+            return self.S3_PRESIGNED_URL_TTL_SECONDS
+        return self.STORAGE_PRESIGNED_URL_TTL_SECONDS
 
 
 @lru_cache(maxsize=1)

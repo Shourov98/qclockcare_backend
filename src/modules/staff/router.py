@@ -153,7 +153,7 @@ async def _qualification_to_response(qual: object) -> StaffQualificationResponse
             storage_key=storage_key,
         )
         download_url = url
-        expires_in = settings.S3_PRESIGNED_URL_TTL_SECONDS
+        expires_in = settings.storage_presigned_url_ttl_seconds
 
     return StaffQualificationResponse(
         id=qual.id,
@@ -645,7 +645,7 @@ async def get_qualification_download_endpoint(
     # log (CloudFront / S3 / Supabase audit log).
     return QualificationDownloadResponse(
         download_url=url,
-        expires_in=settings.S3_PRESIGNED_URL_TTL_SECONDS,
+        expires_in=settings.storage_presigned_url_ttl_seconds,
         expires_at=expires_at,
     )
 

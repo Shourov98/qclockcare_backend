@@ -356,10 +356,10 @@ class StaffQualificationResponse(BaseModel):
         description=(
             "Short-lived signed URL for the uploaded document. "
             "`null` until `document_storage_key` is set. URL lifetime is "
-            "`settings.S3_PRESIGNED_URL_TTL_SECONDS`."
+            "`settings.storage_presigned_url_ttl_seconds`."
         ),
     )
-    # Storage key TTL in seconds (matches `settings.S3_PRESIGNED_URL_TTL_SECONDS`).
+    # Storage key TTL in seconds (matches `settings.storage_presigned_url_ttl_seconds`).
     # `None` when `download_url` is None. Surfaced so the client can
     # show "expires in N minutes" or schedule a refresh.
     expires_in: int | None = Field(

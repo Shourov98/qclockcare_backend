@@ -623,7 +623,7 @@ async def build_download_url(
     """Generate a short-lived signed URL for `storage_key`.
 
     Returns `(url, expires_at)`. The TTL is read from
-    `settings.S3_PRESIGNED_URL_TTL_SECONDS` so operators have one knob
+    `settings.storage_presigned_url_ttl_seconds` so operators have one knob
     to control signed-URL lifetime for both backends.
 
     Raises:
@@ -637,7 +637,7 @@ async def build_download_url(
         )
 
     bucket = _qualifications_bucket()
-    expires_in = settings.S3_PRESIGNED_URL_TTL_SECONDS
+    expires_in = settings.storage_presigned_url_ttl_seconds
     url = get_storage().presigned_url(
         bucket=bucket,
         key=storage_key,

@@ -47,11 +47,12 @@ def test_cors_origins_csv_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
 
 
-def test_storage_backend_defaults_to_s3(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Default storage backend is S3-compatible (Floci/AWS)."""
+def test_storage_backend_defaults_to_supabase(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default storage backend is Supabase Storage (matches the common
+    client deployment where the same Supabase project hosts DB + Storage)."""
     from src.core import config
 
     config.get_settings.cache_clear()
     settings = config.get_settings()
 
-    assert settings.STORAGE_BACKEND == "s3"
+    assert settings.STORAGE_BACKEND == "supabase"
