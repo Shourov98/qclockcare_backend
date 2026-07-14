@@ -10,7 +10,8 @@ RLS is the source of truth for tenant scoping; functions still take an
 from __future__ import annotations
 
 import uuid
-from typing import Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -25,6 +26,7 @@ from src.core.exceptions import (
     ValidationError,
 )
 from src.modules.agencies.models import Agency
+from src.modules.identity import auth_service
 from src.modules.identity.models import User, UserRoleAssignment
 from src.modules.patients.models import (
     GuardianProfile,
@@ -39,7 +41,8 @@ from src.modules.patients.schemas import (
     PatientProfileCreateRequest,
     PatientProfileUpdateRequest,
 )
-from src.shared.domain.enums import RelationshipType, UserRole, UserStatus
+from src.shared.domain.enums import UserRole, UserStatus
+
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -122,13 +125,29 @@ def _extract_constraint(exc: IntegrityError) -> str:
 # --------------------------------------------------------------------------
 # Patient profiles — CRUD
 # --------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class PatientInviteResult:
+    """Outcome of `create_patient(...)`.
+
+    The router schedules an invitation email via
+    `auth.email_service.send_invitation_email(...)` using the
+    plaintext token + recipient fields.
+    """
+
+    profile: PatientProfile
+    user_id: uuid.UUID
+    email: str
+    full_name: str | None
+    invitation_token: str
+
+
 async def create_patient(
     session: AsyncSession,
     *,
     agency_id: uuid.UUID,
     payload: PatientProfileCreateRequest,
     admitted_by_user_id: uuid.UUID,
-) -> PatientProfile:
+) -> PatientInviteResult:
     """Admit a new patient at the caller's agency.
 
     Creates three rows in a single transaction:
@@ -139,6 +158,9 @@ async def create_patient(
     If a User with the same email already exists, we re-use them and only
     create the profile + role assignment. The unique constraint on
     `(agency_id, user_id)` will surface duplicates via IntegrityError.
+
+    Issues a fresh `SingleUseToken(purpose="invitation")` and returns
+    its plaintext so the caller can schedule the invitation email.
     """
     await _assert_agency_active(session, agency_id)
 
@@ -216,7 +238,19 @@ async def create_patient(
         },
     )
 
-    return profile
+    # Issue a fresh invitation token + return everything the router
+    # needs to schedule the email.
+    invitation_token, _jti = await auth_service.issue_invitation_token(
+        session, user_id=user.id
+    )
+
+    return PatientInviteResult(
+        profile=profile,
+        user_id=user.id,
+        email=user.email,
+        full_name=user.full_name,
+        invitation_token=invitation_token,
+    )
 
 
 async def get_patient(
@@ -344,13 +378,28 @@ async def archive_patient(
 # --------------------------------------------------------------------------
 # Guardian profiles — CRUD
 # --------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class GuardianInviteResult:
+    """Outcome of `create_guardian(...)`.
+
+    `new_guardian` paths in `add_patient_guardian` propagate this
+    dataclass up so the router can schedule an invitation email.
+    """
+
+    profile: GuardianProfile
+    user_id: uuid.UUID
+    email: str
+    full_name: str | None
+    invitation_token: str
+
+
 async def create_guardian(
     session: AsyncSession,
     *,
     agency_id: uuid.UUID,
     payload: GuardianProfileCreateRequest,
     invited_by_user_id: uuid.UUID,
-) -> GuardianProfile:
+) -> GuardianInviteResult:
     await _assert_agency_active(session, agency_id)
 
     user = (
@@ -421,7 +470,19 @@ async def create_guardian(
         },
     )
 
-    return profile
+    # Issue a fresh invitation token + return everything the router
+    # needs to schedule the email.
+    invitation_token, _jti = await auth_service.issue_invitation_token(
+        session, user_id=user.id
+    )
+
+    return GuardianInviteResult(
+        profile=profile,
+        user_id=user.id,
+        email=user.email,
+        full_name=user.full_name,
+        invitation_token=invitation_token,
+    )
 
 
 async def get_guardian(
@@ -505,6 +566,21 @@ async def archive_guardian(
 # --------------------------------------------------------------------------
 # Patient ↔ Guardian relationships
 # --------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class AddPatientGuardianResult:
+    """Outcome of `add_patient_guardian(...)`.
+
+    `new_guardian` is set when the caller supplied a fresh guardian
+    profile in `payload.new_guardian`. The router uses it to schedule
+    an invitation email — when the caller instead supplied an
+    existing `guardian_id`, no email goes out (the existing user
+    already has a login path).
+    """
+
+    relationship: PatientGuardianRelationship
+    new_guardian: GuardianInviteResult | None
+
+
 async def list_patient_guardians(
     session: AsyncSession,
     *,
@@ -529,17 +605,23 @@ async def add_patient_guardian(
     patient_id: uuid.UUID,
     agency_id: uuid.UUID,
     payload: PatientGuardianRelationshipCreateRequest,
-) -> PatientGuardianRelationship:
+) -> AddPatientGuardianResult:
     """Link a guardian to a patient.
 
     The caller supplies EITHER `guardian_id` (existing guardian) OR
     `new_guardian` (one-shot create + link). The validator on the schema
     already rejected both / neither being set.
+
+    When `new_guardian` is supplied, the freshly-created guardian's
+    `GuardianInviteResult` is propagated up so the router can schedule
+    an invitation email. When `guardian_id` is supplied, no email
+    goes out — the existing user already has a login path.
     """
     patient = await _get_patient_or_404(
         session, patient_id=patient_id, agency_id=agency_id
     )
 
+    new_guardian_invite: GuardianInviteResult | None = None
     if payload.guardian_id is not None:
         guardian = await _get_guardian_or_404(
             session, guardian_id=payload.guardian_id, agency_id=agency_id
@@ -547,12 +629,13 @@ async def add_patient_guardian(
     else:
         # Type narrowed by the schema validator; assert for the type checker.
         assert payload.new_guardian is not None
-        guardian = await create_guardian(
+        new_guardian_invite = await create_guardian(
             session,
             agency_id=agency_id,
             payload=payload.new_guardian,
             invited_by_user_id=patient.user_id,  # the patient inviting their own guardian
         )
+        guardian = new_guardian_invite.profile
 
     link = PatientGuardianRelationship(
         agency_id=agency_id,
@@ -573,14 +656,14 @@ async def add_patient_guardian(
             details={"constraint": _extract_constraint(exc)},
         ) from exc
 
-    from src.modules.identity.auth_service import _record_audit
-    from src.shared.domain.enums import AuditAction
-
     # NOTE: We don't write a generic audit row here — the relationship
     # create is implicit. A dedicated LINK_PATIENT_GUARDIAN audit action
     # can be added in a later migration.
 
-    return link
+    return AddPatientGuardianResult(
+        relationship=link,
+        new_guardian=new_guardian_invite,
+    )
 
 
 async def update_patient_guardian(

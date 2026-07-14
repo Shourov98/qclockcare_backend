@@ -44,6 +44,7 @@ logger = get_logger(__name__)
 class OtpIssueResult:
     user_id: uuid.UUID
     email: str
+    full_name: str | None
     otp: str  # plaintext, returned for the email send step
     expires_at: datetime
 
@@ -106,6 +107,7 @@ async def issue_otp(
     return OtpIssueResult(
         user_id=user.id,
         email=user.email,
+        full_name=user.full_name,
         otp=otp,
         expires_at=expires_at,
     )

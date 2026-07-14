@@ -57,8 +57,15 @@ class SupabaseStorageAdapter(StorageAdapter):
         expires_in: int = 900,
         method: str = "GET",
     ) -> str:
-        # Supabase only supports GET signed URLs out of the box.
-        # For PUT, use the direct upload path.
+        """Supabase-signed GET URL.
+
+        Supabase only supports GET signed URLs out of the box. For PUT,
+        use the direct upload path.
+
+        Pass `expires_in` from `settings.storage_presigned_url_ttl_seconds`
+        at the call site — the 900 s default here is only a safety
+        net for direct callers that don't read settings.
+        """
         resp: dict[str, Any] = self._bucket(bucket).create_signed_url(key, expires_in)
         return str(resp.get("signedURL", ""))
 

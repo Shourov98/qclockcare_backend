@@ -428,6 +428,51 @@ async def logout(
 
 
 # --------------------------------------------------------------------------
+# Invitation tokens
+# --------------------------------------------------------------------------
+async def issue_invitation_token(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+) -> tuple[str, str]:
+    """Issue a `SingleUseToken(purpose='invitation')` for `user_id`.
+
+    Returns `(plaintext_token, jti)`. The token is the value the
+    recipient pastes / clicks through to land on the SPA's
+    `/accept-invitation?token=…` page; the `jti` is the row's primary
+    key (used by `accept_invitation` to mark it consumed).
+
+    The TTL is sourced from
+    `settings.INVITATION_TOKEN_EXPIRY_DAYS` (default 7, range 1-30)
+    so operators have one knob to control invitation lifetime — the
+    `forgot_password` path hard-codes 2 h because password-reset is a
+    more sensitive, shorter-lived flow.
+
+    The caller is responsible for:
+      1. Scheduling the invitation email (use
+         `auth.email_service.send_invitation_email` with the returned
+         token).
+      2. Writing the `AuthAuditEventType.INVITATION_SENT` audit row
+         (the staff / patients services already do this).
+    """
+    ttl = timedelta(days=settings.INVITATION_TOKEN_EXPIRY_DAYS)
+    token, jti = jwt_service.issue_single_use_token(
+        purpose="invitation",
+        user_id=user_id,
+        ttl=ttl,
+    )
+    session.add(
+        SingleUseToken(
+            jti=jti,
+            user_id=user_id,
+            purpose="invitation",
+            expires_at=datetime.now(tz=UTC) + ttl,
+        )
+    )
+    return token, jti
+
+
+# --------------------------------------------------------------------------
 # Accept invitation
 # --------------------------------------------------------------------------
 async def accept_invitation(
@@ -444,7 +489,6 @@ async def accept_invitation(
     persist the plaintext. Returns `otp_plaintext=None` if no OTP needs to be
     issued (e.g. account was already verified).
     """
-    payload = jwt_service.verify_single_use_token(invitation_token, expected_purpose="invitation")
     payload = jwt_service.verify_single_use_token(invitation_token, expected_purpose="invitation")
 
     row = (
@@ -553,27 +597,32 @@ async def resend_otp(
     email: str,
     ip_address: str | None = None,
     user_agent: str | None = None,
-) -> int:
+) -> tuple[int, otp_service.OtpIssueResult | None]:
     """Re-issue an OTP for the given email.
 
-    Returns the cooldown-seconds-remaining (0 if issued now).
+    Returns `(cooldown_seconds_remaining, issued_otp | None)`. The
+    cooldown int is 0 when an OTP was issued now; the OtpIssueResult
+    carries the plaintext OTP the caller will email. The OTP is
+    `None` when the user doesn't exist (we don't leak existence — the
+    caller still sees cooldown=0 and is expected to optimistically
+    report "sent").
+
+    Raises OtpResendCooldownError if the last issued OTP is too
+    recent — the global handler maps that to HTTP 429 with
+    `cooldown_seconds_remaining` in the body.
     """
     user = (
         await session.execute(select(User).where(User.email == email))
     ).scalar_one_or_none()
     if user is None:
         # Don't leak existence — pretend we sent it. Cooldown is 0 either way.
-        return 0
-    try:
-        await otp_service.resend_otp(
-            session,
-            user=user,
-            ip_address=ip_address,
-            user_agent=user_agent,
-        )
-    except OtpResendCooldownError:
-        # Propagate so the route returns 429 with the right body
-        raise
+        return 0, None
+    issued = await otp_service.resend_otp(
+        session,
+        user=user,
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
     await _record_audit(
         session,
         user_id=user.id,
@@ -581,7 +630,7 @@ async def resend_otp(
         ip_address=ip_address,
         user_agent=user_agent,
     )
-    return 0
+    return 0, issued
 
 
 # --------------------------------------------------------------------------
@@ -593,18 +642,49 @@ async def forgot_password(
     email: str,
     ip_address: str | None = None,
     user_agent: str | None = None,
-) -> str | None:
+) -> tuple[uuid.UUID | None, str | None, str | None]:
     """Issue a password-reset single-use token for the user, if they exist.
 
-    Returns the plaintext token (so the route can email it). Returns None
-    if no user matches — the route will still return 200 with the same
-    shape, to avoid leaking account existence.
+    Returns `(user_id, email, token)` so the route can email the
+    reset link. Returns `(None, None, None)` if no user matches —
+    the route will still return 200 with the same shape, to avoid
+    leaking account existence.
+
+    Cooldown: if the most recent `PASSWORD_RESET_REQUESTED` audit
+    event for this user is within `OTP_RESEND_COOLDOWN_SECONDS`,
+    raises `OtpResendCooldownError`. We piggyback on the audit
+    log so no new schema is needed.
     """
     user = (
         await session.execute(select(User).where(User.email == email))
     ).scalar_one_or_none()
     if user is None:
-        return None
+        return None, None, None
+
+    # Cooldown enforcement — same window as /auth/resend-otp.
+    last_audit = (
+        await session.execute(
+            select(AuthAuditEvent)
+            .where(
+                AuthAuditEvent.user_id == user.id,
+                AuthAuditEvent.event_type
+                == AuthAuditEventType.PASSWORD_RESET_REQUESTED,
+            )
+            .order_by(AuthAuditEvent.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if last_audit is not None:
+        cooldown_ends = last_audit.created_at + timedelta(
+            seconds=settings.OTP_RESEND_COOLDOWN_SECONDS
+        )
+        now = datetime.now(tz=UTC)
+        if cooldown_ends > now:
+            remaining = int((cooldown_ends - now).total_seconds())
+            raise OtpResendCooldownError(
+                details={"cooldown_seconds_remaining": remaining}
+            )
+
     ttl = timedelta(hours=2)
     token, jti = jwt_service.issue_single_use_token(
         purpose="password_reset", user_id=user.id, ttl=ttl
@@ -624,7 +704,7 @@ async def forgot_password(
         ip_address=ip_address,
         user_agent=user_agent,
     )
-    return token
+    return user.id, user.email, token
 
 
 # --------------------------------------------------------------------------

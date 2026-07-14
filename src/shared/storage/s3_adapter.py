@@ -85,6 +85,12 @@ class S3StorageAdapter(StorageAdapter):
         expires_in: int = 900,
         method: str = "GET",
     ) -> str:
+        """boto3-backed presigned URL.
+
+        Pass `expires_in` from `settings.storage_presigned_url_ttl_seconds`
+        at the call site — the 900 s default here is only a safety net
+        for direct callers that don't read settings.
+        """
         op = "get_object" if method == "GET" else "put_object"
         return self._client.generate_presigned_url(
             op,

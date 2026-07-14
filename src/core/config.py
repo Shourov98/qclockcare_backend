@@ -95,6 +95,31 @@ class Settings(BaseSettings):
     SMTP_FROM_EMAIL: str = "noreply@qlockcare.local"
     SMTP_FROM_NAME: str = "QlockCare"
     SMTP_USE_TLS: bool = False
+    # Connect/send timeout for aiosmtplib. Background-task dispatch
+    # also relies on this to avoid unbounded hangs in worker threads.
+    SMTP_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=120)
+    # Retry policy for transactional auth emails (see
+    # src/modules/auth/email_service.py:_send_in_background). The
+    # background runner retries up to SMTP_RETRY_MAX_ATTEMPTS times
+    # with exponential backoff + jitter before giving up and logging
+    # at error level. The HTTP response is already flushed at this
+    # point, so the user is unaffected by retry duration. Set
+    # SMTP_RETRY_MAX_ATTEMPTS=1 to disable retries entirely.
+    SMTP_RETRY_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=10)
+    SMTP_RETRY_BASE_DELAY_SECONDS: float = Field(default=1.0, ge=0.0, le=60.0)
+    SMTP_RETRY_MAX_DELAY_SECONDS: float = Field(default=10.0, ge=0.0, le=600.0)
+    # Jitter as a fraction of the computed delay (+/-50% means the
+    # actual sleep is uniformly chosen from [0.5*base, 1.5*base]).
+    SMTP_RETRY_JITTER: float = Field(default=0.5, ge=0.0, le=1.0)
+
+    # ----- Frontend (deep links in transactional emails) -----
+    # Base URL of the SPA — used by transactional auth emails
+    # (OTP verify, password reset) to build a clickable deep link.
+    FRONTEND_URL: str = "http://localhost:3000"
+    # When True, OTP / reset tokens are logged at INFO with a clear
+    # `dev_*` prefix so local dev can test without configuring SMTP.
+    # MUST stay False in production.
+    LOG_INCLUDE_DEV_OTPS: bool = False
 
     # ----- SMS (Twilio) — Phase 2 -----
     SMS_ENABLED: bool = False
@@ -103,26 +128,39 @@ class Settings(BaseSettings):
     TWILIO_FROM_NUMBER: str | None = None
 
     # ----- Storage (ADR-0018) -----
-    STORAGE_BACKEND: Literal["s3", "supabase"] = "s3"
+    # Default is `supabase` — clients already running on Supabase don't
+    # need to set up a separate S3-compatible service. Switch to `s3`
+    # for AWS S3 / Floci / MinIO / Cloudflare R2 deployments.
+    STORAGE_BACKEND: Literal["s3", "supabase"] = "supabase"
     STORAGE_MAX_FILE_SIZE_MB: int = Field(default=10, ge=1, le=100)
     # `NoDecode` — same as CORS_ORIGINS, we want the raw CSV from env.
     STORAGE_ALLOWED_MIME_TYPES: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["image/png", "image/jpeg", "application/pdf"]
     )
+    # Signed-URL TTL — canonical setting shared by every storage backend.
+    STORAGE_PRESIGNED_URL_TTL_SECONDS: int = Field(default=900, ge=60, le=86400)
 
-    # ----- S3-Compatible -----
+    # ----- S3-Compatible (only used when STORAGE_BACKEND=s3) -----
     S3_ENDPOINT_URL: str | None = None
     S3_REGION: str = "us-east-1"
     S3_ACCESS_KEY_ID: SecretStr = SecretStr("any")
     S3_SECRET_ACCESS_KEY: SecretStr = SecretStr("any")
     S3_FORCE_PATH_STYLE: bool = False
     S3_BUCKET_QUALIFICATIONS: str = "qualifications"
-    S3_PRESIGNED_URL_TTL_SECONDS: int = Field(default=900, ge=60, le=86400)
+    # Deprecated alias for `STORAGE_PRESIGNED_URL_TTL_SECONDS`. Kept so
+    # existing deployments with `S3_PRESIGNED_URL_TTL_SECONDS=...` in
+    # their `.env` keep working after the rename.
+    S3_PRESIGNED_URL_TTL_SECONDS: int | None = Field(default=None)
 
     # ----- Notifications -----
     NOTIFICATION_RETRY_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=10)
     NOTIFICATION_RETRY_BACKOFF_SECONDS: int = Field(default=60, ge=1, le=3600)
     NOTIFICATION_BATCH_SIZE: int = Field(default=50, ge=1, le=500)
+    # How long the unread badge can be cached. Currently a no-op —
+    # the badge endpoint hits the DB on every request. When Redis is
+    # wired up, the badge endpoint should cache `unread_count` under
+    # the user_id with this TTL.
+    NOTIFICATION_BADGE_CACHE_TTL_SECONDS: int = Field(default=30, ge=0, le=3600)
 
     # ----- Rate Limiting -----
     RATE_LIMIT_ENABLED: bool = True
@@ -208,6 +246,18 @@ class Settings(BaseSettings):
             if self.DATABASE_POOL_URL is not None
             else self.DATABASE_URL.get_secret_value()
         )
+
+    @property
+    def storage_presigned_url_ttl_seconds(self) -> int:
+        """Canonical signed-URL TTL, shared by every storage backend.
+
+        Prefers `STORAGE_PRESIGNED_URL_TTL_SECONDS`. Falls back to the
+        deprecated `S3_PRESIGNED_URL_TTL_SECONDS` alias so deployments
+        that still set the old name keep working after the rename.
+        """
+        if self.S3_PRESIGNED_URL_TTL_SECONDS is not None:
+            return self.S3_PRESIGNED_URL_TTL_SECONDS
+        return self.STORAGE_PRESIGNED_URL_TTL_SECONDS
 
 
 @lru_cache(maxsize=1)

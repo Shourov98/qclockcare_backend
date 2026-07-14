@@ -12,13 +12,16 @@ take an `agency_id` parameter for defence in depth and to make logging
 from __future__ import annotations
 
 import uuid
-from typing import Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from src.core.config import settings
 from src.core.exceptions import (
     ConflictError,
     DuplicateResourceError,
@@ -27,6 +30,7 @@ from src.core.exceptions import (
     ValidationError,
 )
 from src.modules.agencies.models import Agency
+from src.modules.identity import auth_service
 from src.modules.identity.models import User, UserRoleAssignment
 from src.modules.staff.models import (
     StaffAvailability,
@@ -42,6 +46,8 @@ from src.modules.staff.schemas import (
     StaffQualificationUpdateRequest,
 )
 from src.shared.domain.enums import UserRole, UserStatus
+from src.shared.storage import get_storage
+
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -90,6 +96,24 @@ async def _get_qualification_or_404(
     return qual
 
 
+async def get_qualification(
+    session: AsyncSession,
+    *,
+    qualification_id: uuid.UUID,
+    staff_id: uuid.UUID,
+    agency_id: uuid.UUID,
+) -> StaffQualification:
+    """Public wrapper around `_get_qualification_or_404` so router
+    code can fetch a single qualification without reaching into a
+    private helper."""
+    return await _get_qualification_or_404(
+        session,
+        qualification_id=qualification_id,
+        staff_id=staff_id,
+        agency_id=agency_id,
+    )
+
+
 async def _get_availability_or_404(
     session: AsyncSession,
     *,
@@ -125,13 +149,30 @@ async def _assert_agency_active(session: AsyncSession, agency_id: uuid.UUID) -> 
 # --------------------------------------------------------------------------
 # Staff profiles — CRUD
 # --------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class StaffInviteResult:
+    """Outcome of `create_staff(...)`.
+
+    The router hands `invitation_token` + `email` + `full_name` to
+    `auth.email_service.send_invitation_email(...)` so the new staff
+    member gets a deep-link invitation. The `profile` is what the
+    router returns in the HTTP response body.
+    """
+
+    profile: StaffProfile
+    user_id: uuid.UUID
+    email: str
+    full_name: str | None
+    invitation_token: str
+
+
 async def create_staff(
     session: AsyncSession,
     *,
     agency_id: uuid.UUID,
     payload: StaffProfileCreateRequest,
     invited_by_user_id: uuid.UUID,
-) -> StaffProfile:
+) -> StaffInviteResult:
     """Create a new staff member at the caller's agency.
 
     Creates three rows in a single transaction:
@@ -139,9 +180,9 @@ async def create_staff(
     2. `UserRoleAssignment` (role=STAFF, agency_id=…) — authorises the user
     3. `StaffProfile` (agency_id, user_id, staff_code, …) — the staff record
 
-    The invitation email is sent out-of-band (separate module); this
-    function returns the freshly-minted `StaffProfile` so the router can
-    respond with the new resource.
+    Then issues a fresh `SingleUseToken(purpose="invitation")` and
+    returns its plaintext so the caller can schedule the invitation
+    email (see `StaffInviteResult`).
     """
     await _assert_agency_active(session, agency_id)
 
@@ -223,7 +264,21 @@ async def create_staff(
         },
     )
 
-    return profile
+    # Issue a fresh invitation token + return everything the router
+    # needs to schedule the email. Re-issuing when the user already
+    # exists is the right behaviour — the recipient needs a fresh
+    # link every time an admin invites them.
+    invitation_token, _jti = await auth_service.issue_invitation_token(
+        session, user_id=user.id
+    )
+
+    return StaffInviteResult(
+        profile=profile,
+        user_id=user.id,
+        email=user.email,
+        full_name=user.full_name,
+        invitation_token=invitation_token,
+    )
 
 
 async def get_staff(
@@ -548,3 +603,46 @@ def _extract_constraint(exc: IntegrityError) -> str:
     if diag is not None and getattr(diag, "constraint_name", None):
         return diag.constraint_name
     return "unknown"
+
+
+# --------------------------------------------------------------------------
+# Storage (download URL signing)
+# --------------------------------------------------------------------------
+def _qualifications_bucket() -> str:
+    """Bucket name for staff-qualification documents, resolved from
+    the active storage backend's setting."""
+    if settings.STORAGE_BACKEND == "supabase":
+        return settings.SUPABASE_STORAGE_BUCKET_QUALIFICATIONS
+    return settings.S3_BUCKET_QUALIFICATIONS
+
+
+async def build_download_url(
+    *,
+    storage_key: str,
+) -> tuple[str, datetime]:
+    """Generate a short-lived signed URL for `storage_key`.
+
+    Returns `(url, expires_at)`. The TTL is read from
+    `settings.storage_presigned_url_ttl_seconds` so operators have one knob
+    to control signed-URL lifetime for both backends.
+
+    Raises:
+        ValidationError: if `storage_key` is empty (the qualification
+            has no attached document).
+    """
+    if not storage_key:
+        raise ValidationError(
+            "Qualification has no attached document.",
+            details={"reason": "document_storage_key_is_null"},
+        )
+
+    bucket = _qualifications_bucket()
+    expires_in = settings.storage_presigned_url_ttl_seconds
+    url = get_storage().presigned_url(
+        bucket=bucket,
+        key=storage_key,
+        expires_in=expires_in,
+        method="GET",
+    )
+    expires_at = datetime.now(UTC) + timedelta(seconds=expires_in)
+    return url, expires_at

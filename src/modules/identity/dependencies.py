@@ -20,12 +20,13 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.database import get_session, set_session_context
+from src.core.exceptions import AccountDisabledError, UnauthorizedError
 from src.modules.identity import jwt_service
 from src.modules.identity.models import User
 from src.modules.identity.schemas import CurrentUser
@@ -78,17 +79,22 @@ async def get_session_with_auth(
                 )
             ).scalar_one_or_none()
             if user is None:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="User no longer exists.",
+                # Typed exception → routed through the project's
+                # global error envelope (`app_exception_handler` in
+                # src/core/exceptions.py) so the OpenAPI docs and
+                # the on-wire JSON share one shape.
+                raise UnauthorizedError(
+                    message="User no longer exists.",
+                    details={"user_id": str(payload.user_id)},
                 )
             if user.status in {UserStatus.INACTIVE, UserStatus.ARCHIVED}:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Account disabled.",
-                )
+                # 403 via the typed hierarchy so the response uses
+                # the standard error envelope (raw `HTTPException`
+                # would route through `http_exception_handler` and
+                # produce a different shape).
+                raise AccountDisabledError()
             # Attach the auth context to the request for downstream handlers
-            from src.modules.identity.auth_service import _to_current_user, _pick_primary_role
+            from src.modules.identity.auth_service import _pick_primary_role, _to_current_user
 
             role, agency_id = _pick_primary_role(user.roles)
             request.state.auth = AuthContext(
@@ -115,7 +121,7 @@ def get_current_auth(
     # We depend on get_session_with_auth so FastAPI resolves the auth-bearing
     # session FIRST and populates `request.state.auth` before this runs.
     # The session itself is discarded — we only need the side effect.
-    _session: AsyncSession = Depends(get_session_with_auth),  # noqa: ARG001
+    _session: AsyncSession = Depends(get_session_with_auth),
 ) -> AuthContext:
     """Return the AuthContext populated by `get_session_with_auth`.
 
@@ -125,10 +131,7 @@ def get_current_auth(
     """
     ctx = getattr(request.state, "auth", None)
     if ctx is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication required.",
-        )
+        raise UnauthorizedError(message="Authentication required.")
     return ctx
 
 

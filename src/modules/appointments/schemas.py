@@ -20,11 +20,13 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from src.shared.domain.enums import (
+    AppointmentEventType,
     AppointmentStatus,
     ConfirmationStatus,
     ProgramType,
     ServiceItemStatus,
     ServiceType,
+    UserRole,
 )
 
 
@@ -187,6 +189,79 @@ class AppointmentServiceItemResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Lifecycle — confirm / request-reschedule / request-cancellation
+# --------------------------------------------------------------------------
+class AppointmentConfirmRequest(BaseModel):
+    """POST /appointments/{id}/confirm — patient/guardian confirms or declines.
+
+    `declined=True` records the confirmation with `status=DECLINED` (the
+    appointment itself stays in its current state — admin must call
+    `/cancel` to finalise). Default = confirmed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    declined: bool = False
+    comment: Annotated[str, StringConstraints(max_length=4000)] | None = None
+
+
+class AppointmentRescheduleRequest(BaseModel):
+    """POST /appointments/{id}/request-reschedule — patient proposes a new window."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    proposed_start: datetime
+    proposed_end: datetime
+    comment: Annotated[str, StringConstraints(max_length=4000)] | None = None
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> AppointmentRescheduleRequest:
+        if self.proposed_end <= self.proposed_start:
+            raise ValueError("proposed_end must be after proposed_start")
+        return self
+
+
+class AppointmentCancellationRequest(BaseModel):
+    """POST /appointments/{id}/request-cancellation — patient asks to cancel."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str, StringConstraints(min_length=1, max_length=4000)]
+
+
+class AppointmentConfirmationResponse(BaseModel):
+    """One confirmation row — returned by GET /confirmations and POST /confirm."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    appointment_id: UUID
+    confirmed_by: UUID
+    confirmation_role: UserRole
+    status: ConfirmationStatus
+    comment: str | None
+    created_at: datetime
+
+
+class AppointmentEventResponse(BaseModel):
+    """Single event row — returned by GET /appointments/{id}/events."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    appointment_id: UUID
+    agency_id: UUID
+    actor_user_id: UUID | None
+    event_type: AppointmentEventType
+    from_status: AppointmentStatus | None
+    to_status: AppointmentStatus | None
+    metadata_: dict = Field(default_factory=dict, alias="metadata")
+    ip_address: str | None
+    user_agent: str | None
+    created_at: datetime
+
+
+# --------------------------------------------------------------------------
 # Forward refs
 # --------------------------------------------------------------------------
 AppointmentCreateRequest.model_rebuild()
@@ -195,7 +270,12 @@ AppointmentResponse.model_rebuild()
 
 __all__ = [
     "AppointmentCancelRequest",
+    "AppointmentCancellationRequest",
+    "AppointmentConfirmRequest",
+    "AppointmentConfirmationResponse",
     "AppointmentCreateRequest",
+    "AppointmentEventResponse",
+    "AppointmentRescheduleRequest",
     "AppointmentResponse",
     "AppointmentServiceItemCreateRequest",
     "AppointmentServiceItemResponse",
