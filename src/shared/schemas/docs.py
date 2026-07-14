@@ -142,6 +142,15 @@ tags_metadata: Final[list[dict[str, str]]] = [
         ),
     },
     {
+        "name": "agencies",
+        "description": (
+            "Agency-tenant management — create, list, suspend, and "
+            "soft-delete agencies, plus list the programs each agency "
+            "offers. **SUPER_ADMIN only.** AGENCY_ADMIN does not have "
+            "an agency-management surface (their agency is managed for them)."
+        ),
+    },
+    {
         "name": "health",
         "description": (
             "Liveness (`/health`) and readiness (`/ready`) probes. "

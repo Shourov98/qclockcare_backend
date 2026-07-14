@@ -34,6 +34,7 @@ from src.core.middleware import RequestContextMiddleware
 # resolution has to happen before the first mapper is configured against
 # the registry.
 from src.modules.agencies.models import Agency as _Agency  # noqa: F401
+from src.modules.agencies.router import router as agencies_router
 from src.modules.appointments.models import (  # noqa: F401
     Appointment,
     AppointmentServiceItem,
@@ -370,6 +371,9 @@ def create_app() -> FastAPI:
 
     # Audit logs — admin-facing list/get endpoints.
     app.include_router(audit_logs_router)
+
+    # Agencies — SUPER_ADMIN-only management of agency tenants.
+    app.include_router(agencies_router)
 
     # NOTE: feature routers get registered here as modules land, e.g.
     #   app.include_router(staff_router, prefix="/staff", tags=["staff"])

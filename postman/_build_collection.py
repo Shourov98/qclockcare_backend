@@ -62,6 +62,7 @@ if (!token || (expiresAt && Date.now() > expiresAt)) {
 }
 """.strip()
 
+
 # The 3 standard tests every request runs after the response.
 # `request_name` is captured at definition time for nicer error messages.
 def standard_tests(request_name: str) -> str:
@@ -115,6 +116,7 @@ if (pm.response.code >= 200 && pm.response.code < 300) {{
 # --------------------------------------------------------------------------
 # Helpers for building a request item.
 # --------------------------------------------------------------------------
+
 
 def _example_body(payload: dict[str, Any]) -> dict[str, Any]:
     """Return a Postman `body` block for a JSON request."""
@@ -710,7 +712,10 @@ VISITS_FOLDER = folder(
             name="Check in to visit",
             method="POST",
             path="/visits/{{visit_id}}/check-in",
-            body={"actual_start": "2026-07-01T10:05:00Z", "location": {"lat": 44.98, "lng": -93.27}},
+            body={
+                "actual_start": "2026-07-01T10:05:00Z",
+                "location": {"lat": 44.98, "lng": -93.27},
+            },
         ),
         make_request(
             name="Check out of visit",
@@ -962,7 +967,65 @@ AUDIT_LOGS_FOLDER = folder(
 )
 
 # --------------------------------------------------------------------------
-# 10. Health (2 routes)
+# 10. Agencies (6 routes — SUPER_ADMIN only)
+# --------------------------------------------------------------------------
+AGENCIES_FOLDER = folder(
+    "agencies",
+    [
+        make_request(
+            name="List agencies (paginated)",
+            method="GET",
+            path="/agencies?page=1&page_size=20",
+        ),
+        make_request(
+            name="Create agency",
+            method="POST",
+            path="/agencies",
+            body={
+                "name": "Test Agency {{$randomUUID}}",
+                "timezone": "America/Chicago",
+                "settings": {"theme": "light"},
+                "initial_program_codes": ["PCA", "ARMHS"],
+            },
+            extract=[("agency_id", "id")],
+        ),
+        make_request(
+            name="Get agency by id",
+            method="GET",
+            path="/agencies/{{agency_id}}",
+        ),
+        make_request(
+            name="Get deleted agency by id (?include_deleted=true)",
+            method="GET",
+            path="/agencies/{{agency_id}}?include_deleted=true",
+        ),
+        make_request(
+            name="Patch agency (rename + status flip)",
+            method="PATCH",
+            path="/agencies/{{agency_id}}",
+            body={"name": "Renamed {{$randomUUID}}", "status": "SUSPENDED"},
+        ),
+        make_request(
+            name="Soft-delete agency",
+            method="DELETE",
+            path="/agencies/{{agency_id}}",
+        ),
+        make_request(
+            name="List programs the agency offers",
+            method="GET",
+            path="/agencies/{{agency_id}}/programs",
+        ),
+    ],
+    description=(
+        "Agency-tenant management (SUPER_ADMIN only). Create / list / patch / "
+        "soft-delete agencies, and list the programs each agency offers. "
+        "Auto-extracts `agency_id` from the Create response for use by the "
+        "downstream Get/Patch/Delete/Programs requests."
+    ),
+)
+
+# --------------------------------------------------------------------------
+# 11. Health (2 routes)
 # --------------------------------------------------------------------------
 HEALTH_FOLDER = folder(
     "health",
@@ -1003,6 +1066,7 @@ COLLECTION: dict[str, Any] = {
             "**Folders are organized by user role:**\n"
             "- `auth`, `health` — public.\n"
             "- `staff`, `patients`, `appointments`, `visits`, `locations`, `audit-logs`, `notifications > broadcast` — AGENCY_ADMIN.\n"
+            "- `agencies` — SUPER_ADMIN only.\n"
             "- `notifications > list/read/badge` — any authenticated user.\n"
             "- `portal` — PATIENT role only.\n\n"
             "**CI:** the same collection runs under Newman on every PR. See `.github/workflows/api-smoke.yml`."
@@ -1019,10 +1083,14 @@ COLLECTION: dict[str, Any] = {
         NOTIFICATIONS_FOLDER,
         LOCATIONS_FOLDER,
         AUDIT_LOGS_FOLDER,
+        AGENCIES_FOLDER,
         HEALTH_FOLDER,
     ],
     "event": [
-        {"listen": "prerequest", "script": {"type": "text/javascript", "exec": [COLLECTION_PRE_REQUEST]}},
+        {
+            "listen": "prerequest",
+            "script": {"type": "text/javascript", "exec": [COLLECTION_PRE_REQUEST]},
+        },
     ],
     "variable": [],
     "auth": _bearer_auth(),
@@ -1032,6 +1100,7 @@ COLLECTION: dict[str, Any] = {
 def main() -> None:
     out = Path(__file__).resolve().parent / "QlockCare_API.postman_collection.json"
     out.write_text(json.dumps(COLLECTION, indent=2) + "\n")
+
     # Count requests for sanity.
     def _count(items: list[dict[str, Any]]) -> int:
         n = 0
@@ -1041,6 +1110,7 @@ def main() -> None:
             else:
                 n += 1
         return n
+
     print(f"Wrote {out}")
     print(f"Folders: {len(COLLECTION['item'])}")
     print(f"Total requests: {_count(COLLECTION['item'])}")
