@@ -301,15 +301,19 @@ class Settings(BaseSettings):
 
         The webhook secret is checked separately (the key alone lets us
         create checkout sessions; the secret lets us receive webhooks).
+
+        Both ``None`` and an empty ``SecretStr`` count as "not configured"
+        so a deploy that forgets to populate the env var still gets a
+        503 rather than a request that crashes mid-flight.
         """
-        return bool(
-            self.STRIPE_SECRET_KEY is not None
-            and (
-                self.STRIPE_PRICE_BASIC
-                or self.STRIPE_PRICE_PROFESSIONAL
-                or self.STRIPE_PRICE_ENTERPRISE
-            )
+        secret = self.STRIPE_SECRET_KEY
+        secret_ok = secret is not None and bool(secret.get_secret_value().strip())
+        prices_ok = bool(
+            (self.STRIPE_PRICE_BASIC or "")
+            or (self.STRIPE_PRICE_PROFESSIONAL or "")
+            or (self.STRIPE_PRICE_ENTERPRISE or "")
         )
+        return secret_ok and prices_ok
 
 
 @lru_cache(maxsize=1)
