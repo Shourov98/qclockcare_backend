@@ -29,6 +29,8 @@ from src.modules.agencies.schemas import (
     AgencyProgramListResponse,
     AgencyProgramResponse,
     AgencyResponse,
+    AgencySubscriptionPackageListResponse,
+    AgencySubscriptionPackageResponse,
     AgencyUpdateRequest,
 )
 from src.modules.appointments import models as _appt_models  # noqa: F401
@@ -36,7 +38,7 @@ from src.modules.identity import models as _identity_models  # noqa: F401
 from src.modules.patients import models as _patient_models  # noqa: F401
 from src.modules.staff import models as _staff_models  # noqa: F401
 from src.modules.visits import models as _visits_models  # noqa: F401
-from src.shared.domain.enums import AgencyStatus
+from src.shared.domain.enums import AgencyStatus, AgencySubscriptionPlan
 
 
 def _make_agency(**overrides: object) -> Agency:
@@ -46,6 +48,18 @@ def _make_agency(**overrides: object) -> Agency:
         "name": "Acme Home Care",
         "status": AgencyStatus.ACTIVE,
         "timezone": "America/Chicago",
+        "subscription_plan": AgencySubscriptionPlan.BASIC,
+        "subscription_price_cents": 2900,
+        "subscription_billing_cycle": "MONTHLY",
+        "trial_started_at": None,
+        "trial_ends_at": None,
+        "stripe_customer_id": None,
+        "stripe_subscription_id": None,
+        "stripe_price_id": None,
+        "current_period_start": None,
+        "current_period_end": None,
+        "cancel_at_period_end": False,
+        "subscription_synced_at": None,
         "settings": {"theme": "dark"},
         "created_at": datetime(2026, 6, 1, tzinfo=UTC),
         "updated_at": datetime(2026, 6, 15, tzinfo=UTC),
@@ -62,6 +76,9 @@ class TestAgencyCreateRequest:
         r = AgencyCreateRequest(name="Acme Home Care")
         assert r.name == "Acme Home Care"
         assert r.timezone == "America/Chicago"
+        assert r.subscription_plan == AgencySubscriptionPlan.BASIC
+        assert r.start_trial is False
+        assert r.trial_days == 14
         assert r.settings == {}
         assert r.initial_program_codes == []
 
@@ -69,10 +86,16 @@ class TestAgencyCreateRequest:
         r = AgencyCreateRequest(
             name="Acme",
             timezone="America/New_York",
+            subscription_plan=AgencySubscriptionPlan.PROFESSIONAL,
+            start_trial=True,
+            trial_days=30,
             settings={"branding": {"primary": "#FF0000"}},
             initial_program_codes=["PCA", "ARMHS"],
         )
         assert r.timezone == "America/New_York"
+        assert r.subscription_plan == AgencySubscriptionPlan.PROFESSIONAL
+        assert r.start_trial is True
+        assert r.trial_days == 30
         assert r.settings == {"branding": {"primary": "#FF0000"}}
         assert r.initial_program_codes == ["PCA", "ARMHS"]
 
@@ -108,6 +131,10 @@ class TestAgencyCreateRequest:
         r = AgencyCreateRequest(name="Acme", initial_program_codes=[])
         assert r.initial_program_codes == []
 
+    def test_trial_days_range_validated(self) -> None:
+        with pytest.raises(ValidationError):
+            AgencyCreateRequest(name="Acme", start_trial=True, trial_days=0)
+
 
 # --------------------------------------------------------------------------
 # AgencyUpdateRequest
@@ -126,6 +153,10 @@ class TestAgencyUpdateRequest:
         r = AgencyUpdateRequest(status=AgencyStatus.SUSPENDED)
         assert r.status == AgencyStatus.SUSPENDED
 
+    def test_subscription_plan_enum_validated(self) -> None:
+        r = AgencyUpdateRequest(subscription_plan=AgencySubscriptionPlan.ENTERPRISE)
+        assert r.subscription_plan == AgencySubscriptionPlan.ENTERPRISE
+
     def test_blank_name_rejected(self) -> None:
         with pytest.raises(ValidationError):
             AgencyUpdateRequest(name="   ")
@@ -142,6 +173,11 @@ class TestAgencyResponse:
         assert resp.name == "Acme Home Care"
         assert resp.status == AgencyStatus.ACTIVE
         assert resp.timezone == "America/Chicago"
+        assert resp.subscription_plan == AgencySubscriptionPlan.BASIC
+        assert resp.subscription_price_cents == 2900
+        assert resp.subscription_billing_cycle == "MONTHLY"
+        assert resp.trial_started_at is None
+        assert resp.trial_ends_at is None
         assert resp.settings == {"theme": "dark"}
         assert resp.created_at.year == 2026
 
@@ -160,6 +196,27 @@ class TestAgencyListResponse:
         resp = AgencyListResponse(data=items, pagination={"page": 1, "page_size": 20, "total": 3})
         assert len(resp.data) == 3
         assert resp.pagination.total == 3
+
+
+class TestAgencySubscriptionPackageListResponse:
+    def test_shape(self) -> None:
+        package = AgencySubscriptionPackageResponse(
+            plan=AgencySubscriptionPlan.PROFESSIONAL,
+            name="Professional",
+            description="For growing agencies with advanced needs",
+            monthly_price_cents=7900,
+            billing_cycle="MONTHLY",
+            max_team_members=25,
+            max_active_projects=None,
+            storage_gb=100,
+            is_most_popular=True,
+            included_features=["Everything in Basic", "Up to 25 team members"],
+        )
+        resp = AgencySubscriptionPackageListResponse(data=[package])
+
+        assert resp.data[0].plan == AgencySubscriptionPlan.PROFESSIONAL
+        assert resp.data[0].monthly_price_cents == 7900
+        assert resp.data[0].is_most_popular is True
 
 
 # --------------------------------------------------------------------------

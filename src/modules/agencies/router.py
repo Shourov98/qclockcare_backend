@@ -30,6 +30,8 @@ from src.modules.agencies.schemas import (
     AgencyProgramListResponse,
     AgencyProgramResponse,
     AgencyResponse,
+    AgencySubscriptionPackageListResponse,
+    AgencySubscriptionPackageResponse,
     AgencyUpdateRequest,
 )
 from src.modules.audit_logs import service as audit_logs_service
@@ -51,11 +53,29 @@ _SUPER_ADMIN_ONLY = [Depends(require_role(UserRole.SUPER_ADMIN))]
 
 
 # --------------------------------------------------------------------------
+# Subscription package catalog
+# --------------------------------------------------------------------------
+@router.get(
+    "/subscription-packages",
+    response_model=AgencySubscriptionPackageListResponse,
+    responses=standard_responses(include=[]),
+)
+async def list_subscription_packages_endpoint() -> AgencySubscriptionPackageListResponse:
+    """List available agency subscription packages."""
+    data = [
+        AgencySubscriptionPackageResponse.model_validate(package)
+        for package in agencies_service.list_subscription_packages()
+    ]
+    return AgencySubscriptionPackageListResponse(data=data)
+
+
+# --------------------------------------------------------------------------
 # List + create
 # --------------------------------------------------------------------------
 @router.get(
     "",
     response_model=AgencyListResponse,
+    dependencies=_SUPER_ADMIN_ONLY,
     responses=standard_responses(include=[401, 403]),
 )
 async def list_agencies_endpoint(
@@ -113,6 +133,9 @@ async def create_agency_endpoint(
                 "name": agency.name,
                 "timezone": agency.timezone,
                 "status": agency.status.value,
+                "subscription_plan": agency.subscription_plan.value,
+                "subscription_price_cents": agency.subscription_price_cents,
+                "subscription_billing_cycle": agency.subscription_billing_cycle,
                 "initial_program_codes": payload.initial_program_codes,
             },
             ip_address=ip,

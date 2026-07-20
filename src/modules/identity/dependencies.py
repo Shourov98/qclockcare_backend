@@ -94,21 +94,26 @@ async def get_session_with_auth(
                 # produce a different shape).
                 raise AccountDisabledError()
             # Attach the auth context to the request for downstream handlers
-            from src.modules.identity.auth_service import _pick_primary_role, _to_current_user
+            from src.modules.identity.auth_service import (
+                _pick_primary_role,
+                _to_current_user,
+                assert_agency_allows_auth,
+            )
 
             role, agency_id = _pick_primary_role(user.roles)
+            await set_session_context(
+                session,
+                user_id=str(user.id),
+                agency_id=str(agency_id) if agency_id else None,
+                user_role=role.value,
+            )
+            await assert_agency_allows_auth(session, agency_id=agency_id)
             request.state.auth = AuthContext(
                 user_id=user.id,
                 user=_to_current_user(user),
                 role=role,
                 agency_id=agency_id,
                 raw_token=credentials.credentials,
-            )
-            await set_session_context(
-                session,
-                user_id=str(user.id),
-                agency_id=str(agency_id) if agency_id else None,
-                user_role=role.value,
             )
         yield session
 

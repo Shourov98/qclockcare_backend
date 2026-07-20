@@ -31,7 +31,6 @@ from sqlalchemy import text
 from src.core.database import engine
 from src.core.security import hash_password
 
-
 BASE_URL = os.environ.get("QLOCKCARE_TEST_URL", "http://127.0.0.1:8001")
 
 
@@ -114,7 +113,7 @@ async def fresh_user() -> tuple[str, str, str, str]:
 # --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_login_returns_token_pair(fresh_user: tuple[str, str, str, str]) -> None:
-    email, password, user_id, _agency_id = fresh_user
+    email, password, _user_id, _agency_id = fresh_user
     async with httpx.AsyncClient(base_url=BASE_URL, timeout=10) as client:
         r = await client.post(
             "/auth/login", json={"email": email, "password": password}
@@ -209,6 +208,51 @@ async def test_login_wrong_password(fresh_user: tuple[str, str, str, str]) -> No
         )
         assert r.status_code == 401
         assert r.json()["error"]["code"] == "INVALID_CREDENTIALS"
+
+
+@pytest.mark.asyncio
+async def test_login_rejects_suspended_agency(
+    fresh_user: tuple[str, str, str, str],
+) -> None:
+    email, password, _user_id, agency_id = fresh_user
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE agencies SET status = 'SUSPENDED' WHERE id = :a"),
+            {"a": agency_id},
+        )
+
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=10) as client:
+        r = await client.post(
+            "/auth/login", json={"email": email, "password": password}
+        )
+        assert r.status_code == 403, r.text
+        assert r.json()["error"]["code"] == "AGENCY_SUSPENDED"
+
+
+@pytest.mark.asyncio
+async def test_existing_access_token_rejects_after_agency_suspended(
+    fresh_user: tuple[str, str, str, str],
+) -> None:
+    email, password, _user_id, agency_id = fresh_user
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=10) as client:
+        r = await client.post(
+            "/auth/login", json={"email": email, "password": password}
+        )
+        assert r.status_code == 200, r.text
+        token = r.json()["access_token"]
+
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE agencies SET status = 'SUSPENDED' WHERE id = :a"),
+                {"a": agency_id},
+            )
+
+        r = await client.get(
+            "/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 403, r.text
+        assert r.json()["error"]["code"] == "AGENCY_SUSPENDED"
 
 
 @pytest.mark.asyncio

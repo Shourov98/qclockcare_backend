@@ -14,33 +14,28 @@ dependencies = [
     "fastapi[standard]>=0.115.0",
     "uvicorn[standard]>=0.32.0",
     "python-multipart>=0.0.20",
-
     # Validation & settings
     "pydantic>=2.10.0",
     "pydantic-settings>=2.7.0",
     "email-validator>=2.2.0",
-
     # Database
     "sqlalchemy[asyncio]>=2.0.36",
     "asyncpg>=0.30.0",
     "psycopg[binary]>=3.2.0",
     "alembic>=1.14.0",
-
     # Auth & security
     "pyjwt[crypto]>=2.10.0",
     "argon2-cffi>=23.1.0",
     "cryptography>=44.0.0",
-
     # Storage
     "boto3>=1.35.0",
     "aioboto3>=13.3.0",
-
     # Supabase (only used if STORAGE_BACKEND=supabase)
     "supabase>=2.10.0",
-
+    # Billing (only used if FEATURE_BILLING_ENABLED=true)
+    "stripe>=11.0.0",
     # Rate limiting
     "slowapi>=0.1.9",
-
     # Observability
     "structlog>=24.4.0",
     "prometheus-client>=0.21.0",
@@ -48,13 +43,10 @@ dependencies = [
     "opentelemetry-sdk>=1.28.0",
     "opentelemetry-instrumentation-fastapi>=0.49b0",
     "sentry-sdk[fastapi]>=2.19.0",
-
     # HTTP client (used by services for outbound calls)
     "httpx>=0.28.0",
-
     # Email (notifications SMTP provider)
     "aiosmtplib>=3.0.0",
-
     # Misc
     "python-json-logger>=2.0.7",
     "orjson>=3.10.0",

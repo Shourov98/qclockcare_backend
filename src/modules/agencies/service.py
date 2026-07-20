@@ -9,7 +9,7 @@ is auditable from logs.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -21,7 +21,83 @@ from src.modules.agencies.schemas import (
     AgencyCreateRequest,
     AgencyUpdateRequest,
 )
-from src.shared.domain.enums import ProgramType
+from src.shared.domain.enums import AgencyStatus, AgencySubscriptionPlan, ProgramType
+
+SUBSCRIPTION_PACKAGES: dict[AgencySubscriptionPlan, dict] = {
+    AgencySubscriptionPlan.BASIC: {
+        "plan": AgencySubscriptionPlan.BASIC,
+        "name": "Basic",
+        "description": "For small agencies getting started",
+        "monthly_price_cents": 2900,
+        "billing_cycle": "MONTHLY",
+        "max_team_members": 5,
+        "max_active_projects": 10,
+        "storage_gb": 5,
+        "is_most_popular": False,
+        "included_features": [
+            "Up to 5 team members",
+            "10 active projects",
+            "Basic reporting & analytics",
+            "Email support",
+            "5GB storage",
+            "Mobile app access",
+            "Standard integrations",
+            "Task management",
+        ],
+    },
+    AgencySubscriptionPlan.PROFESSIONAL: {
+        "plan": AgencySubscriptionPlan.PROFESSIONAL,
+        "name": "Professional",
+        "description": "For growing agencies with advanced needs",
+        "monthly_price_cents": 7900,
+        "billing_cycle": "MONTHLY",
+        "max_team_members": 25,
+        "max_active_projects": None,
+        "storage_gb": 100,
+        "is_most_popular": True,
+        "included_features": [
+            "Everything in Basic",
+            "Up to 25 team members",
+            "Unlimited projects",
+            "Advanced analytics & insights",
+            "Priority support (24/7)",
+            "100GB storage",
+            "Custom workflows",
+            "Advanced integrations",
+            "Time tracking & invoicing",
+            "Client portals",
+            "White-label options",
+        ],
+    },
+    AgencySubscriptionPlan.ENTERPRISE: {
+        "plan": AgencySubscriptionPlan.ENTERPRISE,
+        "name": "Enterprise",
+        "description": "For large organizations with complex needs",
+        "monthly_price_cents": 9000,
+        "billing_cycle": "MONTHLY",
+        "max_team_members": None,
+        "max_active_projects": None,
+        "storage_gb": None,
+        "is_most_popular": False,
+        "included_features": [
+            "Everything in Professional",
+            "Unlimited team members",
+            "Unlimited projects & storage",
+            "Dedicated account manager",
+            "Custom integrations & API",
+            "Advanced security & compliance",
+            "SSO & SAML authentication",
+            "Custom training & onboarding",
+            "SLA guarantees",
+            "Multi-region deployment",
+            "Priority feature requests",
+        ],
+    },
+}
+
+
+def _subscription_package(plan: AgencySubscriptionPlan) -> dict:
+    return SUBSCRIPTION_PACKAGES[plan]
 
 
 # --------------------------------------------------------------------------
@@ -114,6 +190,15 @@ async def list_agencies(
     return list(rows), int(total)
 
 
+def list_subscription_packages() -> list[dict]:
+    """Return the supported agency subscription packages in display order."""
+    return [
+        dict(SUBSCRIPTION_PACKAGES[AgencySubscriptionPlan.BASIC]),
+        dict(SUBSCRIPTION_PACKAGES[AgencySubscriptionPlan.PROFESSIONAL]),
+        dict(SUBSCRIPTION_PACKAGES[AgencySubscriptionPlan.ENTERPRISE]),
+    ]
+
+
 async def get_agency(
     session: AsyncSession,
     *,
@@ -137,9 +222,17 @@ async def create_agency(
     `initial_program_codes` is best-effort: unknown codes surface as
     422 from the schema layer before we reach here.
     """
+    package = _subscription_package(payload.subscription_plan)
+    now = datetime.now(UTC)
     agency = Agency(
         name=payload.name,
         timezone=payload.timezone,
+        status=AgencyStatus.TRIAL if payload.start_trial else AgencyStatus.ACTIVE,
+        subscription_plan=payload.subscription_plan,
+        subscription_price_cents=package["monthly_price_cents"],
+        subscription_billing_cycle=package["billing_cycle"],
+        trial_started_at=now if payload.start_trial else None,
+        trial_ends_at=now + timedelta(days=payload.trial_days) if payload.start_trial else None,
         settings=payload.settings,
     )
     session.add(agency)
@@ -181,21 +274,26 @@ async def update_agency(
     """
     agency = await _get_agency_or_404(session, agency_id=agency_id, include_deleted=False)
     updates = payload.model_dump(exclude_unset=True)
+    plan = updates.get("subscription_plan")
+    if plan is not None:
+        package = _subscription_package(plan)
+        updates["subscription_price_cents"] = package["monthly_price_cents"]
+        updates["subscription_billing_cycle"] = package["billing_cycle"]
 
     # If the caller explicitly wants to set status to SUSPENDED or CHURNED,
     # document it via settings.suspended_at / churned_at so audit log readers
     # have a timestamp to work with.
     new_status = updates.get("status")
     now = datetime.now(UTC)
-    if new_status == "SUSPENDED" and "settings" not in updates:
+    if new_status == AgencyStatus.SUSPENDED and "settings" not in updates:
         settings = dict(agency.settings or {})
         settings.setdefault("suspended_at", now.isoformat())
         updates["settings"] = settings
-    elif new_status == "CHURNED" and "settings" not in updates:
+    elif new_status == AgencyStatus.CHURNED and "settings" not in updates:
         settings = dict(agency.settings or {})
         settings.setdefault("churned_at", now.isoformat())
         updates["settings"] = settings
-    elif new_status in {"ACTIVE", "TRIAL"} and "settings" not in updates:
+    elif new_status in {AgencyStatus.ACTIVE, AgencyStatus.TRIAL} and "settings" not in updates:
         # Clear any previously-set suspension flag so a reactivation is
         # tracked.
         settings = dict(agency.settings or {})
@@ -205,6 +303,10 @@ async def update_agency(
         if "churned_at" in settings:
             del settings["churned_at"]
         updates["settings"] = settings
+    if new_status == AgencyStatus.TRIAL and agency.trial_started_at is None:
+        updates.setdefault("trial_started_at", now)
+    elif new_status == AgencyStatus.ACTIVE and "trial_ends_at" not in updates:
+        updates["trial_ends_at"] = None
 
     for field, value in updates.items():
         setattr(agency, field, value)
@@ -312,6 +414,7 @@ __all__ = [
     "get_agency",
     "list_agencies",
     "list_agency_programs",
+    "list_subscription_packages",
     "set_agency_program",
     "soft_delete_agency",
     "update_agency",

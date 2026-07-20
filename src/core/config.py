@@ -182,8 +182,28 @@ class Settings(BaseSettings):
 
     # ----- Feature Flags -----
     FEATURE_REGISTRATION_ENABLED: bool = False
+    # When True, the `/billing` surface is mounted and Stripe checkout /
+    # webhook handlers are live. Leave False until you've set
+    # `STRIPE_SECRET_KEY` + `STRIPE_WEBHOOK_SECRET` and run migration 0015.
     FEATURE_BILLING_ENABLED: bool = False
     FEATURE_2FA_ENABLED: bool = False
+
+    # ----- Stripe / Billing (ADR-0021) -----
+    # Required when FEATURE_BILLING_ENABLED=True. None in dev keeps the
+    # Stripe SDK in test/mock mode so the app starts.
+    STRIPE_SECRET_KEY: SecretStr | None = None
+    # Used to verify `Stripe-Signature` on inbound webhook deliveries.
+    STRIPE_WEBHOOK_SECRET: SecretStr | None = None
+    # One Stripe Price ID per agency package — drives Checkout line items.
+    STRIPE_PRICE_BASIC: str | None = None
+    STRIPE_PRICE_PROFESSIONAL: str | None = None
+    STRIPE_PRICE_ENTERPRISE: str | None = None
+    # Where Stripe Checkout redirects the customer after success / cancel.
+    STRIPE_CHECKOUT_SUCCESS_URL: str = "http://localhost:3000/billing/success"
+    STRIPE_CHECKOUT_CANCEL_URL: str = "http://localhost:3000/billing/cancel"
+    # Connect timeout for Stripe API calls (seconds). The SDK retries
+    # internally up to 2x by default; this caps the outer wait.
+    STRIPE_API_TIMEOUT_SECONDS: int = Field(default=15, ge=1, le=120)
 
     # ----- Seed / Bootstrap -----
     SEED_SUPER_ADMIN_EMAIL: str | None = None
@@ -258,6 +278,38 @@ class Settings(BaseSettings):
         if self.S3_PRESIGNED_URL_TTL_SECONDS is not None:
             return self.S3_PRESIGNED_URL_TTL_SECONDS
         return self.STORAGE_PRESIGNED_URL_TTL_SECONDS
+
+    @property
+    def stripe_price_id_for(self) -> dict[str, str | None]:
+        """Map AgencySubscriptionPlan.value → Stripe Price ID.
+
+        Returning None for any unmapped plan lets callers raise
+        ServiceUnavailableError("Stripe price not configured") at request
+        time rather than crashing at startup over a missing env var.
+        """
+        from src.shared.domain.enums import AgencySubscriptionPlan
+
+        return {
+            AgencySubscriptionPlan.BASIC.value: self.STRIPE_PRICE_BASIC,
+            AgencySubscriptionPlan.PROFESSIONAL.value: self.STRIPE_PRICE_PROFESSIONAL,
+            AgencySubscriptionPlan.ENTERPRISE.value: self.STRIPE_PRICE_ENTERPRISE,
+        }
+
+    @property
+    def stripe_configured(self) -> bool:
+        """True iff billing can talk to Stripe — key + at least one price set.
+
+        The webhook secret is checked separately (the key alone lets us
+        create checkout sessions; the secret lets us receive webhooks).
+        """
+        return bool(
+            self.STRIPE_SECRET_KEY is not None
+            and (
+                self.STRIPE_PRICE_BASIC
+                or self.STRIPE_PRICE_PROFESSIONAL
+                or self.STRIPE_PRICE_ENTERPRISE
+            )
+        )
 
 
 @lru_cache(maxsize=1)

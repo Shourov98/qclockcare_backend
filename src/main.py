@@ -42,6 +42,13 @@ from src.modules.appointments.models import (  # noqa: F401
 from src.modules.appointments.router import router as appointments_router
 from src.modules.audit_logs.models import AuditLog  # noqa: F401
 from src.modules.audit_logs.router import router as audit_logs_router
+from src.modules.billing.models import StripeWebhookEvent  # noqa: F401
+from src.modules.billing.router import (
+    agencies_billing_router,
+)
+from src.modules.billing.router import (
+    webhook_router as billing_webhook_router,
+)
 from src.modules.identity.models import (  # noqa: F401
     AuthAuditEvent,
     EmailVerificationOtp,
@@ -165,10 +172,10 @@ QlockCare backend API.
 All endpoints except the public auth flows (`POST /auth/login`,
 `POST /auth/refresh`, `POST /auth/forgot-password`,
 `POST /auth/reset-password`, `POST /auth/accept-invitation`,
-`POST /auth/verify-email`, `POST /auth/resend-otp`) require a Bearer
-JWT in the `Authorization` header. Use the **Authorize** button at
-the top of `/docs` to paste your access token once for the whole
-session.
+`POST /auth/verify-email`, `POST /auth/resend-otp`) and the Stripe
+webhook receiver (`POST /billing/webhook`) require a Bearer JWT in
+the `Authorization` header. Use the **Authorize** button at the top
+of `/docs` to paste your access token once for the whole session.
 
 The token has a short lifetime (default 15 minutes); refresh it via
 `POST /auth/refresh` with your current refresh token.
@@ -374,6 +381,13 @@ def create_app() -> FastAPI:
 
     # Agencies — SUPER_ADMIN-only management of agency tenants.
     app.include_router(agencies_router)
+
+    # Billing — Stripe checkout + portal (per-agency) + webhook receiver.
+    # Routes are mounted unconditionally but each handler short-circuits
+    # with 503 when FEATURE_BILLING_ENABLED=False, so the OpenAPI schema
+    # still advertises the surface across environments.
+    app.include_router(agencies_billing_router)
+    app.include_router(billing_webhook_router)
 
     # NOTE: feature routers get registered here as modules land, e.g.
     #   app.include_router(staff_router, prefix="/staff", tags=["staff"])

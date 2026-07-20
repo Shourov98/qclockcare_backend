@@ -56,6 +56,12 @@ class AgencyStatus(StrEnum):
     CHURNED = "CHURNED"
 
 
+class AgencySubscriptionPlan(StrEnum):
+    BASIC = "BASIC"
+    PROFESSIONAL = "PROFESSIONAL"
+    ENTERPRISE = "ENTERPRISE"
+
+
 # --------------------------------------------------------------------------
 # Programs
 # --------------------------------------------------------------------------

@@ -146,6 +146,11 @@ class AccountDisabledError(ForbiddenError):
     message = "This account has been disabled."
 
 
+class AgencySuspendedError(ForbiddenError):
+    error_code = "AGENCY_SUSPENDED"
+    message = "This agency is suspended."
+
+
 class EmailNotVerifiedError(ForbiddenError):
     error_code = "EMAIL_NOT_VERIFIED"
     message = "Please verify your email address to continue."
@@ -363,6 +368,7 @@ def register_exception_handlers(app: FastAPI) -> None:
 __all__ = [
     "AccountDisabledError",
     "AccountLockedError",
+    "AgencySuspendedError",
     "AppException",
     "ConflictError",
     "CrossAgencyAccessDeniedError",

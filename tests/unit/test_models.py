@@ -10,6 +10,7 @@ from __future__ import annotations
 def test_enums_load() -> None:
     from src.shared.domain.enums import (
         AgencyStatus,
+        AgencySubscriptionPlan,
         AppointmentStatus,
         AuditAction,
         AuthAuditEventType,
@@ -33,6 +34,7 @@ def test_enums_load() -> None:
     # Every enum has at least one member
     for cls in (
         AgencyStatus,
+        AgencySubscriptionPlan,
         AppointmentStatus,
         AuditAction,
         AuthAuditEventType,
@@ -59,6 +61,7 @@ def test_enum_mapping_complete() -> None:
     from src.shared.domain.enum_mapping import ENUM_TYPE_NAMES, pg_name
     from src.shared.domain.enums import (
         AgencyStatus,
+        AgencySubscriptionPlan,
         AppointmentStatus,
         AuditAction,
         AuthAuditEventType,
@@ -81,6 +84,7 @@ def test_enum_mapping_complete() -> None:
 
     for cls in (
         AgencyStatus,
+        AgencySubscriptionPlan,
         AppointmentStatus,
         AuditAction,
         AuthAuditEventType,
@@ -176,6 +180,11 @@ def test_agency_table_has_expected_columns() -> None:
         "name",
         "status",
         "timezone",
+        "subscription_plan",
+        "subscription_price_cents",
+        "subscription_billing_cycle",
+        "trial_started_at",
+        "trial_ends_at",
         "settings",
         "created_at",
         "updated_at",

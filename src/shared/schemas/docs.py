@@ -151,6 +151,17 @@ tags_metadata: Final[list[dict[str, str]]] = [
         ),
     },
     {
+        "name": "billing",
+        "description": (
+            "Stripe-backed subscription billing — start a Checkout "
+            "session for the agency, open the hosted billing portal, "
+            "and the Stripe webhook receiver that writes back "
+            "subscription state. **Disabled by default** — enable with "
+            "`FEATURE_BILLING_ENABLED=true` after Stripe credentials are "
+            "configured."
+        ),
+    },
+    {
         "name": "health",
         "description": (
             "Liveness (`/health`) and readiness (`/ready`) probes. "

@@ -68,7 +68,7 @@ def _user_agent(request: Request) -> str | None:
 @router.post(
     "/login",
     response_model=TokenPair,
-    responses=standard_responses(include=[401, 422]),
+    responses=standard_responses(include=[401, 403, 422]),
     summary="Log in with email and password",
     description=(
         "Authenticates a user with email + password and returns an "
@@ -104,7 +104,7 @@ async def login_endpoint(
 @router.post(
     "/refresh",
     response_model=TokenPair,
-    responses=standard_responses(include=[401, 422]),
+    responses=standard_responses(include=[401, 403, 422]),
     summary="Mint a fresh access token",
     description=(
         "Exchanges a valid refresh token for a new access/refresh pair. "

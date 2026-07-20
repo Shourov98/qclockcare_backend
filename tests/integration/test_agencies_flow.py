@@ -174,6 +174,16 @@ async def test_agency_admin_returns_403(super_admin_seed) -> None:
         assert r.status_code == 403, r.text
 
 
+async def test_subscription_packages_catalog() -> None:
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=10) as client:
+        r = await client.get("/agencies/subscription-packages")
+        assert r.status_code == 200, r.text
+        data = r.json()["data"]
+        assert [p["plan"] for p in data] == ["BASIC", "PROFESSIONAL", "ENTERPRISE"]
+        assert [p["monthly_price_cents"] for p in data] == [2900, 7900, 9000]
+        assert data[1]["is_most_popular"] is True
+
+
 # --------------------------------------------------------------------------
 # Full CRUD lifecycle as SUPER_ADMIN
 # --------------------------------------------------------------------------
@@ -191,6 +201,7 @@ async def test_super_admin_full_lifecycle(super_admin_seed) -> None:
             json={
                 "name": agency_name,
                 "timezone": "America/New_York",
+                "subscription_plan": "PROFESSIONAL",
                 "settings": {"theme": "light"},
                 "initial_program_codes": ["PCA", "ARMHS"],
             },
@@ -202,6 +213,9 @@ async def test_super_admin_full_lifecycle(super_admin_seed) -> None:
         assert body["name"] == agency_name
         assert body["timezone"] == "America/New_York"
         assert body["status"] == "ACTIVE"
+        assert body["subscription_plan"] == "PROFESSIONAL"
+        assert body["subscription_price_cents"] == 7900
+        assert body["subscription_billing_cycle"] == "MONTHLY"
         assert body["settings"] == {"theme": "light"}
 
         # 2. LIST — must include the new agency
@@ -226,13 +240,19 @@ async def test_super_admin_full_lifecycle(super_admin_seed) -> None:
         new_name = f"Test Agency Renamed {uuid.uuid4().hex[:6]}"
         r = await client.patch(
             f"/agencies/{agency_id}",
-            json={"name": new_name, "status": "SUSPENDED"},
+            json={
+                "name": new_name,
+                "status": "SUSPENDED",
+                "subscription_plan": "ENTERPRISE",
+            },
             headers=auth,
         )
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["name"] == new_name
         assert body["status"] == "SUSPENDED"
+        assert body["subscription_plan"] == "ENTERPRISE"
+        assert body["subscription_price_cents"] == 9000
         # The service stamps settings.suspended_at on SUSPENDED transitions.
         assert "suspended_at" in body["settings"]
 

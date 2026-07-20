@@ -24,7 +24,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from src.shared.domain.enums import AgencyStatus, ProgramType
+from src.shared.domain.enums import AgencyStatus, AgencySubscriptionPlan, ProgramType
 from src.shared.schemas.pagination import PaginatedResponse
 
 
@@ -39,6 +39,12 @@ class AgencyCreateRequest(BaseModel):
 
     name: str = Field(min_length=1, max_length=255)
     timezone: str = Field(default="America/Chicago", min_length=1, max_length=64)
+    subscription_plan: AgencySubscriptionPlan = Field(default=AgencySubscriptionPlan.BASIC)
+    start_trial: bool = Field(
+        default=False,
+        description="When true, creates the agency in TRIAL status for `trial_days` days.",
+    )
+    trial_days: int = Field(default=14, ge=1, le=90)
     settings: dict[str, Any] = Field(default_factory=dict)
     initial_program_codes: list[str] = Field(
         default_factory=list,
@@ -82,6 +88,8 @@ class AgencyUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     timezone: str | None = Field(default=None, min_length=1, max_length=64)
     status: AgencyStatus | None = Field(default=None)
+    subscription_plan: AgencySubscriptionPlan | None = Field(default=None)
+    trial_ends_at: datetime | None = Field(default=None)
     settings: dict[str, Any] | None = Field(default=None)
 
     @field_validator("name", "timezone")
@@ -107,6 +115,20 @@ class AgencyResponse(BaseModel):
     name: str
     status: AgencyStatus
     timezone: str
+    subscription_plan: AgencySubscriptionPlan
+    subscription_price_cents: int
+    subscription_billing_cycle: str
+    trial_started_at: datetime | None
+    trial_ends_at: datetime | None
+    # Stripe mirror fields — populated after the agency goes through
+    # Checkout. None means "no Stripe subscription yet".
+    stripe_customer_id: str | None
+    stripe_subscription_id: str | None
+    stripe_price_id: str | None
+    current_period_start: datetime | None
+    current_period_end: datetime | None
+    cancel_at_period_end: bool
+    subscription_synced_at: datetime | None
     settings: dict[str, Any]
     created_at: datetime
     updated_at: datetime
@@ -116,6 +138,30 @@ class AgencyListResponse(PaginatedResponse[AgencyResponse]):
     """Paginated list envelope."""
 
     pass
+
+
+# --------------------------------------------------------------------------
+# Subscription packages
+# --------------------------------------------------------------------------
+class AgencySubscriptionPackageResponse(BaseModel):
+    """One package shown in the agency subscription/pricing UI."""
+
+    plan: AgencySubscriptionPlan
+    name: str
+    description: str
+    monthly_price_cents: int
+    billing_cycle: str
+    max_team_members: int | None
+    max_active_projects: int | None
+    storage_gb: int | None
+    is_most_popular: bool
+    included_features: list[str]
+
+
+class AgencySubscriptionPackageListResponse(BaseModel):
+    """Available agency subscription packages."""
+
+    data: list[AgencySubscriptionPackageResponse]
 
 
 # --------------------------------------------------------------------------
@@ -146,5 +192,7 @@ __all__ = [
     "AgencyProgramListResponse",
     "AgencyProgramResponse",
     "AgencyResponse",
+    "AgencySubscriptionPackageListResponse",
+    "AgencySubscriptionPackageResponse",
     "AgencyUpdateRequest",
 ]

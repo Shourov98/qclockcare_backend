@@ -29,6 +29,7 @@ from src.core.config import settings
 from src.core.exceptions import (
     AccountDisabledError,
     AccountLockedError,
+    AgencySuspendedError,
     EmailNotVerifiedError,
     InvalidCredentialsError,
     InvalidInvitationTokenError,
@@ -40,6 +41,7 @@ from src.core.exceptions import (
 )
 from src.core.logging import get_logger
 from src.core.security import hash_password, needs_rehash, verify_password
+from src.modules.agencies.models import Agency
 from src.modules.identity import jwt_service, otp_service
 from src.modules.identity.models import (
     AuthAuditEvent,
@@ -50,6 +52,7 @@ from src.modules.identity.models import (
 )
 from src.modules.identity.schemas import CurrentUser
 from src.shared.domain.enums import (
+    AgencyStatus,
     AuthAuditEventType,
     UserRole,
     UserStatus,
@@ -147,6 +150,41 @@ def _to_current_user(user: User) -> CurrentUser:
     )
 
 
+async def assert_agency_allows_auth(
+    session: AsyncSession,
+    *,
+    agency_id: uuid.UUID | None,
+) -> None:
+    """Reject authentication for agency-scoped users whose agency is not active."""
+    if agency_id is None:
+        return
+
+    agency = await session.get(Agency, agency_id)
+    if agency is None:
+        raise AgencySuspendedError(
+            message="This agency is not available.",
+            details={"agency_id": str(agency_id), "status": "MISSING"},
+        )
+    if agency.deleted_at is not None:
+        raise AgencySuspendedError(
+            message="This agency is not available.",
+            details={"agency_id": str(agency_id), "status": "DELETED"},
+        )
+    if agency.status in {AgencyStatus.SUSPENDED, AgencyStatus.CHURNED}:
+        raise AgencySuspendedError(
+            details={"agency_id": str(agency_id), "status": agency.status.value}
+        )
+    if (
+        agency.status == AgencyStatus.TRIAL
+        and agency.trial_ends_at is not None
+        and agency.trial_ends_at <= datetime.now(UTC)
+    ):
+        raise AgencySuspendedError(
+            message="This agency trial has expired.",
+            details={"agency_id": str(agency_id), "status": "TRIAL_EXPIRED"},
+        )
+
+
 async def _issue_pair(
     session: AsyncSession,
     *,
@@ -155,7 +193,16 @@ async def _issue_pair(
     user_agent: str | None,
 ) -> IssuedTokens:
     """Issue access + refresh tokens, persist the refresh row, return pair."""
+    from src.core.database import set_session_context
+
     role, agency_id = _pick_primary_role(user.roles)
+    await set_session_context(
+        session,
+        user_id=str(user.id),
+        agency_id=str(agency_id) if agency_id else None,
+        user_role=role.value,
+    )
+    await assert_agency_allows_auth(session, agency_id=agency_id)
     access_token, expires_in = jwt_service.issue_access_token(
         user_id=user.id,
         email=user.email,
@@ -351,6 +398,7 @@ async def refresh(
         agency_id=str(agency_id) if agency_id else None,
         user_role=role.value,
     )
+    await assert_agency_allows_auth(session, agency_id=agency_id)
 
     # Rotate: revoke the old, issue a new pair
     row.revoked_at = now
