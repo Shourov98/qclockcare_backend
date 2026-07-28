@@ -260,12 +260,25 @@ class Settings(BaseSettings):
 
     @property
     def effective_database_url(self) -> str:
-        """Pool URL for app runtime, direct URL for Alembic."""
-        return (
+        """Pool URL for app runtime, direct URL for Alembic.
+
+        Automatically prepends `+asyncpg` to the scheme if it's missing,
+        so deployments that set `DATABASE_URL=postgresql://...` (without
+        the driver suffix) still work. Without the explicit driver,
+        SQLAlchemy defaults to psycopg2 which isn't installed — causing
+        a `ModuleNotFoundError` at engine-creation time on Python 3.14.
+        """
+        url = (
             self.DATABASE_POOL_URL.get_secret_value()
             if self.DATABASE_POOL_URL is not None
             else self.DATABASE_URL.get_secret_value()
         )
+        # Normalize scheme to asyncpg variant for the async runtime.
+        # Alembic reads DATABASE_URL separately and swaps its own
+        # scheme (asyncpg → psycopg) for sync migrations.
+        if url.startswith("postgresql://"):
+            url = "postgresql+asyncpg://" + url[len("postgresql://") :]
+        return url
 
     @property
     def storage_presigned_url_ttl_seconds(self) -> int:
