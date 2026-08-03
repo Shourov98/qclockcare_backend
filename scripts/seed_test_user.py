@@ -121,7 +121,22 @@ async def _fetch_or_create_user(
             )
         ).first()
         if existing is not None:
-            return cast("uuid.UUID", existing[0])
+            # Re-seed idempotently: update the password hash so a
+            # previous seed with a different password doesn't leave
+            # us with credentials that don't match the documented
+            # passwords in this file. Also make sure the account is
+            # ACTIVE and email-verified so login succeeds.
+            existing_id = cast("uuid.UUID", existing[0])
+            await conn.execute(
+                text(
+                    "UPDATE users SET password_hash = :pw, status = 'ACTIVE', "
+                    "email_verified_at = COALESCE(email_verified_at, now()), "
+                    "locked_until = NULL, failed_login_attempts = 0 "
+                    "WHERE id = :id"
+                ),
+                {"pw": hash_password(password), "id": existing_id},
+            )
+            return existing_id
         new_id = uuid.uuid4()
         await conn.execute(
             text(

@@ -9,19 +9,25 @@ is auditable from logs.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import settings
 from src.core.exceptions import ConflictError, NotFoundError, ValidationError
+from src.core.security import hash_password
 from src.modules.agencies.models import Agency, AgencyProgram, Program
 from src.modules.agencies.schemas import (
+    AgencyAdminInviteRequest,
     AgencyCreateRequest,
     AgencyUpdateRequest,
 )
-from src.shared.domain.enums import AgencyStatus, AgencySubscriptionPlan, ProgramType
+from src.modules.identity import auth_service
+from src.modules.identity.models import User, UserRoleAssignment
+from src.shared.domain.enums import AgencyStatus, AgencySubscriptionPlan, ProgramType, UserRole, UserStatus
 
 SUBSCRIPTION_PACKAGES: dict[AgencySubscriptionPlan, dict] = {
     AgencySubscriptionPlan.BASIC: {
@@ -151,6 +157,245 @@ async def _resolve_program_codes(
 
 
 # --------------------------------------------------------------------------
+# Atomic admin-binding helpers
+# --------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class AgencyAdminBindResult:
+    """Outcome of binding an AGENCY_ADMIN to an agency.
+
+    `invitation_token` is `None` for the ACTIVE / existing-user paths.
+    `email` is the recipient address (for the email subject + log line).
+    """
+
+    user_id: uuid.UUID
+    email: str
+    full_name: str
+    status: UserStatus
+    invitation_token: str | None = None
+
+
+async def _bind_agency_admin(
+    session: AsyncSession,
+    *,
+    agency_id: uuid.UUID,
+    payload: AgencyAdminInviteRequest,
+) -> AgencyAdminBindResult:
+    """Bind an `AGENCY_ADMIN` user to `agency_id` in the same session.
+
+    Three branches (decided by which fields on `payload` are set):
+
+      1. `existing_user_id` — promote an existing user to
+         AGENCY_ADMIN at this agency. No password reset, no email.
+      2. `password` provided — create a new user with
+         `status='ACTIVE'`, hashed password, `email_verified_at=now()`.
+         Login-ready; no email.
+      3. Neither — create a new user with `status='INVITED'`,
+         `password_hash=NULL`. Issue an invitation token and return its
+         plaintext so the caller can schedule the invitation email.
+
+    Raises `ConflictError` when:
+      * the email already exists on a different user (new-user path)
+      * the user already holds AGENCY_ADMIN at this agency
+      * the unique constraint on `user_roles(user_id, role, agency_id)`
+        trips for any other reason
+    """
+    # ---- Branch 1: promote an existing user ----
+    if payload.existing_user_id is not None:
+        user = (
+            await session.execute(
+                select(User).where(User.id == payload.existing_user_id)
+            )
+        ).scalar_one_or_none()
+        if user is None:
+            raise NotFoundError(
+                details={"resource": "user", "id": str(payload.existing_user_id)},
+            )
+        # Check role doesn't already exist (avoids IntegrityError).
+        existing_role = (
+            await session.execute(
+                select(UserRoleAssignment).where(
+                    UserRoleAssignment.user_id == user.id,
+                    UserRoleAssignment.agency_id == agency_id,
+                    UserRoleAssignment.role == UserRole.AGENCY_ADMIN,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_role is not None:
+            raise ConflictError(
+                message="User is already an AGENCY_ADMIN at this agency.",
+                details={"user_id": str(user.id), "agency_id": str(agency_id)},
+            )
+        session.add(
+            UserRoleAssignment(
+                user_id=user.id,
+                agency_id=agency_id,
+                role=UserRole.AGENCY_ADMIN,
+            )
+        )
+        await session.flush()
+        return AgencyAdminBindResult(
+            user_id=user.id,
+            email=user.email,
+            full_name=user.full_name,
+            status=user.status,
+        )
+
+    # ---- New-user branch (2 or 3) ----
+    if payload.email is None or payload.full_name is None:
+        # Schema validator allows None on the new-user fields when
+        # existing_user_id is set; if we're here, the caller asked
+        # for a new user without giving an email/name.
+        raise ValidationError(
+            message="`email` and `full_name` are required when creating a new admin.",
+        )
+
+    # Check the user isn't already an AGENCY_ADMIN at this agency.
+    existing_user = (
+        await session.execute(select(User).where(User.email == payload.email))
+    ).scalar_one_or_none()
+
+    if existing_user is not None and payload.password is None and existing_user.status == UserStatus.ACTIVE:
+        # If we're about to INVITE an existing ACTIVE user, that's
+        # almost certainly a duplicate admin request. Reject loudly.
+        existing_role = (
+            await session.execute(
+                select(UserRoleAssignment).where(
+                    UserRoleAssignment.user_id == existing_user.id,
+                    UserRoleAssignment.agency_id == agency_id,
+                    UserRoleAssignment.role == UserRole.AGENCY_ADMIN,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_role is not None:
+            raise ConflictError(
+                message="A user with this email is already an AGENCY_ADMIN at this agency.",
+                details={"email": existing_user.email},
+            )
+
+    # ---- Branch 2: ACTIVE (password supplied) ----
+    if payload.password is not None:
+        if existing_user is not None:
+            # Promote the existing user to AGENCY_ADMIN, set a fresh
+            # password, mark them ACTIVE so they can log in immediately.
+            existing_user.password_hash = hash_password(payload.password)
+            existing_user.status = UserStatus.ACTIVE
+            if payload.full_name is not None:
+                existing_user.full_name = payload.full_name
+            if payload.phone is not None:
+                existing_user.phone = payload.phone
+            user = existing_user
+        else:
+            user = User(
+                email=payload.email,
+                full_name=payload.full_name,
+                phone=payload.phone,
+                status=UserStatus.ACTIVE,
+                password_hash=hash_password(payload.password),
+                email_verified_at=datetime.now(tz=UTC),
+                must_change_password=False,
+            )
+            session.add(user)
+            await session.flush()
+        # Check role doesn't already exist (avoids IntegrityError).
+        existing_role = (
+            await session.execute(
+                select(UserRoleAssignment).where(
+                    UserRoleAssignment.user_id == user.id,
+                    UserRoleAssignment.agency_id == agency_id,
+                    UserRoleAssignment.role == UserRole.AGENCY_ADMIN,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_role is not None:
+            raise ConflictError(
+                message="A user with this email is already an AGENCY_ADMIN at this agency.",
+                details={"email": user.email},
+            )
+        session.add(
+            UserRoleAssignment(
+                user_id=user.id,
+                agency_id=agency_id,
+                role=UserRole.AGENCY_ADMIN,
+            )
+        )
+        await session.flush()
+        return AgencyAdminBindResult(
+            user_id=user.id,
+            email=user.email,
+            full_name=user.full_name,
+            status=user.status,
+        )
+
+    # ---- Branch 3: INVITED (no password) ----
+    if existing_user is None:
+        user = User(
+            email=payload.email,
+            full_name=payload.full_name,
+            phone=payload.phone,
+            status=UserStatus.INVITED,
+            must_change_password=True,
+        )
+        session.add(user)
+        await session.flush()
+    else:
+        user = existing_user
+        # If the existing user already has a password hash, the
+        # INVITED path doesn't make sense — they're not new. Reject.
+        if user.password_hash is not None:
+            raise ConflictError(
+                message=(
+                    "A user with this email already exists and has a "
+                    "password set. Provide `password` to set them "
+                    "ACTIVE, or `existing_user_id` to promote them."
+                ),
+                details={"email": user.email},
+            )
+        # Update display fields if supplied.
+        if payload.full_name is not None:
+            user.full_name = payload.full_name
+        if payload.phone is not None:
+            user.phone = payload.phone
+        user.status = UserStatus.INVITED
+
+    # Check role doesn't already exist (avoids IntegrityError).
+    existing_role = (
+        await session.execute(
+            select(UserRoleAssignment).where(
+                UserRoleAssignment.user_id == user.id,
+                UserRoleAssignment.agency_id == agency_id,
+                UserRoleAssignment.role == UserRole.AGENCY_ADMIN,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing_role is not None:
+        raise ConflictError(
+            message="A user with this email is already an AGENCY_ADMIN at this agency.",
+            details={"email": user.email},
+        )
+
+    session.add(
+        UserRoleAssignment(
+            user_id=user.id,
+            agency_id=agency_id,
+            role=UserRole.AGENCY_ADMIN,
+        )
+    )
+    await session.flush()
+
+    invitation_token, _jti = await auth_service.issue_invitation_token(
+        session, user_id=user.id
+    )
+
+    return AgencyAdminBindResult(
+        user_id=user.id,
+        email=user.email,
+        full_name=user.full_name,
+        status=user.status,
+        invitation_token=invitation_token,
+    )
+
+
+# --------------------------------------------------------------------------
 # Reads
 # --------------------------------------------------------------------------
 async def list_agencies(
@@ -215,12 +460,19 @@ async def create_agency(
     session: AsyncSession,
     *,
     payload: AgencyCreateRequest,
-) -> Agency:
-    """Insert one new agency + (optionally) attach programs.
+) -> tuple[Agency, "AgencyAdminBindResult | None"]:
+    """Insert one new agency + (optionally) attach programs and an admin.
 
     `status` starts at ACTIVE per the checklist (4.2.1).
     `initial_program_codes` is best-effort: unknown codes surface as
     422 from the schema layer before we reach here.
+
+    When `payload.admin` is set, an `AGENCY_ADMIN` user is bound to the
+    new agency in the **same session / transaction**. If any step
+    raises, the agency row is rolled back too — no orphan agencies.
+
+    Returns `(agency, admin_bind_result)` where `admin_bind_result` is
+    `None` when the caller didn't supply an admin block.
     """
     package = _subscription_package(payload.subscription_plan)
     now = datetime.now(UTC)
@@ -258,7 +510,38 @@ async def create_agency(
                 )
             )
         await session.flush()
-    return agency
+
+    admin_bind_result: AgencyAdminBindResult | None = None
+    if payload.admin is not None:
+        admin_bind_result = await _bind_agency_admin(
+            session,
+            agency_id=agency.id,
+            payload=payload.admin,
+        )
+
+    return agency, admin_bind_result
+
+
+async def add_agency_admin(
+    session: AsyncSession,
+    *,
+    agency_id: uuid.UUID,
+    payload: AgencyAdminInviteRequest,
+) -> AgencyAdminBindResult:
+    """Attach an `AGENCY_ADMIN` to an existing agency (orphan-remediation).
+
+    Same three branches as `_bind_agency_admin` (existing user, ACTIVE
+    new user, INVITED new user). Used by `POST /agencies/{id}/admins`
+    so SUPER_ADMIN can fix orphan agencies or add additional admins.
+    """
+    agency = await _get_agency_or_404(
+        session, agency_id=agency_id, include_deleted=False
+    )
+    return await _bind_agency_admin(
+        session,
+        agency_id=agency.id,
+        payload=payload,
+    )
 
 
 async def update_agency(

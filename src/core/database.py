@@ -32,14 +32,31 @@ logger = get_logger(__name__)
 # --------------------------------------------------------------------------
 def _build_engine() -> AsyncEngine:
     """Create the async engine from the pool URL (app runtime)."""
+    # The Supabase pgbouncer pooler runs in transaction mode and can't
+    # host a per-connection prepared-statement cache (each request gets
+    # a different physical connection). Two knobs matter:
+    #   * `statement_cache_size=0`        — asyncpg's own cache, passed
+    #                                       via `connect_args`
+    #   * `prepared_statement_cache_size=0` — SQLAlchemy's asyncpg
+    #                                       dialect wrapper, passed via URL
+    # Both are required; either alone leaves one cache layer active and
+    # pgbouncer returns `prepared statement ... already exists`. The
+    # SELECT 1 issued by `pool_pre_ping` also trips this cache, so we
+    # turn pre-ping off — connection liveness is cheap enough to skip
+    # for now (revisit if we see "connection reset" errors).
+    url = settings.effective_database_url
+    if "prepared_statement_cache_size" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}prepared_statement_cache_size=0"
     return create_async_engine(
-        settings.effective_database_url,
+        url,
         echo=settings.DATABASE_ECHO,
         pool_size=settings.DATABASE_POOL_SIZE,
         max_overflow=settings.DATABASE_MAX_OVERFLOW,
         pool_timeout=settings.DATABASE_POOL_TIMEOUT_SECONDS,
-        pool_pre_ping=True,  # validate connections before use
+        pool_pre_ping=False,
         future=True,
+        connect_args={"statement_cache_size": 0},
     )
 
 

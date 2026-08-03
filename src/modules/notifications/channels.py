@@ -109,6 +109,20 @@ class EmailProvider(NotificationProvider):
         metadata: dict[str, Any] | None = None,
     ) -> DeliveryResult:
         if not settings.SMTP_ENABLED:
+            # Dev escape hatch — when SMTP is disabled (the default in
+            # local dev / unit tests), log the full rendered email so the
+            # caller can complete the flow without a real SMTP server.
+            # Gated on APP_ENV != "production" so production never logs
+            # PII/PHI even if SMTP_ENABLED is accidentally left off.
+            if settings.APP_ENV != "production":
+                log.info(
+                    "notifications.email_dev_log",
+                    to=to,
+                    from_addr=f"{settings.SMTP_FROM_NAME} <{settings.SMTP_FROM_EMAIL}>",
+                    subject=subject,
+                    body=body,
+                    _dev_only=True,
+                )
             return DeliveryResult(
                 success=False,
                 error="SMTP disabled (set SMTP_ENABLED=true to deliver email)",

@@ -182,23 +182,32 @@ class CurrentUser(BaseModel):
 # Refresh
 # --------------------------------------------------------------------------
 class RefreshRequest(BaseModel):
-    """POST /auth/refresh body."""
+    """POST /auth/refresh body.
+
+    The refresh token is optional in the body because cookie-auth
+    clients have it set as `qc_refresh`. If omitted we read it from
+    the request cookie; if neither is present we raise 401.
+    """
 
     model_config = ConfigDict(
         extra="forbid",
         json_schema_extra={
             "examples": [
-                {"refresh_token": "rt_5f3a7b1c1d0a4a239c8e1b2c3d4e5f6a"}
+                {"refresh_token": "rt_5f3a7b1c1d0a4a239c8e1b2c3d4e5f6a"},
+                {"refresh_token": None},
+                {},
             ]
         },
     )
 
-    refresh_token: str = Field(
+    refresh_token: str | None = Field(
+        default=None,
         min_length=10,
         description=(
             "Refresh token issued by `POST /auth/login` (or by a previous "
-            "refresh). Rotated on every successful refresh — store the new "
-            "value and discard the old one."
+            "refresh). Optional when the client uses cookie auth — the "
+            "server will read `qc_refresh` instead. Rotated on every "
+            "successful refresh — store the new value and discard the old one."
         ),
     )
 

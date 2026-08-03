@@ -19,12 +19,14 @@ import uuid
 from builtins import type as _type
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import settings
 from src.core.logging import get_logger
 from src.modules.agencies import service as agencies_service
 from src.modules.agencies.schemas import (
+    AgencyAdminInviteRequest,
     AgencyCreateRequest,
     AgencyListResponse,
     AgencyProgramListResponse,
@@ -35,12 +37,13 @@ from src.modules.agencies.schemas import (
     AgencyUpdateRequest,
 )
 from src.modules.audit_logs import service as audit_logs_service
+from src.modules.auth import email_service as auth_email
 from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
     require_role,
 )
-from src.shared.domain.enums import AuditAction, UserRole
+from src.shared.domain.enums import AuditAction, UserRole, UserStatus
 from src.shared.schemas.docs import standard_responses
 from src.shared.schemas.pagination import build_offset_response
 
@@ -112,19 +115,27 @@ async def list_agencies_endpoint(
 async def create_agency_endpoint(
     payload: AgencyCreateRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> AgencyResponse:
-    """Create a new agency (and optionally attach programs)."""
-    agency = await agencies_service.create_agency(session, payload=payload)
-    await session.flush()
+    """Create a new agency (and optionally attach programs and an admin).
+
+    When `payload.admin` is set, the agency is created **together** with
+    an `AGENCY_ADMIN` user bound to it in a single transaction. If the
+    admin branch raises (e.g. duplicate email), the agency row is
+    rolled back too — no orphan agencies are possible.
+    """
+    agency, admin_bind_result = await agencies_service.create_agency(
+        session, payload=payload
+    )
 
     # Best-effort audit hook — never breaks the write.
     ip, ua = audit_logs_service.request_ip_ua(request)
     try:
         await audit_logs_service.audit_log(
             session,
-            agency_id=None,  # agency-level audit, no agency context yet
+            agency_id=agency.id,  # now the agency row exists
             actor_user_id=ctx.user_id,
             action=AuditAction.CREATE,
             entity_type="AGENCY",
@@ -137,18 +148,120 @@ async def create_agency_endpoint(
                 "subscription_price_cents": agency.subscription_price_cents,
                 "subscription_billing_cycle": agency.subscription_billing_cycle,
                 "initial_program_codes": payload.initial_program_codes,
+                "admin_bound": admin_bind_result is not None,
             },
             ip_address=ip,
             user_agent=ua,
         )
+        if admin_bind_result is not None:
+            await audit_logs_service.audit_log(
+                session,
+                agency_id=agency.id,
+                actor_user_id=ctx.user_id,
+                action=AuditAction.CREATE,
+                entity_type="AGENCY_ADMIN",
+                entity_id=admin_bind_result.user_id,
+                new_data={
+                    "email": admin_bind_result.email,
+                    "status": admin_bind_result.status.value,
+                },
+                ip_address=ip,
+                user_agent=ua,
+            )
     except Exception as exc:
         log.warning(
             "agencies.create_audit_failed",
             error=_type(exc).__name__,
         )
 
+    # Schedule the invitation email AFTER commit (deferred network
+    # call, same pattern as staff/router.py:228-235).
+    if admin_bind_result is not None and admin_bind_result.invitation_token is not None:
+        auth_email.send_invitation_email(
+            background_tasks,
+            to_email=admin_bind_result.email,
+            to_name=admin_bind_result.full_name,
+            invitation_token=admin_bind_result.invitation_token,
+            expires_in_days=settings.INVITATION_TOKEN_EXPIRY_DAYS,
+            recipient_user_id=admin_bind_result.user_id,
+        )
+
     await session.commit()
     return AgencyResponse.model_validate(agency)
+
+
+@router.post(
+    "/{agency_id}/admins",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=_SUPER_ADMIN_ONLY,
+    responses=standard_responses(include=[401, 403, 404, 409, 422]),
+    summary="Bind an AGENCY_ADMIN to an existing agency",
+    description=(
+        "Use this endpoint to attach an AGENCY_ADMIN to an existing "
+        "agency (orphan-remediation, adding a second admin, or "
+        "promoting an existing user). Same atomic transaction as "
+        "`POST /agencies` — if the admin branch raises, the agency "
+        "is unaffected."
+    ),
+)
+async def add_agency_admin_endpoint(
+    agency_id: uuid.UUID,
+    payload: AgencyAdminInviteRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> Response:
+    """Attach an AGENCY_ADMIN to an existing agency."""
+    bind_result = await agencies_service.add_agency_admin(
+        session,
+        agency_id=agency_id,
+        payload=payload,
+    )
+
+    ip, ua = audit_logs_service.request_ip_ua(request)
+    try:
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.CREATE,
+            entity_type="AGENCY_ADMIN",
+            entity_id=bind_result.user_id,
+            new_data={
+                "email": bind_result.email,
+                "status": bind_result.status.value,
+                "source": "add_agency_admin_endpoint",
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+    except Exception as exc:
+        log.warning(
+            "agencies.add_admin_audit_failed",
+            error=_type(exc).__name__,
+        )
+
+    if bind_result.invitation_token is not None:
+        auth_email.send_invitation_email(
+            background_tasks,
+            to_email=bind_result.email,
+            to_name=bind_result.full_name,
+            invitation_token=bind_result.invitation_token,
+            expires_in_days=settings.INVITATION_TOKEN_EXPIRY_DAYS,
+            recipient_user_id=bind_result.user_id,
+        )
+
+    await session.commit()
+    return Response(
+        status_code=status.HTTP_201_CREATED,
+        content=(
+            f'{{"user_id":"{bind_result.user_id}",'
+            f'"email":"{bind_result.email}",'
+            f'"status":"{bind_result.status.value}"}}'
+        ),
+        media_type="application/json",
+    )
 
 
 # --------------------------------------------------------------------------

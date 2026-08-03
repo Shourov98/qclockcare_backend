@@ -38,6 +38,7 @@ from src.core.exceptions import CrossAgencyAccessDeniedError, ForbiddenError
 from src.core.logging import get_logger
 from src.modules.audit_logs import service as audit_logs_service
 from src.modules.auth import email_service as auth_email
+from src.modules.identity.cookies import csrf_protect
 from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
@@ -137,7 +138,10 @@ def _to_patient_response(
     "/patients",
     response_model=PatientProfileResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 409, 422]),
     summary="Admit a new patient at the caller's agency",
     description=(
@@ -277,7 +281,10 @@ async def get_patient_with_relationships_endpoint(
 @router.patch(
     "/patients/{patient_id}",
     response_model=PatientProfileResponse,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 404, 422]),
     summary="Update a patient profile",
     description=(
@@ -322,7 +329,10 @@ async def update_patient_endpoint(
 @router.delete(
     "/patients/{patient_id}",
     response_model=PatientProfileResponse,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 404]),
     summary="Archive (discharge) a patient",
     description=(
@@ -398,7 +408,10 @@ async def list_patient_guardians_endpoint(
     "/patients/{patient_id}/guardians",
     response_model=PatientGuardianRelationshipResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 404, 409, 422]),
     summary="Link a guardian to a patient",
     description=(
@@ -466,7 +479,10 @@ async def add_patient_guardian_endpoint(
     "/guardians",
     response_model=GuardianProfileResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 409, 422]),
     summary="Add a standalone guardian profile",
     description=(
@@ -572,7 +588,10 @@ async def get_guardian_endpoint(
 @router.patch(
     "/guardians/{guardian_id}",
     response_model=GuardianProfileResponse,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 404, 422]),
     summary="Update a guardian profile",
     description=(
@@ -617,7 +636,10 @@ async def update_guardian_endpoint(
 @router.delete(
     "/guardians/{guardian_id}",
     response_model=GuardianProfileResponse,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 404]),
     summary="Archive a guardian profile",
     description=(
@@ -664,7 +686,10 @@ async def archive_guardian_endpoint(
 @router.patch(
     "/patient-guardian-relationships/{relationship_id}",
     response_model=PatientGuardianRelationshipResponse,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 404, 422]),
     summary="Edit a patient<->guardian relationship",
     description=(
@@ -713,7 +738,10 @@ async def update_patient_guardian_endpoint(
 @router.delete(
     "/patient-guardian-relationships/{relationship_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 404]),
     summary="Remove a patient<->guardian relationship",
     description=(

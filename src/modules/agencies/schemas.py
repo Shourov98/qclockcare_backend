@@ -22,10 +22,65 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from src.shared.domain.enums import AgencyStatus, AgencySubscriptionPlan, ProgramType
 from src.shared.schemas.pagination import PaginatedResponse
+
+
+# --------------------------------------------------------------------------
+# Admin invite (atomic agency creation)
+# --------------------------------------------------------------------------
+class AgencyAdminInviteRequest(BaseModel):
+    """Optional admin payload to bind an `AGENCY_ADMIN` to a new or
+    existing agency in the same transaction.
+
+    Three branches:
+      * `existing_user_id` set   — promote an existing user; no
+        password reset, no email.
+      * `password` provided     — create the user ACTIVE and login-ready.
+      * Neither                 — create the user INVITED; an
+        invitation email is scheduled and a plaintext token is returned
+        so the SPA can deep-link the recipient into
+        `/accept-invitation?token=…`.
+
+    Email is CITEXT-unique across the `users` table; colliding on an
+    existing email surfaces as `409 DUPLICATE_RESOURCE` and the whole
+    agency creation rolls back.
+    """
+
+    email: EmailStr | None = Field(default=None)
+    full_name: str | None = Field(default=None, min_length=1, max_length=255)
+    phone: str | None = None
+    password: str | None = Field(
+        default=None,
+        min_length=12,
+        max_length=128,
+        description=(
+            "Plaintext password for the new admin. Must match the "
+            "QlockCare password policy (uppercase, lowercase, digit, "
+            "symbol, 12-128 chars) if provided. When omitted, the "
+            "admin is created in INVITED status."
+        ),
+    )
+    existing_user_id: UUID | None = Field(
+        default=None,
+        description=(
+            "If set, do not create a new user — just grant the existing "
+            "user the AGENCY_ADMIN role at this agency. Incompatible "
+            "with `email` / `password` (they're for the new-user branch)."
+        ),
+    )
+
+    @field_validator("full_name")
+    @classmethod
+    def _strip_full_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("must not be empty or whitespace-only")
+        return stripped
 
 
 # --------------------------------------------------------------------------
@@ -35,6 +90,12 @@ class AgencyCreateRequest(BaseModel):
     """Body for POST /agencies.
 
     `name` is required; everything else defaults to the seed values.
+
+    `admin` is optional. When supplied, the agency is created together
+    with an `AGENCY_ADMIN` user bound to it in a single transaction —
+    no orphan-agency state is possible. When omitted, the agency is
+    created without an admin (legacy behaviour; use
+    `POST /agencies/{id}/admins` to attach one later).
     """
 
     name: str = Field(min_length=1, max_length=255)
@@ -51,6 +112,14 @@ class AgencyCreateRequest(BaseModel):
         description=(
             "Optional list of ProgramType values to enable at creation "
             "(e.g. ['PCA', 'ARMHS']). Unknown codes return 422."
+        ),
+    )
+    admin: AgencyAdminInviteRequest | None = Field(
+        default=None,
+        description=(
+            "Optional AGENCY_ADMIN to bind to this agency in the same "
+            "transaction. See `AgencyAdminInviteRequest` for the three "
+            "branches (new user / invited / existing user)."
         ),
     )
 

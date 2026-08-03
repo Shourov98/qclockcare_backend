@@ -121,6 +121,23 @@ class Settings(BaseSettings):
     # MUST stay False in production.
     LOG_INCLUDE_DEV_OTPS: bool = False
 
+    # ----- Cookies (ADR — HttpOnly auth) -----
+    # When True, the `qc_access` / `qc_refresh` cookies are sent with
+    # `Secure` (HTTPS-only). MUST stay False in local dev (browsers
+    # silently drop Secure cookies on `http://localhost`). Flip on in
+    # any environment that's served over TLS.
+    COOKIE_SECURE: bool = False
+    # SameSite policy for `qc_access` and `qc_csrf`. `lax` is the
+    # project default — it allows top-level GET navigations from
+    # third-party sites (good UX) while still blocking cross-origin
+    # POST/PUT/PATCH/DELETE. Use `strict` if you want full defense
+    # against OAuth-style confused-deputy flows.
+    COOKIE_SAMESITE: Literal["lax", "strict", "none"] = "lax"
+    # Optional cookie domain (e.g. `.qlockcare.com`) so cookies are
+    # shared across subdomains. `None` lets the browser default to the
+    # exact origin (recommended for single-host deployments).
+    COOKIE_DOMAIN: str | None = None
+
     # ----- SMS (Twilio) — Phase 2 -----
     SMS_ENABLED: bool = False
     TWILIO_ACCOUNT_SID: str | None = None
@@ -243,6 +260,16 @@ class Settings(BaseSettings):
         # (Pydantic v2 makes cross-field checks awkward in a single validator).
         return value
 
+    @field_validator("COOKIE_DOMAIN", mode="before")
+    @classmethod
+    def _empty_domain_to_none(cls, value: object) -> object:
+        """Coerce an empty `COOKIE_DOMAIN=` env value to `None` so the
+        cookie layer doesn't emit a `Domain=` attribute (which browsers
+        interpret as the empty string and refuse to scope the cookie)."""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     # ------------------------------------------------------------------
     # Derived properties
     # ------------------------------------------------------------------
@@ -278,6 +305,15 @@ class Settings(BaseSettings):
         # scheme (asyncpg → psycopg) for sync migrations.
         if url.startswith("postgresql://"):
             url = "postgresql+asyncpg://" + url[len("postgresql://") :]
+        # asyncpg refuses the psycopg-only `pgbouncer=true` knob — drop it
+        # from the async runtime URL. Supabase's transaction-mode pooler
+        # works fine over asyncpg without that flag.
+        if "pgbouncer=true" in url:
+            from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+            parts = urlsplit(url)
+            q = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "pgbouncer"]
+            url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(q), parts.fragment))
         return url
 
     @property

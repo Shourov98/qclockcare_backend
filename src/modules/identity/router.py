@@ -15,6 +15,14 @@ All routes use the public `get_session` dependency (no auth required).
 `/auth/me` uses `get_session_with_auth` so it both authenticates and
 sets RLS GUCs in one go.
 
+Authentication is dual-mode:
+  * Bearer (`Authorization: Bearer <jwt>`) for non-browser clients
+  * HttpOnly cookies (`qc_access`, `qc_refresh`) + CSRF token
+    (`X-CSRF-Token` header vs. `qc_csrf` cookie) for browser SPAs
+
+Bearer and cookie credentials are interchangeable for read endpoints;
+cookie-authenticated write requests must echo the CSRF token.
+
 Every route attaches `summary=` (short), `description=` (long-form
 markdown), and `responses=` (pre-wired 401/403/422 examples via
 `standard_responses(...)`) so `/docs` shows the operation in the
@@ -23,13 +31,20 @@ sidebar with realistic payloads.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Request, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
 from src.core.database import get_session
+from src.core.exceptions import UnauthorizedError
 from src.modules.auth import email_service as auth_email
 from src.modules.identity import auth_service
+from src.modules.identity.cookies import (
+    QC_REFRESH_COOKIE,
+    clear_auth_cookies,
+    csrf_protect,
+    set_auth_cookies,
+)
 from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
@@ -75,12 +90,14 @@ def _user_agent(request: Request) -> str | None:
         "access/refresh token pair. The access token is short-lived "
         "(default 15 minutes); the refresh token is long-lived "
         "(default 30 days). 5 consecutive failures lock the account "
-        "for `settings.ACCOUNT_LOCKOUT_MINUTES` minutes."
+        "for `settings.ACCOUNT_LOCKOUT_MINUTES` minutes. Sets the "
+        "`qc_access` / `qc_refresh` / `qc_csrf` cookies."
     ),
 )
 async def login_endpoint(
     payload: LoginRequest,
     request: Request,
+    response: Response,
     session: AsyncSession = Depends(get_session),
 ) -> TokenPair:
     issued = await auth_service.login(
@@ -89,6 +106,12 @@ async def login_endpoint(
         password=payload.password,
         ip_address=_client_ip(request),
         user_agent=_user_agent(request),
+    )
+    set_auth_cookies(
+        response,
+        access_token=issued.access_token,
+        refresh_token=issued.refresh_token,
+        expires_in=issued.expires_in,
     )
     return TokenPair(
         access_token=issued.access_token,
@@ -109,19 +132,36 @@ async def login_endpoint(
     description=(
         "Exchanges a valid refresh token for a new access/refresh pair. "
         "The refresh token is **rotated** — store the new value and "
-        "discard the old one. Old refresh tokens cannot be reused."
+        "discard the old one. Old refresh tokens cannot be reused. "
+        "Accepts the refresh token in the request body OR via the "
+        "`qc_refresh` HttpOnly cookie."
     ),
 )
 async def refresh_endpoint(
     payload: RefreshRequest,
     request: Request,
+    response: Response,
     session: AsyncSession = Depends(get_session),
 ) -> TokenPair:
+    # Body wins, fall back to cookie. If neither is present the
+    # client is unauthenticated — surface a typed 401.
+    refresh_token = payload.refresh_token or request.cookies.get(QC_REFRESH_COOKIE)
+    if not refresh_token:
+        raise UnauthorizedError(
+            message="Refresh token required (body or cookie).",
+            details={"reason": "missing_refresh_token"},
+        )
     issued = await auth_service.refresh(
         session,
-        refresh_token=payload.refresh_token,
+        refresh_token=refresh_token,
         ip_address=_client_ip(request),
         user_agent=_user_agent(request),
+    )
+    set_auth_cookies(
+        response,
+        access_token=issued.access_token,
+        refresh_token=issued.refresh_token,
+        expires_in=issued.expires_in,
     )
     return TokenPair(
         access_token=issued.access_token,
@@ -137,29 +177,45 @@ async def refresh_endpoint(
 @router.post(
     "/logout",
     status_code=status.HTTP_204_NO_CONTENT,
-    responses=standard_responses(include=[401, 422]),
+    responses=standard_responses(include=[401, 403, 422]),
+    # csrf_protect is added as a `dependencies=` entry rather than a
+    # signature param so it runs but we don't need its return value.
+    # Bearer clients bypass via the check inside `csrf_protect`.
+    dependencies=[Depends(csrf_protect)],
     summary="Log out (revoke refresh token)",
     description=(
         "Revokes the supplied refresh token (or all active refresh "
         "tokens if `refresh_token` is omitted — useful for "
         "\"log out everywhere\"). The access token in the "
         "`Authorization` header is unaffected and remains valid until "
-        "its own expiry."
+        "its own expiry. Clears the `qc_access` / `qc_refresh` / "
+        "`qc_csrf` cookies regardless of the outcome."
     ),
 )
 async def logout_endpoint(
-    payload: LogoutRequest,
     request: Request,
+    response: Response,
     ctx: CurrentAuth,
     session: AsyncSession = Depends(get_session),
+    payload: LogoutRequest | None = Body(default=None),
 ) -> None:
+    # Resolve refresh token: body wins, fall back to cookie. Authenticated
+    # via the bearer/cookie credential in `ctx`, so no 401 here — missing
+    # refresh token just means "logout-everywhere" semantics. The body is
+    # optional so cookie-authenticated SPAs (which carry the refresh token
+    # via the `qc_refresh` cookie) can POST without a JSON payload.
+    refresh_token = (
+        (payload.refresh_token if payload else None)
+        or request.cookies.get(QC_REFRESH_COOKIE)
+    )
     await auth_service.logout(
         session,
         user_id=ctx.user_id,
-        refresh_token=payload.refresh_token,
+        refresh_token=refresh_token,
         ip_address=_client_ip(request),
         user_agent=_user_agent(request),
     )
+    clear_auth_cookies(response)
 
 
 # --------------------------------------------------------------------------
@@ -225,12 +281,14 @@ async def accept_invitation_endpoint(
         "Step 2 of onboarding. Submits the 6-digit code from the "
         "welcome email. On success returns a fresh access/refresh "
         "token pair and marks the user's email as verified. "
-        "Account is locked after 5 failed attempts."
+        "Account is locked after 5 failed attempts. Sets the "
+        "`qc_access` / `qc_refresh` / `qc_csrf` cookies."
     ),
 )
 async def verify_email_endpoint(
     payload: VerifyEmailRequest,
     request: Request,
+    response: Response,
     session: AsyncSession = Depends(get_session),
 ) -> VerifyEmailResponse:
     issued = await auth_service.verify_email(
@@ -239,6 +297,12 @@ async def verify_email_endpoint(
         otp=payload.otp,
         ip_address=_client_ip(request),
         user_agent=_user_agent(request),
+    )
+    set_auth_cookies(
+        response,
+        access_token=issued.access_token,
+        refresh_token=issued.refresh_token,
+        expires_in=issued.expires_in,
     )
     return VerifyEmailResponse(
         access_token=issued.access_token,
@@ -376,8 +440,9 @@ async def reset_password_endpoint(
     responses=standard_responses(include=[401, 403]),
     summary="Get the currently authenticated user",
     description=(
-        "Returns the `CurrentUser` derived from the bearer token. "
-        "Use this on app load to bootstrap the SPA's user state."
+        "Returns the `CurrentUser` derived from the bearer token "
+        "OR the `qc_access` HttpOnly cookie. Use this on app load "
+        "to bootstrap the SPA's user state."
     ),
 )
 async def me_endpoint(

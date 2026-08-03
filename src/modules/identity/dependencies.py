@@ -59,15 +59,35 @@ async def get_session_with_auth(
 ) -> AsyncIterator[AsyncSession]:
     """Same as `get_session`, but additionally sets RLS GUCs from the bearer.
 
-    If `credentials` is present, we verify the token, look up the user,
-    and call `set_session_context`. The session is committed on success
-    and rolled back on exception (inherited from `get_session`).
+    The bearer token (Authorization header) is the preferred credential
+    because it works for non-browser clients (curl, mobile, server-to-
+    server). When the bearer is absent we fall back to the `qc_access`
+    HttpOnly cookie for browser SPA clients. Bearer always wins if both
+    are present.
+
+    When a credential is present, we verify the token, look up the
+    user, and call `set_session_context`. The session is committed on
+    success and rolled back on exception (inherited from `get_session`).
     """
     from sqlalchemy.orm import selectinload
 
+    # Resolve the access token: bearer header first, then HttpOnly cookie.
+    # `HTTPAuthorizationCredentials` only carries the raw token string,
+    # so we treat the two sources identically once we've picked one.
+    raw_token: str | None = None
+    if credentials is not None:
+        raw_token = credentials.credentials
+    else:
+        # Lazy import to avoid a circular-dep at module load time —
+        # `cookies.py` imports from `core.config` and we don't want to
+        # force an import order on first import of identity.dependencies.
+        from src.modules.identity.cookies import QC_ACCESS_COOKIE
+
+        raw_token = request.cookies.get(QC_ACCESS_COOKIE)
+
     async for session in get_session():
-        if credentials is not None:
-            payload = jwt_service.verify_access_token(credentials.credentials)
+        if raw_token is not None:
+            payload = jwt_service.verify_access_token(raw_token)
             user = (
                 await session.execute(
                     select(User)
@@ -113,7 +133,7 @@ async def get_session_with_auth(
                 user=_to_current_user(user),
                 role=role,
                 agency_id=agency_id,
-                raw_token=credentials.credentials,
+                raw_token=raw_token,
             )
         yield session
 
