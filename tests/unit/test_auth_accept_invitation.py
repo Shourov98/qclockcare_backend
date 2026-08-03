@@ -1,92 +1,74 @@
 """Unit tests for `auth_service.accept_invitation`.
 
-These tests cover the regression introduced when the JWT verification
-call was duplicated at `auth_service.py:492-493`. Calling
-`jwt_service.verify_single_use_token` twice per request:
+These tests cover the email-in-URL + OTP-in-body flow. The old JWT-in-URL
+design was retired because:
 
-1. Doubles the cryptographic cost of `/auth/accept-invitation`.
-2. Risks subtle bugs if either call's behaviour differs (e.g.
-   timing attacks, telemetry hook drift).
-3. Is just wasteful — the result is the same both times.
+1. URL params get stripped/mangled by some email gateways, which surfaced
+   as `TOKEN_INVALID` on the backend.
+2. The OTP service already gates single-use, expiry, attempt-limits —
+   there was no benefit to a second cryptographic layer.
 
-These tests assert `verify_single_use_token` is called **exactly
-once** per `accept_invitation` invocation.
+`accept_invitation` now takes `(email, otp, new_password)`, verifies
+the OTP via `otp_service.verify_otp` (which already transitions
+`INVITED → ACTIVE`), sets the password, and mints the first token
+pair via `_issue_pair`.
+
+These tests assert:
+
+- `verify_otp` is called with `(email, otp)` once per invocation.
+- The password hash is set on the user.
+- `email_verified_at` is set.
+- `_issue_pair` is called once.
+- Audit events are emitted (`INVITATION_ACCEPTED`, `PASSWORD_SET`,
+  `EMAIL_VERIFIED`).
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.modules.appointments import models as _appt_models  # noqa: F401
-from src.modules.locations import models as _locations_models  # noqa: F401
-
 # Import the full mapper graph so any ORM instantiations inside the
 # service don't fail at mapper-resolution time.
 from src.modules.patients import models as _patient_models  # noqa: F401
 from src.modules.staff import models as _staff_models  # noqa: F401
-from src.modules.visits import models as _visits_models  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------
-class _FakeScalarResult:
-    def __init__(self, value: Any) -> None:
-        self._value = value
+class _FakeVerifyResult:
+    def __init__(self, user_id: uuid.UUID, email: str) -> None:
+        self.user_id = user_id
+        self.email = email
 
-    def scalar_one_or_none(self) -> Any:
-        return self._value
+
+class _FakeIssuedTokens:
+    def __init__(self, user_id: uuid.UUID) -> None:
+        self.access_token = "access-abc"
+        self.refresh_token = "refresh-xyz"
+        self.expires_in = 900
+        self.user = SimpleNamespace(
+            id=user_id,
+            email="alex@example.com",
+            full_name="Alex",
+        )
 
 
 class _FakeSession:
-    """AsyncSession stand-in — returns canned scalar results in order,
-    tracks add/flush, no real DB I/O."""
+    """AsyncSession stand-in — tracks flush, no real DB I/O."""
 
-    def __init__(self, *, scalars: list[Any]) -> None:
-        self._scalars = list(scalars)
-        self._idx = 0
-        self.added: list[Any] = []
-        self.execute = AsyncMock(side_effect=self._execute)
+    def __init__(self) -> None:
         self.flush = AsyncMock()
-        self.add = MagicMock(side_effect=self._add)
+        self.add = MagicMock()
 
-    async def _execute(self, stmt: Any) -> _FakeScalarResult:
-        if self._idx >= len(self._scalars):
-            raise AssertionError(
-                f"_FakeSession.execute called too many times "
-                f"({self._idx + 1} > {len(self._scalars)})"
-            )
-        value = self._scalars[self._idx]
-        self._idx += 1
-        return _FakeScalarResult(value)
-
-    def _add(self, obj: Any) -> None:
-        self.added.append(obj)
-
-
-def _single_use_row(
-    jti: str,
-    user_id: uuid.UUID,
-    *,
-    consumed_at: datetime | None = None,
-    revoked_at: datetime | None = None,
-    expires_in_seconds: int = 86_400,
-) -> SimpleNamespace:
-    """A SimpleNamespace quacking like `SingleUseToken`."""
-    return SimpleNamespace(
-        jti=jti,
-        user_id=user_id,
-        purpose="invitation",
-        consumed_at=consumed_at,
-        revoked_at=revoked_at,
-        expires_at=datetime.now(tz=UTC) + timedelta(seconds=expires_in_seconds),
-    )
+    async def _execute(self, stmt: Any) -> Any:
+        return MagicMock(scalar_one_or_none=lambda: None)
 
 
 def _invited_user(user_id: uuid.UUID, email: str = "alex@example.com") -> SimpleNamespace:
@@ -98,166 +80,226 @@ def _invited_user(user_id: uuid.UUID, email: str = "alex@example.com") -> Simple
         full_name="Alex",
         status=UserStatus.INVITED,
         password_hash=None,
+        must_change_password=True,
+        email_verified_at=None,
         roles=[],
     )
 
 
-def _otp_issued(user_id: uuid.UUID) -> Any:
-    from src.modules.identity.otp_service import OtpIssueResult
-
-    return OtpIssueResult(
-        user_id=user_id,
-        email="alex@example.com",
-        full_name="Alex",
-        otp="123456",
-        expires_at=datetime.now(tz=UTC) + timedelta(minutes=10),
-    )
-
-
-def _jwt_payload(jti: str, user_id: uuid.UUID) -> Any:
-    from src.modules.identity.jwt_service import SingleUseTokenPayload
-
-    return SingleUseTokenPayload(
-        user_id=user_id,
-        purpose="invitation",
-        jti=jti,
-        claims={"typ": "single_use", "purpose": "invitation", "jti": jti},
-    )
-
-
 # ---------------------------------------------------------------------------
-# Regression: verify_single_use_token called exactly once
-# ---------------------------------------------------------------------------
-@pytest.mark.asyncio
-class TestAcceptInvitationVerifyCallCount:
-    async def test_jwt_verify_called_exactly_once(self) -> None:
-        """`accept_invitation` must call `jwt_service.verify_single_use_token`
-        exactly once — not twice. The duplicate call was a regression;
-        this test guards against it coming back.
-        """
-        from src.modules.identity import auth_service
-
-        jti = "jti-1"
-        user_id = uuid.uuid4()
-        sut_row = _single_use_row(jti, user_id)
-        user = _invited_user(user_id)
-
-        # Order of executes inside accept_invitation:
-        #   1. select(SingleUseToken by jti) → row
-        #   2. select(User + roles)          → user (via _load_user_with_roles)
-        session = _FakeSession(scalars=[sut_row, user])
-
-        with (
-            patch.object(auth_service, "jwt_service") as mock_jwt,
-            patch.object(auth_service, "otp_service") as mock_otp,
-            patch.object(auth_service, "hash_password", return_value="hashed"),
-            patch.object(auth_service, "_record_audit", AsyncMock()),
-            patch.object(
-                auth_service, "_load_user_with_roles", AsyncMock(return_value=user)
-            ),
-        ):
-            mock_jwt.verify_single_use_token.return_value = _jwt_payload(jti, user_id)
-            mock_otp.issue_otp = AsyncMock(return_value=_otp_issued(user_id))
-
-            user_result, otp_result = await auth_service.accept_invitation(
-                session,
-                invitation_token="the-token",
-                new_password="new-password",
-            )
-
-        # The JWT verify was called exactly once.
-        mock_jwt.verify_single_use_token.assert_called_once_with(
-            "the-token", expected_purpose="invitation"
-        )
-        # And the call returned what we wanted.
-        assert user_result is user
-        assert otp_result == "123456"
-
-    async def test_jwt_verify_called_once_even_when_audit_calls_fail(self) -> None:
-        """The duplicate-verify bug wasn't conditional on audit; it
-        always happened. Verify the call count is still 1 even when
-        we patch away the audit side-effects."""
-        from src.modules.identity import auth_service
-
-        jti = "jti-2"
-        user_id = uuid.uuid4()
-        sut_row = _single_use_row(jti, user_id)
-        user = _invited_user(user_id)
-
-        session = _FakeSession(scalars=[sut_row, user])
-
-        with (
-            patch.object(auth_service, "jwt_service") as mock_jwt,
-            patch.object(auth_service, "otp_service") as mock_otp,
-            patch.object(auth_service, "hash_password", return_value="hashed"),
-            patch.object(auth_service, "_record_audit", AsyncMock()),
-            patch.object(
-                auth_service, "_load_user_with_roles", AsyncMock(return_value=user)
-            ),
-        ):
-            mock_jwt.verify_single_use_token.return_value = _jwt_payload(jti, user_id)
-            mock_otp.issue_otp = AsyncMock(return_value=_otp_issued(user_id))
-
-            await auth_service.accept_invitation(
-                session,
-                invitation_token="another-token",
-                new_password="hunter2",
-            )
-
-        # Still exactly one — no regressions.
-        assert mock_jwt.verify_single_use_token.call_count == 1
-
-
-# ---------------------------------------------------------------------------
-# Sanity: behaviour of accept_invitation when the verify succeeds
+# Happy path
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 class TestAcceptInvitationHappyPath:
-    async def test_user_password_set_and_status_transitioned(self) -> None:
-        """When the token verifies and the row exists, we set the
-        password hash, transition the user to EMAIL_VERIFICATION_PENDING,
-        and mark the row consumed. The OTP is issued."""
+    async def test_otp_verified_password_set_tokens_issued(self) -> None:
+        """On a fresh OTP, the password is hashed and set,
+        `email_verified_at` is stamped, and `_issue_pair` returns a
+        full `IssuedTokens` (access + refresh + user)."""
         from src.modules.identity import auth_service
 
-        jti = "jti-3"
         user_id = uuid.uuid4()
-        sut_row = _single_use_row(jti, user_id)
         user = _invited_user(user_id)
+        session = _FakeSession()
 
-        session = _FakeSession(scalars=[sut_row, user])
+        fake_tokens = _FakeIssuedTokens(user_id)
 
         with (
-            patch.object(auth_service, "jwt_service") as mock_jwt,
             patch.object(auth_service, "otp_service") as mock_otp,
             patch.object(auth_service, "hash_password", return_value="hashed-pw"),
-            patch.object(auth_service, "_record_audit", AsyncMock()),
-            patch.object(
-                auth_service, "_load_user_with_roles", AsyncMock(return_value=user)
-            ),
+            patch.object(auth_service, "_record_audit", AsyncMock()) as mock_audit,
+            patch.object(auth_service, "_load_user_with_roles", AsyncMock(return_value=user)),
+            patch.object(auth_service, "_issue_pair", AsyncMock(return_value=fake_tokens)) as mock_pair,
         ):
-            mock_jwt.verify_single_use_token.return_value = _jwt_payload(jti, user_id)
-            mock_otp.issue_otp = AsyncMock(return_value=_otp_issued(user_id))
+            mock_otp.verify_otp = AsyncMock(
+                return_value=_FakeVerifyResult(user_id, user.email)
+            )
 
-            returned_user, otp = await auth_service.accept_invitation(
+            result = await auth_service.accept_invitation(
                 session,
-                invitation_token="tok",
-                new_password="hunter2",
+                email=user.email,
+                otp="123456",
+                new_password="hunter2hunter2",
             )
 
         # Password was set.
         assert user.password_hash == "hashed-pw"
-        # Status was transitioned.
+        assert user.must_change_password is False
+        assert user.email_verified_at is not None
+        # verify_otp was called once with our OTP.
+        mock_otp.verify_otp.assert_awaited_once_with(
+            session, email=user.email, otp="123456"
+        )
+        # Token pair returned.
+        assert result is fake_tokens
+        mock_pair.assert_awaited_once()
+        # Three audit events.
+        event_types = [c.kwargs["event_type"] for c in mock_audit.await_args_list]
+        from src.shared.domain.enums import AuthAuditEventType
+
+        assert event_types == [
+            AuthAuditEventType.INVITATION_ACCEPTED,
+            AuthAuditEventType.PASSWORD_SET,
+            AuthAuditEventType.EMAIL_VERIFIED,
+        ]
+
+    async def test_idempotent_on_re_invite(self) -> None:
+        """If the user is already ACTIVE (re-invite edge case),
+        we still set the password — the latest password always wins."""
+        from src.modules.identity import auth_service
         from src.shared.domain.enums import UserStatus
 
-        assert user.status == UserStatus.EMAIL_VERIFICATION_PENDING
-        # Row was marked consumed.
-        assert sut_row.consumed_at is not None
-        # OTP returned for the email step.
-        assert otp == "123456"
-        assert returned_user is user
+        user_id = uuid.uuid4()
+        user = _invited_user(user_id)
+        user.status = UserStatus.ACTIVE  # already accepted once
+        user.email_verified_at = datetime.now(tz=UTC)
+        session = _FakeSession()
+
+        fake_tokens = _FakeIssuedTokens(user_id)
+
+        with (
+            patch.object(auth_service, "otp_service") as mock_otp,
+            patch.object(auth_service, "hash_password", return_value="hashed-2"),
+            patch.object(auth_service, "_record_audit", AsyncMock()),
+            patch.object(auth_service, "_load_user_with_roles", AsyncMock(return_value=user)),
+            patch.object(auth_service, "_issue_pair", AsyncMock(return_value=fake_tokens)),
+        ):
+            mock_otp.verify_otp = AsyncMock(
+                return_value=_FakeVerifyResult(user_id, user.email)
+            )
+
+            result = await auth_service.accept_invitation(
+                session,
+                email=user.email,
+                otp="654321",
+                new_password="newer-password",
+            )
+
+        assert user.password_hash == "hashed-2"
+        # email_verified_at was NOT overwritten (already set).
+        assert result.access_token == "access-abc"
+
+
+# ---------------------------------------------------------------------------
+# Reject terminal user states
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+class TestAcceptInvitationRejectTerminalStates:
+    async def test_locked_user_raises_invitation_already_consumed(self) -> None:
+        """Users in LOCKED / INACTIVE / ARCHIVED shouldn't be handed
+        tokens even if they have a valid OTP."""
+        from src.modules.identity import auth_service
+        from src.core.exceptions import InvitationAlreadyConsumedError
+        from src.shared.domain.enums import UserStatus
+
+        user_id = uuid.uuid4()
+        user = _invited_user(user_id)
+        user.status = UserStatus.LOCKED
+        session = _FakeSession()
+
+        with (
+            patch.object(auth_service, "otp_service") as mock_otp,
+            patch.object(auth_service, "hash_password") as mock_hash,
+            patch.object(auth_service, "_record_audit", AsyncMock()),
+            patch.object(auth_service, "_load_user_with_roles", AsyncMock(return_value=user)),
+            patch.object(auth_service, "_issue_pair", AsyncMock()) as mock_pair,
+        ):
+            mock_otp.verify_otp = AsyncMock(
+                return_value=_FakeVerifyResult(user_id, user.email)
+            )
+
+            with pytest.raises(InvitationAlreadyConsumedError):
+                await auth_service.accept_invitation(
+                    session,
+                    email=user.email,
+                    otp="123456",
+                    new_password="hunter2hunter2",
+                )
+
+        # Password was NOT set, no token pair issued.
+        mock_hash.assert_not_called()
+        mock_pair.assert_not_called()
+
+    async def test_archived_user_raises_invitation_already_consumed(self) -> None:
+        from src.modules.identity import auth_service
+        from src.core.exceptions import InvitationAlreadyConsumedError
+        from src.shared.domain.enums import UserStatus
+
+        user_id = uuid.uuid4()
+        user = _invited_user(user_id)
+        user.status = UserStatus.ARCHIVED
+        session = _FakeSession()
+
+        with (
+            patch.object(auth_service, "otp_service") as mock_otp,
+            patch.object(auth_service, "_load_user_with_roles", AsyncMock(return_value=user)),
+            patch.object(auth_service, "_issue_pair", AsyncMock()) as mock_pair,
+        ):
+            mock_otp.verify_otp = AsyncMock(
+                return_value=_FakeVerifyResult(user_id, user.email)
+            )
+
+            with pytest.raises(InvitationAlreadyConsumedError):
+                await auth_service.accept_invitation(
+                    session,
+                    email=user.email,
+                    otp="123456",
+                    new_password="hunter2hunter2",
+                )
+
+        mock_pair.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# OTP error surface
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+class TestAcceptInvitationOtpErrors:
+    """`verify_otp` raises typed errors — we surface them verbatim so
+    the frontend can branch on `data.code`. This test guards against
+    wrapping them in a less-useful generic exception."""
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            pytest.param(
+                __import__("src.core.exceptions", fromlist=["InvalidOtpError"]).InvalidOtpError(),
+                id="invalid_otp",
+            ),
+            pytest.param(
+                __import__("src.core.exceptions", fromlist=["OtpExpiredError"]).OtpExpiredError(),
+                id="otp_expired",
+            ),
+            pytest.param(
+                __import__("src.core.exceptions", fromlist=["OtpMaxAttemptsExceededError"]).OtpMaxAttemptsExceededError(),
+                id="max_attempts",
+            ),
+        ],
+    )
+    async def test_otp_errors_propagate(self, exc: Exception) -> None:
+        from src.modules.identity import auth_service
+
+        user_id = uuid.uuid4()
+        user = _invited_user(user_id)
+        session = _FakeSession()
+
+        with (
+            patch.object(auth_service, "otp_service") as mock_otp,
+            patch.object(auth_service, "_load_user_with_roles", AsyncMock(return_value=user)),
+            patch.object(auth_service, "_record_audit", AsyncMock()),
+        ):
+            mock_otp.verify_otp = AsyncMock(side_effect=exc)
+
+            with pytest.raises(type(exc)):
+                await auth_service.accept_invitation(
+                    session,
+                    email=user.email,
+                    otp="123456",
+                    new_password="hunter2hunter2",
+                )
 
 
 __all__ = [
     "TestAcceptInvitationHappyPath",
-    "TestAcceptInvitationVerifyCallCount",
+    "TestAcceptInvitationRejectTerminalStates",
+    "TestAcceptInvitationOtpErrors",
 ]

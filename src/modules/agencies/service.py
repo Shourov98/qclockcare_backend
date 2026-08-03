@@ -25,7 +25,7 @@ from src.modules.agencies.schemas import (
     AgencyCreateRequest,
     AgencyUpdateRequest,
 )
-from src.modules.identity import auth_service
+from src.modules.identity import otp_service
 from src.modules.identity.models import User, UserRoleAssignment
 from src.shared.domain.enums import AgencyStatus, AgencySubscriptionPlan, ProgramType, UserRole, UserStatus
 
@@ -163,7 +163,7 @@ async def _resolve_program_codes(
 class AgencyAdminBindResult:
     """Outcome of binding an AGENCY_ADMIN to an agency.
 
-    `invitation_token` is `None` for the ACTIVE / existing-user paths.
+    `invitation_otp` is `None` for the ACTIVE / existing-user paths.
     `email` is the recipient address (for the email subject + log line).
     """
 
@@ -171,7 +171,7 @@ class AgencyAdminBindResult:
     email: str
     full_name: str
     status: UserStatus
-    invitation_token: str | None = None
+    invitation_otp: str | None = None
 
 
 async def _bind_agency_admin(
@@ -382,8 +382,9 @@ async def _bind_agency_admin(
     )
     await session.flush()
 
-    invitation_token, _jti = await auth_service.issue_invitation_token(
-        session, user_id=user.id
+    issued = await otp_service.issue_otp(
+        session,
+        user=user,
     )
 
     return AgencyAdminBindResult(
@@ -391,7 +392,7 @@ async def _bind_agency_admin(
         email=user.email,
         full_name=user.full_name,
         status=user.status,
-        invitation_token=invitation_token,
+        invitation_otp=issued.otp,
     )
 
 

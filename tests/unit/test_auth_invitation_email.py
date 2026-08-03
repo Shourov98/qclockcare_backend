@@ -1,13 +1,15 @@
 """Unit tests for `src/modules/auth/email_service.py` invitation helpers.
 
-These tests do NOT touch the network. They:
+The invitation email is now OTP-based — the URL carries only the
+recipient's `?email=` and the OTP lives in the body. These tests
+verify:
 
-1. Verify the `EmailMessage` shape built by `_build_invitation_email`
-   — subject, From, To, body contains the deep link + the plaintext
-   token fallback + the expiry wording.
-2. Verify `send_invitation_email` schedules a background task with
+1. The `EmailMessage` shape built by `_build_invitation_email`:
+   subject, From, To, body contains the deep link (`?email=...`),
+   the OTP plaintext, and the expiry wording in minutes.
+2. `send_invitation_email` schedules a background task with
    `kind="invitation"` and the right arguments.
-3. Verify the background runner logs the invitation token when
+3. The background runner logs the OTP when
    `LOG_INCLUDE_DEV_OTPS=true` and stays silent otherwise.
 
 Mirrors `tests/unit/test_auth_email_service.py` for the OTP / reset
@@ -32,8 +34,8 @@ class TestBuildInvitationEmail:
         *,
         to_email: str = "user@example.com",
         to_name: str | None = "Alex",
-        invitation_token: str = "invite-token-abc",
-        expires_in_days: int = 7,
+        otp: str = "123456",
+        expires_in_minutes: int = 10,
         frontend_url: str = "http://localhost:3000",
     ) -> EmailMessage:
         from src.modules.auth.email_service import _build_invitation_email
@@ -45,8 +47,8 @@ class TestBuildInvitationEmail:
             return _build_invitation_email(
                 to_email=to_email,
                 to_name=to_name,
-                invitation_token=invitation_token,
-                expires_in_days=expires_in_days,
+                otp=otp,
+                expires_in_minutes=expires_in_minutes,
             )
 
     def test_subject_mentions_invitation(self) -> None:
@@ -76,24 +78,23 @@ class TestBuildInvitationEmail:
 
     def test_body_contains_deep_link(self) -> None:
         msg = self._build(
-            invitation_token="abcdef",
+            to_email="alex@example.com",
             frontend_url="http://localhost:3000",
         )
         body = _body(msg)
-        # URL must contain the token so the SPA can pre-fill it.
+        # URL must carry the email — that's how the SPA pre-fills.
         assert "http://localhost:3000/accept-invitation" in body
-        assert "token=abcdef" in body
+        assert "email=alex%40example.com" in body
 
-    def test_body_includes_plaintext_token_fallback(self) -> None:
-        """The body repeats the token in plaintext so users whose
-        email client strips query-string params (some corporate
-        gateways do this for security) can still paste it manually."""
-        msg = self._build(invitation_token="FALLBACK-TOK")
-        assert "FALLBACK-TOK" in _body(msg)
+    def test_body_contains_otp(self) -> None:
+        """The OTP must be prominently in the body so users can copy-paste it."""
+        msg = self._build(otp="482915")
+        assert "482915" in _body(msg)
+        assert "Verification code" in _body(msg)
 
-    def test_body_mentions_expiry_in_days(self) -> None:
-        msg = self._build(expires_in_days=14)
-        assert "14 days" in _body(msg)
+    def test_body_mentions_expiry_in_minutes(self) -> None:
+        msg = self._build(expires_in_minutes=10)
+        assert "10 minutes" in _body(msg)
 
     def test_strips_trailing_slash_from_frontend_url(self) -> None:
         msg = self._build(frontend_url="http://localhost:3000/")
@@ -121,8 +122,8 @@ class TestSendInvitationSchedulerShape:
                 background_tasks,
                 to_email="alex@example.com",
                 to_name="Alex",
-                invitation_token="invite-xyz",
-                expires_in_days=7,
+                otp="482915",
+                expires_in_minutes=10,
                 recipient_user_id=uuid.uuid4(),
             )
 
@@ -130,11 +131,10 @@ class TestSendInvitationSchedulerShape:
         # First positional arg is the background runner.
         runner = background_tasks.add_task.call_args.args[0]
         assert runner.__name__ == "_send_in_background"
-        # kwargs include the plaintext token (dev-only log field)
-        # and `kind="invitation"`.
+        # kwargs include the OTP (dev-only log field) and `kind="invitation"`.
         kwargs = background_tasks.add_task.call_args.kwargs
         assert kwargs["kind"] == "invitation"
-        assert kwargs["dev_otp_for_test_only"] == "invite-xyz"
+        assert kwargs["dev_otp_for_test_only"] == "482915"
         assert kwargs["recipient_user_id"] is not None
         # The message has the right subject.
         msg = kwargs["message"]

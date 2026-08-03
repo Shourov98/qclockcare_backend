@@ -19,8 +19,9 @@ block the request thread — same pattern as the just-shipped
 
 Public API:
   - `send_invitation_email(background_tasks, *, to_email, to_name,
-    invitation_token, expires_in_days)` — schedule an invitation
-    email.
+    otp, expires_in_minutes)` — schedule an invitation email
+    carrying an OTP and a deep link to
+    `/accept-invitation?email=…`.
   - `send_otp_email(background_tasks, *, to_email, to_name, otp,
     expires_in_minutes)` — schedule an OTP email.
   - `send_password_reset_email(background_tasks, *, to_email,
@@ -136,18 +137,19 @@ def _build_invitation_email(
     *,
     to_email: str,
     to_name: str | None,
-    invitation_token: str,
-    expires_in_days: int,
+    otp: str,
+    expires_in_minutes: int,
 ) -> EmailMessage:
     """Build the invitation email.
 
-    The deep-link points to `${FRONTEND_URL}/accept-invitation?token=…`
-    so the SPA can pre-fill the token when the recipient clicks
-    through. The body also includes the plaintext token as a fallback
-    for clients that strip query-string params (some corporate email
-    gateways do this for security).
+    The deep-link points to `${FRONTEND_URL}/accept-invitation?email=…`
+    so the SPA can pre-fill the email field when the recipient clicks
+    through. The OTP itself lives in the body (not the URL) — we
+    moved away from a JWT-in-URL design because email gateways and
+    link preprocessors routinely strip query-string params, which
+    surfaced as `TOKEN_INVALID` on the backend.
     """
-    query = urlencode({"token": invitation_token})
+    query = urlencode({"email": to_email})
     invite_url = f"{settings.FRONTEND_URL.rstrip('/')}/accept-invitation?{query}"
 
     greeting = f"Hi {to_name}," if to_name else "Hi,"
@@ -155,15 +157,15 @@ def _build_invitation_email(
         f"{greeting}\n\n"
         f"You've been invited to {_BRAND_NAME} — the home-care platform "
         f"your team uses to schedule visits, track care plans, and "
-        f"coordinate with families. Click the link below to set your "
-        f"password and finish setting up your account. This invitation "
-        f"expires in {expires_in_days} days.\n\n"
-        f"  Accept your invitation: {invite_url}\n\n"
-        f"If the link doesn't work, paste this token into the "
-        f"accept-invitation page manually:\n"
-        f"  {invitation_token}\n\n"
+        f"coordinate with families. Use the code below to set your "
+        f"password and finish setting up your account. This code "
+        f"expires in {expires_in_minutes} minutes.\n\n"
+        f"  Verification code: {otp}\n\n"
+        f"Open this link on the device you want to sign in from — your "
+        f"email is pre-filled, just paste the code and pick a password:\n"
+        f"  {invite_url}\n\n"
         f"If you weren't expecting this email, you can safely ignore "
-        f"it. The invitation will expire on its own.\n\n"
+        f"it. The code will expire on its own.\n\n"
         f"— The {_BRAND_NAME} team\n"
     )
 
@@ -210,14 +212,17 @@ async def _send_in_background(
     # LOG_INCLUDE_DEV_OTPS so production log scanners do not ingest
     # secrets. Runs once per request, before the retry loop, so we
     # don't re-log secrets on retries.
+    #
+    # NOTE: We pass each field as a top-level kwarg, not inside an
+    # `extra={...}` dict. structlog treats `extra` as a single kwarg
+    # and renders it as one nested dict in the output — hard to grep
+    # and easy to miss when scanning the terminal.
     if settings.LOG_INCLUDE_DEV_OTPS and dev_otp_for_test_only:
         logger.info(
             f"auth.email.dev_{kind}_for_test_only",
-            extra={
-                "dev_otp_for_test_only": dev_otp_for_test_only,
-                "to": message["To"],
-                "_dev_only": True,
-            },
+            dev_otp_for_test_only=dev_otp_for_test_only,
+            to=message["To"],
+            _dev_only=True,
         )
 
     last_error: str | None = None
@@ -392,31 +397,32 @@ def send_invitation_email(
     *,
     to_email: str,
     to_name: str | None,
-    invitation_token: str,
-    expires_in_days: int,
+    otp: str,
+    expires_in_minutes: int,
     recipient_user_id: uuid.UUID,
 ) -> None:
     """Schedule an invitation email to be sent after the response.
 
-    Called by the staff / patients / patient-guardians routers after
-    `staff_service.create_staff` /
+    Called by the staff / patients / patient-guardians / agencies
+    routers after `staff_service.create_staff` /
     `patients_service.create_patient` /
-    `patients_service.create_guardian` issue a fresh
-    `SingleUseToken(purpose="invitation")`. The recipient gets a deep
-    link to `/accept-invitation?token=…` and a plaintext token fallback
-    for clients that strip query-string params.
+    `patients_service.create_guardian` /
+    `agencies_service.create_agency` issue a fresh OTP via
+    `otp_service.issue_otp`. The recipient gets a deep link to
+    `/accept-invitation?email=…` and a 6-digit code in the body to
+    paste on the accept page.
     """
     message = _build_invitation_email(
         to_email=to_email,
         to_name=to_name,
-        invitation_token=invitation_token,
-        expires_in_days=expires_in_days,
+        otp=otp,
+        expires_in_minutes=expires_in_minutes,
     )
     background_tasks.add_task(
         _send_in_background,
         recipient_user_id=recipient_user_id,
         message=message,
-        dev_otp_for_test_only=invitation_token,
+        dev_otp_for_test_only=otp,
         kind="invitation",
     )
 

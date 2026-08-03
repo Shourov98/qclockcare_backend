@@ -213,13 +213,22 @@ class RefreshRequest(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# Accept invitation (step 1 of onboarding)
+# Accept invitation (single-step onboarding — OTP + new password)
 # --------------------------------------------------------------------------
 class AcceptInvitationRequest(BaseModel):
     """POST /auth/accept-invitation body.
 
-    `invitation_token` is the signed token emailed to the new user; we hash
-    it server-side before lookup, so the plaintext never lives in the DB.
+    The invitation email carries a deep link of the shape
+    `/accept-invitation?email=<user_email>` plus the 6-digit verification
+    code in the body. On success the server marks the email verified,
+    activates the user, sets their password, and returns a fresh
+    token pair — the client is logged in immediately (no separate
+    `/auth/verify-email` round-trip).
+
+    We deliberately moved away from a JWT-in-URL design: URL params get
+    stripped or mangled by some email gateways and link-preprocessors,
+    which surfaced as `TOKEN_INVALID` on the backend. The OTP is the
+    actual secret — it lives in the email body, not the URL.
     """
 
     model_config = ConfigDict(
@@ -227,20 +236,28 @@ class AcceptInvitationRequest(BaseModel):
         json_schema_extra={
             "examples": [
                 {
-                    "invitation_token": "inv_5f3a7b1c1d0a4a239c8e1b2c3d4e5f6a",
+                    "email": "alex.rivera@careagency.com",
+                    "otp": "482915",
                     "password": "CorrectHorseBattery!42",
                 }
             ]
         },
     )
 
-    invitation_token: str = Field(
-        min_length=20,
-        max_length=512,
+    email: EmailStr = Field(
         description=(
-            "Token from the invitation email's deep link "
-            "(`/accept-invitation?token=...`). Single-use; expires after "
-            "`settings.INVITATION_TOKEN_EXPIRY_DAYS` days."
+            "Email address from the invitation deep link "
+            "(`/accept-invitation?email=...`). Case-insensitive."
+        ),
+    )
+    otp: str = Field(
+        min_length=4,
+        max_length=8,
+        pattern=r"^\d+$",
+        description=(
+            "Verification code from the invitation email body. "
+            "Expires after `settings.OTP_EXPIRY_MINUTES` minutes; "
+            "max 5 attempts before the account is locked."
         ),
     )
     password: str = Field(

@@ -229,8 +229,8 @@ async def create_staff_endpoint(
         background_tasks,
         to_email=result.email,
         to_name=result.full_name,
-        invitation_token=result.invitation_token,
-        expires_in_days=settings.INVITATION_TOKEN_EXPIRY_DAYS,
+        otp=result.invitation_otp,
+        expires_in_minutes=settings.OTP_EXPIRY_MINUTES,
         recipient_user_id=result.user_id,
     )
     return _to_response(result.profile, with_details=False)

@@ -32,7 +32,6 @@ from src.core.exceptions import (
     AgencySuspendedError,
     EmailNotVerifiedError,
     InvalidCredentialsError,
-    InvalidInvitationTokenError,
     InvalidResetTokenError,
     InvitationAlreadyConsumedError,
     NotFoundError,
@@ -476,95 +475,55 @@ async def logout(
 
 
 # --------------------------------------------------------------------------
-# Invitation tokens
-# --------------------------------------------------------------------------
-async def issue_invitation_token(
-    session: AsyncSession,
-    *,
-    user_id: uuid.UUID,
-) -> tuple[str, str]:
-    """Issue a `SingleUseToken(purpose='invitation')` for `user_id`.
-
-    Returns `(plaintext_token, jti)`. The token is the value the
-    recipient pastes / clicks through to land on the SPA's
-    `/accept-invitation?token=…` page; the `jti` is the row's primary
-    key (used by `accept_invitation` to mark it consumed).
-
-    The TTL is sourced from
-    `settings.INVITATION_TOKEN_EXPIRY_DAYS` (default 7, range 1-30)
-    so operators have one knob to control invitation lifetime — the
-    `forgot_password` path hard-codes 2 h because password-reset is a
-    more sensitive, shorter-lived flow.
-
-    The caller is responsible for:
-      1. Scheduling the invitation email (use
-         `auth.email_service.send_invitation_email` with the returned
-         token).
-      2. Writing the `AuthAuditEventType.INVITATION_SENT` audit row
-         (the staff / patients services already do this).
-    """
-    ttl = timedelta(days=settings.INVITATION_TOKEN_EXPIRY_DAYS)
-    token, jti = jwt_service.issue_single_use_token(
-        purpose="invitation",
-        user_id=user_id,
-        ttl=ttl,
-    )
-    session.add(
-        SingleUseToken(
-            jti=jti,
-            user_id=user_id,
-            purpose="invitation",
-            expires_at=datetime.now(tz=UTC) + ttl,
-        )
-    )
-    return token, jti
-
-
-# --------------------------------------------------------------------------
 # Accept invitation
 # --------------------------------------------------------------------------
 async def accept_invitation(
     session: AsyncSession,
     *,
-    invitation_token: str,
+    email: str,
+    otp: str,
     new_password: str,
     ip_address: str | None = None,
     user_agent: str | None = None,
-) -> tuple[User, str | None]:
-    """Accept an invitation, set password, issue first OTP.
+) -> IssuedTokens:
+    """Verify the OTP from the invitation email, set the password,
+    activate the user, and mint the first token pair.
 
-    Returns (user, otp_plaintext). The caller emails the OTP — we don't
-    persist the plaintext. Returns `otp_plaintext=None` if no OTP needs to be
-    issued (e.g. account was already verified).
+    Single-step onboarding: the invitee opens the link from the email
+    (which contains only `?email=...` — no JWT), enters the 6-digit
+    code + a new password, and is logged in on success. The second
+    `/auth/verify-email` round-trip is no longer required because
+    OTP verification already transitions `INVITED → ACTIVE`
+    (see `otp_service.verify_otp:188-191`).
+
+    Returns the issued `IssuedTokens` so the caller can set auth
+    cookies on the response. Raises `InvalidOtpError` /
+    `OtpExpiredError` / `OtpMaxAttemptsExceededError` directly from
+    `otp_service.verify_otp` — the frontend branches on
+    `data.code`.
     """
-    payload = jwt_service.verify_single_use_token(invitation_token, expected_purpose="invitation")
-
-    row = (
-        await session.execute(
-            select(SingleUseToken).where(SingleUseToken.jti == payload.jti)
+    verify_result = await otp_service.verify_otp(
+        session, email=email, otp=otp
+    )
+    user = await _load_user_with_roles(session, verify_result.user_id)
+    # `verify_otp` already consumed the OTP row, so replays naturally
+    # fail with `OtpExpiredError` — no token-style "already consumed"
+    # check needed here. We still defensively reject users in
+    # terminal states (LOCKED / INACTIVE / ARCHIVED) so we don't
+    # hand tokens to an account that can't actually log in.
+    if user.status in {UserStatus.LOCKED, UserStatus.INACTIVE, UserStatus.ARCHIVED}:
+        raise InvitationAlreadyConsumedError(
+            details={"status": user.status.value, "reason": "account_not_eligible"}
         )
-    ).scalar_one_or_none()
+
     now = datetime.now(tz=UTC)
-    if row is None or row.consumed_at is not None or row.revoked_at is not None:
-        raise InvalidInvitationTokenError()
-    if row.expires_at <= now:
-        row.revoked_at = now
-        await _record_audit(
-            session,
-            user_id=row.user_id,
-            event_type=AuthAuditEventType.INVITATION_EXPIRED,
-            ip_address=ip_address,
-            user_agent=user_agent,
-        )
-        raise InvalidInvitationTokenError()
-
-    user = await _load_user_with_roles(session, row.user_id)
-    if user.status != UserStatus.INVITED:
-        raise InvitationAlreadyConsumedError()
-
+    # Set the password exactly once — idempotent for re-invitation
+    # because the latest password always wins and the user must use
+    # the most recent password to log in.
     user.password_hash = hash_password(new_password)
-    user.status = UserStatus.EMAIL_VERIFICATION_PENDING
-    row.consumed_at = now
+    user.must_change_password = False
+    if user.email_verified_at is None:
+        user.email_verified_at = now
 
     await _record_audit(
         session,
@@ -580,22 +539,20 @@ async def accept_invitation(
         ip_address=ip_address,
         user_agent=user_agent,
     )
-    # Issue an OTP for the user to verify their email
-    issued = await otp_service.issue_otp(
+    await _record_audit(
+        session,
+        user_id=user.id,
+        event_type=AuthAuditEventType.EMAIL_VERIFIED,
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
+
+    return await _issue_pair(
         session,
         user=user,
         ip_address=ip_address,
         user_agent=user_agent,
     )
-    await _record_audit(
-        session,
-        user_id=user.id,
-        event_type=AuthAuditEventType.OTP_SENT,
-        ip_address=ip_address,
-        user_agent=user_agent,
-        metadata={"via": "invitation"},
-    )
-    return user, issued.otp
 
 
 # --------------------------------------------------------------------------

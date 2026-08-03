@@ -26,7 +26,7 @@ from src.core.exceptions import (
     ValidationError,
 )
 from src.modules.agencies.models import Agency
-from src.modules.identity import auth_service
+from src.modules.identity import otp_service
 from src.modules.identity.models import User, UserRoleAssignment
 from src.modules.patients.models import (
     GuardianProfile,
@@ -131,14 +131,14 @@ class PatientInviteResult:
 
     The router schedules an invitation email via
     `auth.email_service.send_invitation_email(...)` using the
-    plaintext token + recipient fields.
+    plaintext OTP + recipient fields.
     """
 
     profile: PatientProfile
     user_id: uuid.UUID
     email: str
     full_name: str | None
-    invitation_token: str
+    invitation_otp: str
 
 
 async def create_patient(
@@ -159,8 +159,9 @@ async def create_patient(
     create the profile + role assignment. The unique constraint on
     `(agency_id, user_id)` will surface duplicates via IntegrityError.
 
-    Issues a fresh `SingleUseToken(purpose="invitation")` and returns
-    its plaintext so the caller can schedule the invitation email.
+    Issues a fresh email-verification OTP via `otp_service.issue_otp`
+    and returns its plaintext so the caller can schedule the
+    invitation email.
     """
     await _assert_agency_active(session, agency_id)
 
@@ -238,10 +239,11 @@ async def create_patient(
         },
     )
 
-    # Issue a fresh invitation token + return everything the router
+    # Issue a fresh invitation OTP + return everything the router
     # needs to schedule the email.
-    invitation_token, _jti = await auth_service.issue_invitation_token(
-        session, user_id=user.id
+    issued = await otp_service.issue_otp(
+        session,
+        user=user,
     )
 
     return PatientInviteResult(
@@ -249,7 +251,7 @@ async def create_patient(
         user_id=user.id,
         email=user.email,
         full_name=user.full_name,
-        invitation_token=invitation_token,
+        invitation_otp=issued.otp,
     )
 
 
@@ -390,7 +392,7 @@ class GuardianInviteResult:
     user_id: uuid.UUID
     email: str
     full_name: str | None
-    invitation_token: str
+    invitation_otp: str
 
 
 async def create_guardian(
@@ -470,10 +472,11 @@ async def create_guardian(
         },
     )
 
-    # Issue a fresh invitation token + return everything the router
+    # Issue a fresh invitation OTP + return everything the router
     # needs to schedule the email.
-    invitation_token, _jti = await auth_service.issue_invitation_token(
-        session, user_id=user.id
+    issued = await otp_service.issue_otp(
+        session,
+        user=user,
     )
 
     return GuardianInviteResult(
@@ -481,7 +484,7 @@ async def create_guardian(
         user_id=user.id,
         email=user.email,
         full_name=user.full_name,
-        invitation_token=invitation_token,
+        invitation_otp=issued.otp,
     )
 
 

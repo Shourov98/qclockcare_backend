@@ -525,7 +525,7 @@
             },
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"token\": \"<invitation-token>\",\n  \"password\": \"InviteePass123!\"\n}",
+              "raw": "{\n  \"email\": \"<invitee-email>\",\n  \"otp\": \"000000\",\n  \"password\": \"InviteePass123!\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -5866,10 +5866,6 @@
       "script": {
         "type": "text/javascript",
         "exec": [
-          "// Generate a fresh UUID for this request (used by body templates).",
-          "// Postman's built-in $randomUUID doesn't resolve in raw JSON,",
-          "// so we generate one and put it in the environment.",
-          "pm.environment.set('$randomUUID', require('crypto').randomUUID());",
           "// Auto-refresh: if access_token is missing or expired, try refresh.\n// This runs before every request in the collection.\nconst token = pm.environment.get('access_token');\nconst expiresAt = parseInt(pm.environment.get('access_token_expires_at') || '0');\nif (!token || (expiresAt && Date.now() > expiresAt)) {\n    const refresh = pm.environment.get('refresh_token');\n    const baseUrl = pm.environment.get('base_url');\n    if (refresh && baseUrl) {\n        pm.sendRequest({\n            url: baseUrl + '/auth/refresh',\n            method: 'POST',\n            header: {'Content-Type': 'application/json'},\n            body: {mode: 'raw', raw: JSON.stringify({refresh_token: refresh})}\n        }, (err, res) => {\n            if (!err && res.code === 200) {\n                const b = res.json();\n                pm.environment.set('access_token', b.access_token);\n                pm.environment.set('refresh_token', b.refresh_token);\n                if (b.expires_in) {\n                    pm.environment.set(\n                        'access_token_expires_at',\n                        String(Date.now() + b.expires_in * 1000)\n                    );\n                }\n            }\n        });\n    }\n}"
         ]
       }

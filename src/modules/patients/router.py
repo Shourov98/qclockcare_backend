@@ -190,8 +190,8 @@ async def create_patient_endpoint(
         background_tasks,
         to_email=result.email,
         to_name=result.full_name,
-        invitation_token=result.invitation_token,
-        expires_in_days=settings.INVITATION_TOKEN_EXPIRY_DAYS,
+        otp=result.invitation_otp,
+        expires_in_minutes=settings.OTP_EXPIRY_MINUTES,
         recipient_user_id=result.user_id,
     )
     return _to_patient_response(result.profile)
@@ -465,8 +465,8 @@ async def add_patient_guardian_endpoint(
             background_tasks,
             to_email=result.new_guardian.email,
             to_name=result.new_guardian.full_name,
-            invitation_token=result.new_guardian.invitation_token,
-            expires_in_days=settings.INVITATION_TOKEN_EXPIRY_DAYS,
+            otp=result.new_guardian.invitation_otp,
+            expires_in_minutes=settings.OTP_EXPIRY_MINUTES,
             recipient_user_id=result.new_guardian.user_id,
         )
     return PatientGuardianRelationshipResponse.model_validate(result.relationship)
@@ -528,8 +528,8 @@ async def create_guardian_endpoint(
         background_tasks,
         to_email=result.email,
         to_name=result.full_name,
-        invitation_token=result.invitation_token,
-        expires_in_days=settings.INVITATION_TOKEN_EXPIRY_DAYS,
+        otp=result.invitation_otp,
+        expires_in_minutes=settings.OTP_EXPIRY_MINUTES,
         recipient_user_id=result.user_id,
     )
     return GuardianProfileResponse.model_validate(result.profile)

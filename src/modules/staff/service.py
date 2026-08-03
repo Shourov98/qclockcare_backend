@@ -30,7 +30,7 @@ from src.core.exceptions import (
     ValidationError,
 )
 from src.modules.agencies.models import Agency
-from src.modules.identity import auth_service
+from src.modules.identity import otp_service
 from src.modules.identity.models import User, UserRoleAssignment
 from src.modules.staff.models import (
     StaffAvailability,
@@ -153,9 +153,9 @@ async def _assert_agency_active(session: AsyncSession, agency_id: uuid.UUID) -> 
 class StaffInviteResult:
     """Outcome of `create_staff(...)`.
 
-    The router hands `invitation_token` + `email` + `full_name` to
+    The router hands `invitation_otp` + `email` + `full_name` to
     `auth.email_service.send_invitation_email(...)` so the new staff
-    member gets a deep-link invitation. The `profile` is what the
+    member gets an OTP-enabled invitation. The `profile` is what the
     router returns in the HTTP response body.
     """
 
@@ -163,7 +163,7 @@ class StaffInviteResult:
     user_id: uuid.UUID
     email: str
     full_name: str | None
-    invitation_token: str
+    invitation_otp: str
 
 
 async def create_staff(
@@ -180,9 +180,9 @@ async def create_staff(
     2. `UserRoleAssignment` (role=STAFF, agency_id=…) — authorises the user
     3. `StaffProfile` (agency_id, user_id, staff_code, …) — the staff record
 
-    Then issues a fresh `SingleUseToken(purpose="invitation")` and
-    returns its plaintext so the caller can schedule the invitation
-    email (see `StaffInviteResult`).
+    Then issues a fresh email-verification OTP via
+    `otp_service.issue_otp` and returns its plaintext so the caller
+    can schedule the invitation email (see `StaffInviteResult`).
     """
     await _assert_agency_active(session, agency_id)
 
@@ -264,12 +264,15 @@ async def create_staff(
         },
     )
 
-    # Issue a fresh invitation token + return everything the router
+    # Issue a fresh invitation OTP + return everything the router
     # needs to schedule the email. Re-issuing when the user already
     # exists is the right behaviour — the recipient needs a fresh
-    # link every time an admin invites them.
-    invitation_token, _jti = await auth_service.issue_invitation_token(
-        session, user_id=user.id
+    # code every time an admin invites them. We use the OTP service
+    # (not a JWT invitation token) because that's the secret the
+    # recipient actually proves possession of to accept.
+    issued = await otp_service.issue_otp(
+        session,
+        user=user,
     )
 
     return StaffInviteResult(
@@ -277,7 +280,7 @@ async def create_staff(
         user_id=user.id,
         email=user.email,
         full_name=user.full_name,
-        invitation_token=invitation_token,
+        invitation_otp=issued.otp,
     )
 
 

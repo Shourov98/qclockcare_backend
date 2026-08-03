@@ -29,6 +29,20 @@ from src.shared.domain.enums import NotificationChannel
 
 log = get_logger(__name__)
 
+# Process-local dedupe of dev-mode email logs. When SMTP_ENABLED=false the
+# EmailProvider logs the full rendered email (to / from / subject / body)
+# so the developer can complete the auth flow without a real SMTP server.
+# The retry loop in `auth/email_service.py:_send_in_background` calls
+# `EmailProvider.send` up to three times per attempt; without dedupe the
+# same email is logged three times in the application log. Keyed by
+# (recipient, subject) so two different invites to the same recipient
+# (e.g. staff invite vs password reset) still both log.
+#
+# Process-local and intentionally never cleared: in tests we mock
+# `EmailProvider.send` so this branch doesn't run, and in production
+# SMTP_ENABLED is true so the dev branch is gated out entirely.
+_DEV_LOGGED_EMAILS: set[tuple[str, str]] = set()
+
 
 @dataclass(frozen=True, slots=True)
 class DeliveryResult:
@@ -114,15 +128,24 @@ class EmailProvider(NotificationProvider):
             # caller can complete the flow without a real SMTP server.
             # Gated on APP_ENV != "production" so production never logs
             # PII/PHI even if SMTP_ENABLED is accidentally left off.
+            #
+            # Deduped by (to, subject) so the retry loop in
+            # `auth/email_service.py:_send_in_background` doesn't spam
+            # the log with three copies of the same email. The set is
+            # process-local and intentionally never cleared — in tests
+            # we mock `EmailProvider.send` so this branch doesn't run.
             if settings.APP_ENV != "production":
-                log.info(
-                    "notifications.email_dev_log",
-                    to=to,
-                    from_addr=f"{settings.SMTP_FROM_NAME} <{settings.SMTP_FROM_EMAIL}>",
-                    subject=subject,
-                    body=body,
-                    _dev_only=True,
-                )
+                dedupe_key = (to, subject)
+                if dedupe_key not in _DEV_LOGGED_EMAILS:
+                    _DEV_LOGGED_EMAILS.add(dedupe_key)
+                    log.info(
+                        "notifications.email_dev_log",
+                        to=to,
+                        from_addr=f"{settings.SMTP_FROM_NAME} <{settings.SMTP_FROM_EMAIL}>",
+                        subject=subject,
+                        body=body,
+                        _dev_only=True,
+                    )
             return DeliveryResult(
                 success=False,
                 error="SMTP disabled (set SMTP_ENABLED=true to deliver email)",

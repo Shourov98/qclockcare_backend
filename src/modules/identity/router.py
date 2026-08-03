@@ -4,7 +4,7 @@ Endpoints:
   POST /auth/login                  → {access, refresh, ...}
   POST /auth/refresh                → {access, refresh, ...}
   POST /auth/logout                 → 204
-  POST /auth/accept-invitation      → {accepted, email, otp_sent}
+  POST /auth/accept-invitation      → {access, refresh, ...}
   POST /auth/verify-email           → {access, refresh, ...}
   POST /auth/resend-otp             → {sent, cooldown_seconds_remaining}
   POST /auth/forgot-password        → {sent: true}
@@ -37,7 +37,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.config import settings
 from src.core.database import get_session
 from src.core.exceptions import UnauthorizedError
-from src.modules.auth import email_service as auth_email
 from src.modules.identity import auth_service
 from src.modules.identity.cookies import (
     QC_REFRESH_COOKIE,
@@ -219,54 +218,49 @@ async def logout_endpoint(
 
 
 # --------------------------------------------------------------------------
-# Accept invitation (step 1 of onboarding)
+# Accept invitation (single-step onboarding)
 # --------------------------------------------------------------------------
 @router.post(
     "/accept-invitation",
-    status_code=status.HTTP_202_ACCEPTED,
+    response_model=TokenPair,
     responses=standard_responses(include=[401, 404, 409, 422]),
-    summary="Accept an invitation and set a password",
+    summary="Accept an invitation, verify OTP, and receive a session",
     description=(
-        "Step 1 of onboarding. The invitee submits the token from "
-        "their invitation email and a new password that satisfies the "
-        "project password policy. On success a 6-digit OTP is sent to "
-        "the invitee's email via the background SMTP runner — the "
-        "client should immediately follow up with `POST /auth/verify-email`."
+        "Single-step onboarding. The invitee submits the email from "
+        "their invitation deep link, the 6-digit code from the email "
+        "body, and a new password that satisfies the project password "
+        "policy. On success the user is marked `ACTIVE`, the email "
+        "is verified, and the response carries a fresh access/refresh "
+        "token pair — the client is logged in immediately. No "
+        "follow-up `/auth/verify-email` call is required."
     ),
 )
 async def accept_invitation_endpoint(
     payload: AcceptInvitationRequest,
     request: Request,
-    background_tasks: BackgroundTasks,
+    response: Response,
     session: AsyncSession = Depends(get_session),
-) -> dict:
-    user, otp = await auth_service.accept_invitation(
+) -> TokenPair:
+    issued = await auth_service.accept_invitation(
         session,
-        invitation_token=payload.invitation_token,
+        email=payload.email,
+        otp=payload.otp,
         new_password=payload.password,
         ip_address=_client_ip(request),
         user_agent=_user_agent(request),
     )
-    # Schedule the OTP email to be sent after the response is flushed.
-    # The SMTP call runs in the background via FastAPI's
-    # BackgroundTasks (see src/modules/auth/email_service.py) so an
-    # unreachable SMTP server cannot block this endpoint.
-    # When `LOG_INCLUDE_DEV_OTPS=true`, the OTP is also logged at
-    # INFO so devs can test without configuring SMTP.
-    if otp is not None:
-        auth_email.send_otp_email(
-            background_tasks,
-            to_email=user.email,
-            to_name=user.full_name,
-            otp=otp,
-            expires_in_minutes=settings.OTP_EXPIRY_MINUTES,
-            recipient_user_id=user.id,
-        )
-    return {
-        "accepted": True,
-        "email": user.email,
-        "otp_sent": True,
-    }
+    set_auth_cookies(
+        response,
+        access_token=issued.access_token,
+        refresh_token=issued.refresh_token,
+        expires_in=issued.expires_in,
+    )
+    return TokenPair(
+        access_token=issued.access_token,
+        refresh_token=issued.refresh_token,
+        expires_in=issued.expires_in,
+        user=issued.user,
+    )
 
 
 # --------------------------------------------------------------------------

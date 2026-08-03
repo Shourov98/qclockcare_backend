@@ -176,13 +176,13 @@ async def create_agency_endpoint(
 
     # Schedule the invitation email AFTER commit (deferred network
     # call, same pattern as staff/router.py:228-235).
-    if admin_bind_result is not None and admin_bind_result.invitation_token is not None:
+    if admin_bind_result is not None and admin_bind_result.invitation_otp is not None:
         auth_email.send_invitation_email(
             background_tasks,
             to_email=admin_bind_result.email,
             to_name=admin_bind_result.full_name,
-            invitation_token=admin_bind_result.invitation_token,
-            expires_in_days=settings.INVITATION_TOKEN_EXPIRY_DAYS,
+            otp=admin_bind_result.invitation_otp,
+            expires_in_minutes=settings.OTP_EXPIRY_MINUTES,
             recipient_user_id=admin_bind_result.user_id,
         )
 
@@ -242,13 +242,13 @@ async def add_agency_admin_endpoint(
             error=_type(exc).__name__,
         )
 
-    if bind_result.invitation_token is not None:
+    if bind_result.invitation_otp is not None:
         auth_email.send_invitation_email(
             background_tasks,
             to_email=bind_result.email,
             to_name=bind_result.full_name,
-            invitation_token=bind_result.invitation_token,
-            expires_in_days=settings.INVITATION_TOKEN_EXPIRY_DAYS,
+            otp=bind_result.invitation_otp,
+            expires_in_minutes=settings.OTP_EXPIRY_MINUTES,
             recipient_user_id=bind_result.user_id,
         )
 

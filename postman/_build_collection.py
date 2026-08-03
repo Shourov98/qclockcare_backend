@@ -299,7 +299,8 @@ pm.test('Login (negative) — error.code is INVALID_CREDENTIALS', () => {
             method="POST",
             path="/auth/accept-invitation",
             body={
-                "token": "<invitation-token>",
+                "email": "<invitee-email>",
+                "otp": "000000",
                 "password": "InviteePass123!",
             },
             auth=_noauth(),
