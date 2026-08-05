@@ -15,6 +15,8 @@ from src.modules.staff.schemas import (
     StaffAvailabilityCreateRequest,
     StaffAvailabilityUpdateRequest,
     StaffProfileCreateRequest,
+    StaffProfileResponse,
+    StaffProfileSummaryResponse,
     StaffProfileUpdateRequest,
     StaffQualificationCreateRequest,
     StaffQualificationUpdateRequest,
@@ -96,6 +98,74 @@ class TestStaffProfileUpdateRequest:
         req = StaffProfileUpdateRequest(phone="555-0001")
         assert req.phone == "555-0001"
         assert req.full_name is None
+
+
+# --------------------------------------------------------------------------
+# StaffProfileResponse / StaffProfileSummaryResponse — joined user fields
+# --------------------------------------------------------------------------
+class TestStaffProfileResponsesJoinedFields:
+    """`full_name`, `email`, `phone` are joined from the underlying
+    User row. They must be optional on the response so a soft-deleted
+    or partially-populated user doesn't 500 the endpoint, but they
+    must round-trip when present.
+    """
+
+    def test_summary_response_full(self) -> None:
+        resp = StaffProfileSummaryResponse(
+            id="7c2e9b51-4a8d-4f5e-9c1a-2b3d4e5f6a7b",
+            agency_id="8a3f12d0-7b5e-4a23-9c8e-1b2c3d4e5f6a",
+            user_id="5f3a7b1c-1d0a-4a23-9c8e-1b2c3d4e5f6a",
+            full_name="Jenna Lopez",
+            email="jenna.lopez@careagency.com",
+            phone="+1-612-555-0142",
+            staff_code="STAFF-0042",
+            status="ACTIVE",
+            hired_at=date(2026, 6, 1),
+            terminated_at=None,
+            created_at=datetime(2026, 6, 1, 14, 0, 0),
+            updated_at=datetime(2026, 6, 15, 9, 30, 0),
+        )
+        assert resp.full_name == "Jenna Lopez"
+        assert str(resp.email) == "jenna.lopez@careagency.com"
+        assert resp.phone == "+1-612-555-0142"
+
+    def test_summary_response_nulls_tolerated(self) -> None:
+        resp = StaffProfileSummaryResponse(
+            id="7c2e9b51-4a8d-4f5e-9c1a-2b3d4e5f6a7b",
+            agency_id="8a3f12d0-7b5e-4a23-9c8e-1b2c3d4e5f6a",
+            user_id="5f3a7b1c-1d0a-4a23-9c8e-1b2c3d4e5f6a",
+            staff_code="STAFF-0042",
+            status="ACTIVE",
+            hired_at=None,
+            terminated_at=None,
+            created_at=datetime(2026, 6, 1, 14, 0, 0),
+            updated_at=datetime(2026, 6, 1, 14, 0, 0),
+        )
+        assert resp.full_name is None
+        assert resp.email is None
+        assert resp.phone is None
+
+    def test_detail_response_round_trip(self) -> None:
+        # Detail path includes the joined user fields plus
+        # optional nested children (both default to None here).
+        resp = StaffProfileResponse(
+            id="7c2e9b51-4a8d-4f5e-9c1a-2b3d4e5f6a7b",
+            agency_id="8a3f12d0-7b5e-4a23-9c8e-1b2c3d4e5f6a",
+            user_id="5f3a7b1c-1d0a-4a23-9c8e-1b2c3d4e5f6a",
+            full_name="Jenna Lopez",
+            email="jenna.lopez@careagency.com",
+            phone=None,
+            staff_code="STAFF-0042",
+            status="ACTIVE",
+            hired_at=date(2026, 6, 1),
+            terminated_at=None,
+            created_at=datetime(2026, 6, 1, 14, 0, 0),
+            updated_at=datetime(2026, 6, 1, 14, 0, 0),
+        )
+        assert resp.full_name == "Jenna Lopez"
+        assert resp.phone is None
+        assert resp.qualifications is None
+        assert resp.availability is None
 
 
 # --------------------------------------------------------------------------

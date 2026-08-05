@@ -96,6 +96,33 @@ def _ensure_can_view(ctx: CurrentAuth, staff_user_id: uuid.UUID) -> None:
         raise CrossAgencyAccessDeniedError()
 
 
+def _staff_to_dict(staff: object) -> dict[str, object]:
+    """Build a flat dict from a StaffProfile ORM row.
+
+    Reads the joined user fields eagerly (`full_name` / `email` /
+    `phone`) — `StaffProfile.user` is selectinloaded by `list_staff`
+    and `get_staff` so this never triggers a lazy load inside a sync
+    serializer. Used by both `_to_response` (detail path) and the
+    list endpoint (summary path) so the user fields are populated
+    consistently.
+    """
+    user = getattr(staff, "user", None)
+    return {
+        "id": staff.id,
+        "agency_id": staff.agency_id,
+        "user_id": staff.user_id,
+        "full_name": getattr(user, "full_name", None) if user is not None else None,
+        "email": getattr(user, "email", None) if user is not None else None,
+        "phone": getattr(user, "phone", None) if user is not None else None,
+        "staff_code": staff.staff_code,
+        "status": staff.status,
+        "hired_at": staff.hired_at,
+        "terminated_at": staff.terminated_at,
+        "created_at": staff.created_at,
+        "updated_at": staff.updated_at,
+    }
+
+
 def _to_response(
     staff: object,
     *,
@@ -105,22 +132,12 @@ def _to_response(
 
     `StaffProfile.qualifications` and `.availability` are lazy-loaded
     relationships — calling `model_validate(staff)` would trigger async
-    IO outside an awaited context. We build the dict explicitly and only
-    include the nested children when explicitly requested (i.e. when
-    `with_details=True` and the collections are already loaded).
+    IO outside an awaited context. We build the dict explicitly via
+    `_staff_to_dict` and only include the nested children when
+    explicitly requested (i.e. when `with_details=True` and the
+    collections are already loaded).
     """
-    # `from_attributes=True` lets us build a dict-like input from the ORM row.
-    data: dict = {
-        "id": staff.id,
-        "agency_id": staff.agency_id,
-        "user_id": staff.user_id,
-        "staff_code": staff.staff_code,
-        "status": staff.status,
-        "hired_at": staff.hired_at,
-        "terminated_at": staff.terminated_at,
-        "created_at": staff.created_at,
-        "updated_at": staff.updated_at,
-    }
+    data: dict = _staff_to_dict(staff)
     if with_details:
         # The collections were eager-loaded by the service; safe to read.
         try:
@@ -265,7 +282,13 @@ async def list_staff_endpoint(
         page=page,
         page_size=page_size,
     )
-    data = [StaffProfileSummaryResponse.model_validate(r) for r in rows]
+    # Build dicts explicitly so the joined user fields
+    # (`full_name`, `email`, `phone`) — which live on the User row,
+    # not on the StaffProfile column — are populated reliably.
+    data = [
+        StaffProfileSummaryResponse.model_validate(_staff_to_dict(r))
+        for r in rows
+    ]
     return build_offset_response(
         data,
         total=total,

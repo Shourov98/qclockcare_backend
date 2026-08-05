@@ -294,9 +294,15 @@ async def get_staff(
     """Fetch a single staff profile.
 
     `with_details=True` eagerly loads qualifications + availability.
+    The underlying `User` row is always eager-loaded so the response
+    can include `full_name` / `email` / `phone` without a follow-up
+    query (and without risking lazy-load races inside the response
+    serializer).
     """
-    stmt = select(StaffProfile).where(
-        StaffProfile.id == staff_id, StaffProfile.agency_id == agency_id
+    stmt = (
+        select(StaffProfile)
+        .where(StaffProfile.id == staff_id, StaffProfile.agency_id == agency_id)
+        .options(selectinload(StaffProfile.user))
     )
     if with_details:
         stmt = stmt.options(
@@ -323,7 +329,11 @@ async def list_staff(
     page = max(1, page)
     page_size = max(1, min(100, page_size))
 
-    base = select(StaffProfile).where(StaffProfile.agency_id == agency_id)
+    base = (
+        select(StaffProfile)
+        .where(StaffProfile.agency_id == agency_id)
+        .options(selectinload(StaffProfile.user))
+    )
     count_base = (
         select(func.count())
         .select_from(StaffProfile)

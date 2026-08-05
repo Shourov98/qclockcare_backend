@@ -151,6 +151,9 @@ class StaffProfileResponse(BaseModel):
                     "id": "7c2e9b51-4a8d-4f5e-9c1a-2b3d4e5f6a7b",
                     "agency_id": "8a3f12d0-7b5e-4a23-9c8e-1b2c3d4e5f6a",
                     "user_id": "5f3a7b1c-1d0a-4a23-9c8e-1b2c3d4e5f6a",
+                    "full_name": "Jenna Lopez",
+                    "email": "jenna.lopez@careagency.com",
+                    "phone": "+1-612-555-0142",
                     "staff_code": "STAFF-0042",
                     "status": "ACTIVE",
                     "hired_at": "2026-06-01",
@@ -166,6 +169,21 @@ class StaffProfileResponse(BaseModel):
     agency_id: UUID = Field(description="Owning agency UUID.")
     user_id: UUID = Field(
         description="Underlying user account UUID (link to `/auth/me`).",
+    )
+    # Joined from the User row (`StaffProfile.user`). All three are
+    # nullable on the response side because a soft-deleted user
+    # could leave them unset — we'd rather surface a null than 500.
+    full_name: str | None = Field(
+        default=None,
+        description="Joined from the underlying User row. `null` if unset.",
+    )
+    email: EmailStr | None = Field(
+        default=None,
+        description="Joined from the underlying User row.",
+    )
+    phone: str | None = Field(
+        default=None,
+        description="Joined from the underlying User row. E.164 preferred.",
     )
     staff_code: str = Field(description="Agency-scoped identifier.")
     status: UserStatus = Field(
@@ -198,6 +216,9 @@ class StaffProfileSummaryResponse(BaseModel):
                     "id": "7c2e9b51-4a8d-4f5e-9c1a-2b3d4e5f6a7b",
                     "agency_id": "8a3f12d0-7b5e-4a23-9c8e-1b2c3d4e5f6a",
                     "user_id": "5f3a7b1c-1d0a-4a23-9c8e-1b2c3d4e5f6a",
+                    "full_name": "Jenna Lopez",
+                    "email": "jenna.lopez@careagency.com",
+                    "phone": "+1-612-555-0142",
                     "staff_code": "STAFF-0042",
                     "status": "ACTIVE",
                     "hired_at": "2026-06-01",
@@ -212,6 +233,18 @@ class StaffProfileSummaryResponse(BaseModel):
     id: UUID = Field(description="Staff profile UUID.")
     agency_id: UUID = Field(description="Owning agency UUID.")
     user_id: UUID = Field(description="Underlying user account UUID.")
+    full_name: str | None = Field(
+        default=None,
+        description="Joined from the underlying User row.",
+    )
+    email: EmailStr | None = Field(
+        default=None,
+        description="Joined from the underlying User row.",
+    )
+    phone: str | None = Field(
+        default=None,
+        description="Joined from the underlying User row.",
+    )
     staff_code: str = Field(description="Agency-scoped identifier.")
     status: UserStatus = Field(description="Lifecycle status.")
     hired_at: date | None = Field(description="Start date.")
