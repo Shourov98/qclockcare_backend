@@ -508,6 +508,143 @@ class TestSendInBackgroundLoggingFields:
         assert kwargs["error"] == "connection refused"
 
 
+# ---------------------------------------------------------------------------
+# SMTP-disabled short-circuit
+# ---------------------------------------------------------------------------
+class TestSendInBackgroundSmtpDisabled:
+    """`SMTP disabled (set SMTP_ENABLED=true to deliver email)` is a
+    configuration state, not a transient delivery failure. Retrying
+    it 3× just wastes ~7s of wall time and floods the log with three
+    copies of the same error. The retry loop bails after one attempt
+    with a single `*_smtp_disabled` warning.
+    """
+
+    async def test_smtp_disabled_short_circuits_no_retries(self) -> None:
+        from src.modules.auth.email_service import _send_in_background
+
+        provider = MagicMock()
+        provider.send = AsyncMock(
+            return_value=_FakeResult(
+                success=False,
+                error="SMTP disabled (set SMTP_ENABLED=true to deliver email)",
+            )
+        )
+
+        with (
+            patch("src.modules.auth.email_service.settings") as mock_settings,
+            patch("src.modules.auth.email_service.session_scope") as mock_scope,
+            patch(
+                "src.modules.auth.email_service.set_session_context",
+                AsyncMock(),
+            ),
+            patch(
+                "src.modules.notifications.channels.EmailProvider",
+                return_value=provider,
+            ),
+            patch(
+                "src.modules.auth.email_service.asyncio.sleep",
+                AsyncMock(),
+            ) as mock_sleep,
+            patch("src.modules.auth.email_service.logger") as mock_logger,
+        ):
+            mock_settings.SMTP_RETRY_MAX_ATTEMPTS = 3
+            mock_settings.LOG_INCLUDE_DEV_OTPS = False
+            mock_settings.SMTP_FROM_NAME = "QlockCare"
+            mock_settings.SMTP_FROM_EMAIL = "noreply@qlockcare.local"
+            mock_scope.return_value = _null_scope()
+
+            await _send_in_background(
+                recipient_user_id=MagicMock(),
+                message=_make_msg(to="alex@example.com"),
+                dev_otp_for_test_only=None,
+                kind="invitation",
+            )
+
+        # Provider is called exactly once — no retries on a permanent
+        # configuration error.
+        provider.send.assert_called_once()
+        # No sleeps — we never entered the backoff loop.
+        mock_sleep.assert_not_called()
+        # One short-circuit warning, no `send_failed` retry warnings,
+        # no `send_exhausted` error log.
+        smtp_disabled_calls = [
+            call for call in mock_logger.warning.call_args_list
+            if call.args and "smtp_disabled" in str(call.args[0])
+        ]
+        assert len(smtp_disabled_calls) == 1
+        assert smtp_disabled_calls[0].kwargs["to"] == "alex@example.com"
+        # `kind` is interpolated into the log message string itself,
+        # so we just check the message contains the right prefix.
+        assert "invitation_smtp_disabled" in str(smtp_disabled_calls[0].args[0])
+
+        send_failed_calls = [
+            call for call in mock_logger.warning.call_args_list
+            if call.args and "send_failed" in str(call.args[0])
+        ]
+        assert send_failed_calls == []
+
+        send_exhausted_calls = [
+            call for call in mock_logger.error.call_args_list
+            if call.args and "send_exhausted" in str(call.args[0])
+        ]
+        assert send_exhausted_calls == []
+
+    async def test_smtp_disabled_short_circuits_for_other_kinds(self) -> None:
+        """The short-circuit applies to every email kind (invitation,
+        otp, reset) — only the prefix is parameterized."""
+        from src.modules.auth.email_service import _send_in_background
+
+        provider = MagicMock()
+        provider.send = AsyncMock(
+            return_value=_FakeResult(
+                success=False,
+                error="SMTP disabled (set SMTP_ENABLED=true to deliver email)",
+            )
+        )
+
+        for kind in ("invitation", "otp", "reset"):
+            with (
+                patch("src.modules.auth.email_service.settings") as mock_settings,
+                patch("src.modules.auth.email_service.session_scope") as mock_scope,
+                patch(
+                    "src.modules.auth.email_service.set_session_context",
+                    AsyncMock(),
+                ),
+                patch(
+                    "src.modules.notifications.channels.EmailProvider",
+                    return_value=provider,
+                ),
+                patch(
+                    "src.modules.auth.email_service.asyncio.sleep",
+                    AsyncMock(),
+                ),
+                patch("src.modules.auth.email_service.logger") as mock_logger,
+            ):
+                mock_settings.SMTP_RETRY_MAX_ATTEMPTS = 3
+                mock_settings.LOG_INCLUDE_DEV_OTPS = False
+                mock_settings.SMTP_FROM_NAME = "QlockCare"
+                mock_settings.SMTP_FROM_EMAIL = "noreply@qlockcare.local"
+                mock_scope.return_value = _null_scope()
+                provider.send.reset_mock()
+                mock_logger.warning.reset_mock()
+                mock_logger.error.reset_mock()
+
+                await _send_in_background(
+                    recipient_user_id=MagicMock(),
+                    message=_make_msg(),
+                    dev_otp_for_test_only=None,
+                    kind=kind,
+                )
+
+            provider.send.assert_called_once()
+            smtp_disabled_calls = [
+                call for call in mock_logger.warning.call_args_list
+                if call.args and f"{kind}_smtp_disabled" in str(call.args[0])
+            ]
+            assert len(smtp_disabled_calls) == 1, f"kind={kind!r} should log once"
+            assert mock_logger.error.call_args_list == []
+
+
 __all__ = [
     "TestComputeBackoffDelay",
     "TestSendInBackgroundBackstopException",
@@ -515,4 +652,5 @@ __all__ = [
     "TestSendInBackgroundLoggingFields",
     "TestSendInBackgroundRetryFailureRecovery",
     "TestSendInBackgroundRetrySuccess",
+    "TestSendInBackgroundSmtpDisabled",
 ]

@@ -241,17 +241,20 @@ async def _bind_agency_admin(
         )
 
     # ---- New-user branch (2 or 3) ----
-    if payload.email is None or payload.full_name is None:
-        # Schema validator allows None on the new-user fields when
-        # existing_user_id is set; if we're here, the caller asked
-        # for a new user without giving an email/name.
-        raise ValidationError(
-            message="`email` and `full_name` are required when creating a new admin.",
-        )
+    # `AgencyAdminInviteRequest`'s model_validator has already enforced
+    # that `email` and `full_name` are set on the new-user branch (and
+    # are None on the existing-user branch). We use a local narrowing
+    # helper so the code below reads the non-Optional values without
+    # scattering `assert` / `if` checks.
+    assert payload.email is not None and payload.full_name is not None, (
+        "schema validator should have rejected this"
+    )
+    new_user_email: str = payload.email
+    new_user_full_name: str = payload.full_name
 
     # Check the user isn't already an AGENCY_ADMIN at this agency.
     existing_user = (
-        await session.execute(select(User).where(User.email == payload.email))
+        await session.execute(select(User).where(User.email == new_user_email))
     ).scalar_one_or_none()
 
     if existing_user is not None and payload.password is None and existing_user.status == UserStatus.ACTIVE:
@@ -279,15 +282,14 @@ async def _bind_agency_admin(
             # password, mark them ACTIVE so they can log in immediately.
             existing_user.password_hash = hash_password(payload.password)
             existing_user.status = UserStatus.ACTIVE
-            if payload.full_name is not None:
-                existing_user.full_name = payload.full_name
+            existing_user.full_name = new_user_full_name
             if payload.phone is not None:
                 existing_user.phone = payload.phone
             user = existing_user
         else:
             user = User(
-                email=payload.email,
-                full_name=payload.full_name,
+                email=new_user_email,
+                full_name=new_user_full_name,
                 phone=payload.phone,
                 status=UserStatus.ACTIVE,
                 password_hash=hash_password(payload.password),
@@ -329,8 +331,8 @@ async def _bind_agency_admin(
     # ---- Branch 3: INVITED (no password) ----
     if existing_user is None:
         user = User(
-            email=payload.email,
-            full_name=payload.full_name,
+            email=new_user_email,
+            full_name=new_user_full_name,
             phone=payload.phone,
             status=UserStatus.INVITED,
             must_change_password=True,
@@ -340,19 +342,45 @@ async def _bind_agency_admin(
     else:
         user = existing_user
         # If the existing user already has a password hash, the
-        # INVITED path doesn't make sense — they're not new. Reject.
+        # INVITED path doesn't make sense — they're not new. Reject
+        # with a message that explains the actual state so the
+        # SUPER_ADMIN can decide between re-inviting (force a fresh
+        # password via Branch 2) or promoting-as-link-only (Branch 1).
         if user.password_hash is not None:
+            if user.status == UserStatus.ACTIVE:
+                # Already activated — no invitation email to send,
+                # no new password to write. The SUPER_ADMIN's only
+                # valid path forward is `existing_user_id` (promote
+                # the active user to AGENCY_ADMIN at this agency).
+                raise ConflictError(
+                    message=(
+                        f"A user with email '{user.email}' already "
+                        f"exists and is ACTIVE. They cannot be "
+                        f"re-invited. Use the `existing_user_id` "
+                        f"branch to grant them AGENCY_ADMIN at this "
+                        f"agency, or send a fresh invitation to a "
+                        f"different email."
+                    ),
+                    details={
+                        "email": user.email,
+                        "user_id": str(user.id),
+                        "status": user.status.value,
+                    },
+                )
+            # INVITED / EMAIL_VERIFICATION_PENDING with a password
+            # set is an unusual state, but it can happen (e.g. user
+            # set a password but never finished email verification).
+            # Still reject, but with a different hint.
             raise ConflictError(
                 message=(
-                    "A user with this email already exists and has a "
-                    "password set. Provide `password` to set them "
+                    "A user with this email already exists and has "
+                    "a password set. Provide `password` to set them "
                     "ACTIVE, or `existing_user_id` to promote them."
                 ),
                 details={"email": user.email},
             )
-        # Update display fields if supplied.
-        if payload.full_name is not None:
-            user.full_name = payload.full_name
+        # Update display fields.
+        user.full_name = new_user_full_name
         if payload.phone is not None:
             user.phone = payload.phone
         user.status = UserStatus.INVITED
@@ -461,19 +489,20 @@ async def create_agency(
     session: AsyncSession,
     *,
     payload: AgencyCreateRequest,
-) -> tuple[Agency, "AgencyAdminBindResult | None"]:
-    """Insert one new agency + (optionally) attach programs and an admin.
+) -> tuple[Agency, AgencyAdminBindResult]:
+    """Insert one new agency + attach programs + bind an AGENCY_ADMIN.
 
     `status` starts at ACTIVE per the checklist (4.2.1).
     `initial_program_codes` is best-effort: unknown codes surface as
     422 from the schema layer before we reach here.
 
-    When `payload.admin` is set, an `AGENCY_ADMIN` user is bound to the
-    new agency in the **same session / transaction**. If any step
-    raises, the agency row is rolled back too — no orphan agencies.
+    `payload.admin` is **required** (see `AgencyCreateRequest`).
+    The `AGENCY_ADMIN` user is bound to the new agency in the **same
+    session / transaction**. If any step raises, the agency row is
+    rolled back too — no orphan agencies.
 
-    Returns `(agency, admin_bind_result)` where `admin_bind_result` is
-    `None` when the caller didn't supply an admin block.
+    Returns `(agency, admin_bind_result)`. `admin_bind_result` is
+    always populated because `payload.admin` is required.
     """
     package = _subscription_package(payload.subscription_plan)
     now = datetime.now(UTC)
@@ -512,13 +541,13 @@ async def create_agency(
             )
         await session.flush()
 
-    admin_bind_result: AgencyAdminBindResult | None = None
-    if payload.admin is not None:
-        admin_bind_result = await _bind_agency_admin(
-            session,
-            agency_id=agency.id,
-            payload=payload.admin,
-        )
+    # `payload.admin` is required at the schema layer; the
+    # `admin_bind_result` is always populated on the success path.
+    admin_bind_result = await _bind_agency_admin(
+        session,
+        agency_id=agency.id,
+        payload=payload.admin,
+    )
 
     return agency, admin_bind_result
 

@@ -22,7 +22,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from src.shared.domain.enums import AgencyStatus, AgencySubscriptionPlan, ProgramType
 from src.shared.schemas.pagination import PaginatedResponse
@@ -32,25 +32,45 @@ from src.shared.schemas.pagination import PaginatedResponse
 # Admin invite (atomic agency creation)
 # --------------------------------------------------------------------------
 class AgencyAdminInviteRequest(BaseModel):
-    """Optional admin payload to bind an `AGENCY_ADMIN` to a new or
-    existing agency in the same transaction.
+    """Admin payload to bind an `AGENCY_ADMIN` to a new or existing
+    agency in the same transaction.
 
-    Three branches:
-      * `existing_user_id` set   — promote an existing user; no
-        password reset, no email.
-      * `password` provided     — create the user ACTIVE and login-ready.
-      * Neither                 — create the user INVITED; an
-        invitation email is scheduled and a plaintext token is returned
-        so the SPA can deep-link the recipient into
-        `/accept-invitation?token=…`.
+    Two mutually exclusive branches:
+
+      * **Promote existing user** (`existing_user_id` set) — grant the
+        AGENCY_ADMIN role to a user already in the system. No
+        password reset, no email. `email` / `full_name` must be
+        omitted in this branch.
+
+      * **Create new user** (`existing_user_id` unset) — `email` and
+        `full_name` are **required**. `password` is optional:
+          - provided (≥12 chars, policy-compliant) → user is created
+            `ACTIVE`, login-ready; no email is sent.
+          - omitted → user is created `INVITED` and an invitation
+            email is scheduled carrying a 6-digit OTP and a deep
+            link to `/accept-invitation?email=…`.
 
     Email is CITEXT-unique across the `users` table; colliding on an
     existing email surfaces as `409 DUPLICATE_RESOURCE` and the whole
     agency creation rolls back.
     """
 
-    email: EmailStr | None = Field(default=None)
-    full_name: str | None = Field(default=None, min_length=1, max_length=255)
+    email: EmailStr | None = Field(
+        default=None,
+        description=(
+            "Email of the new admin. Required when `existing_user_id` "
+            "is unset (new-user branch); must be omitted otherwise."
+        ),
+    )
+    full_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        description=(
+            "Display name of the new admin. Required when "
+            "`existing_user_id` is unset; must be omitted otherwise."
+        ),
+    )
     phone: str | None = None
     password: str | None = Field(
         default=None,
@@ -68,9 +88,39 @@ class AgencyAdminInviteRequest(BaseModel):
         description=(
             "If set, do not create a new user — just grant the existing "
             "user the AGENCY_ADMIN role at this agency. Incompatible "
-            "with `email` / `password` (they're for the new-user branch)."
+            "with `email` / `password` / `full_name`."
         ),
     )
+
+    @model_validator(mode="after")
+    def _branch_invariants(self) -> "AgencyAdminInviteRequest":
+        """Enforce the discriminator rules between the two branches."""
+        promoting = self.existing_user_id is not None
+        if promoting:
+            # Promote-existing branch — new-user fields must be empty.
+            if self.email is not None:
+                raise ValueError(
+                    "`email` must be omitted when `existing_user_id` is set."
+                )
+            if self.full_name is not None:
+                raise ValueError(
+                    "`full_name` must be omitted when `existing_user_id` is set."
+                )
+            if self.password is not None:
+                raise ValueError(
+                    "`password` must be omitted when `existing_user_id` is set."
+                )
+        else:
+            # New-user branch — email + full_name are required.
+            if not self.email:
+                raise ValueError(
+                    "`email` is required when creating a new admin."
+                )
+            if not self.full_name:
+                raise ValueError(
+                    "`full_name` is required when creating a new admin."
+                )
+        return self
 
     @field_validator("full_name")
     @classmethod
@@ -89,13 +139,11 @@ class AgencyAdminInviteRequest(BaseModel):
 class AgencyCreateRequest(BaseModel):
     """Body for POST /agencies.
 
-    `name` is required; everything else defaults to the seed values.
-
-    `admin` is optional. When supplied, the agency is created together
+    `name` and `admin` are required. The agency is created together
     with an `AGENCY_ADMIN` user bound to it in a single transaction —
-    no orphan-agency state is possible. When omitted, the agency is
-    created without an admin (legacy behaviour; use
-    `POST /agencies/{id}/admins` to attach one later).
+    no orphan-agency state is possible. To attach an additional admin
+    after the fact (or to remediate a pre-existing orphan from before
+    this schema change), use `POST /agencies/{id}/admins`.
     """
 
     name: str = Field(min_length=1, max_length=255)
@@ -114,12 +162,13 @@ class AgencyCreateRequest(BaseModel):
             "(e.g. ['PCA', 'ARMHS']). Unknown codes return 422."
         ),
     )
-    admin: AgencyAdminInviteRequest | None = Field(
-        default=None,
+    admin: AgencyAdminInviteRequest = Field(
         description=(
-            "Optional AGENCY_ADMIN to bind to this agency in the same "
-            "transaction. See `AgencyAdminInviteRequest` for the three "
-            "branches (new user / invited / existing user)."
+            "Required AGENCY_ADMIN to bind to this agency in the same "
+            "transaction. The invariant is that every agency must have "
+            "at least one `AGENCY_ADMIN`; orphaned agencies are not "
+            "allowed. See `AgencyAdminInviteRequest` for the two "
+            "branches (promote existing user / create new user)."
         ),
     )
 

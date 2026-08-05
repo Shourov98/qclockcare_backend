@@ -119,12 +119,13 @@ async def create_agency_endpoint(
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> AgencyResponse:
-    """Create a new agency (and optionally attach programs and an admin).
+    """Create a new agency together with a bound AGENCY_ADMIN.
 
-    When `payload.admin` is set, the agency is created **together** with
-    an `AGENCY_ADMIN` user bound to it in a single transaction. If the
-    admin branch raises (e.g. duplicate email), the agency row is
-    rolled back too — no orphan agencies are possible.
+    The `admin` block is required (see `AgencyCreateRequest`). The
+    agency row and the `AGENCY_ADMIN` user are inserted in a single
+    transaction. If the admin branch raises (e.g. duplicate email),
+    the agency row is rolled back too — no orphan agencies are
+    possible.
     """
     agency, admin_bind_result = await agencies_service.create_agency(
         session, payload=payload
@@ -148,26 +149,27 @@ async def create_agency_endpoint(
                 "subscription_price_cents": agency.subscription_price_cents,
                 "subscription_billing_cycle": agency.subscription_billing_cycle,
                 "initial_program_codes": payload.initial_program_codes,
-                "admin_bound": admin_bind_result is not None,
+                "admin_bound": True,
             },
             ip_address=ip,
             user_agent=ua,
         )
-        if admin_bind_result is not None:
-            await audit_logs_service.audit_log(
-                session,
-                agency_id=agency.id,
-                actor_user_id=ctx.user_id,
-                action=AuditAction.CREATE,
-                entity_type="AGENCY_ADMIN",
-                entity_id=admin_bind_result.user_id,
-                new_data={
-                    "email": admin_bind_result.email,
-                    "status": admin_bind_result.status.value,
-                },
-                ip_address=ip,
-                user_agent=ua,
-            )
+        # `admin` is required at the schema layer, so
+        # `admin_bind_result` is always populated on the success path.
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency.id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.CREATE,
+            entity_type="AGENCY_ADMIN",
+            entity_id=admin_bind_result.user_id,
+            new_data={
+                "email": admin_bind_result.email,
+                "status": admin_bind_result.status.value,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
     except Exception as exc:
         log.warning(
             "agencies.create_audit_failed",
@@ -175,8 +177,11 @@ async def create_agency_endpoint(
         )
 
     # Schedule the invitation email AFTER commit (deferred network
-    # call, same pattern as staff/router.py:228-235).
-    if admin_bind_result is not None and admin_bind_result.invitation_otp is not None:
+    # call, same pattern as staff/router.py:228-235). `admin` is
+    # required at the schema layer, so `admin_bind_result` is always
+    # present; the `invitation_otp` is only set on the INVITED branch
+    # (ACTIVE / existing-user paths skip the email).
+    if admin_bind_result.invitation_otp is not None:
         auth_email.send_invitation_email(
             background_tasks,
             to_email=admin_bind_result.email,

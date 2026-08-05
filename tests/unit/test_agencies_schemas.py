@@ -1,8 +1,10 @@
 """Unit tests for agencies schemas — validation + ORM shape.
 
 Covers:
-  - AgencyCreateRequest: required fields, whitespace stripping,
-    program code validation + dedup.
+  - AgencyCreateRequest: required fields (incl. `admin`), whitespace
+    stripping, program code validation + dedup.
+  - AgencyAdminInviteRequest: discriminator between promote-existing
+    and create-new-user branches.
   - AgencyUpdateRequest: all fields optional, status enum membership.
   - AgencyResponse: ORM round-trip.
   - AgencyListResponse: pagination envelope.
@@ -24,6 +26,7 @@ from pydantic import ValidationError
 from src.modules.agencies import models as _agencies_models  # noqa: F401
 from src.modules.agencies.models import Agency
 from src.modules.agencies.schemas import (
+    AgencyAdminInviteRequest,
     AgencyCreateRequest,
     AgencyListResponse,
     AgencyProgramListResponse,
@@ -68,12 +71,35 @@ def _make_agency(**overrides: object) -> Agency:
     return Agency(**defaults)
 
 
+def _invite_admin(
+    *,
+    email: str | None = "owner@acme.example.com",
+    full_name: str | None = "Acme Owner",
+    password: str | None = None,
+    existing_user_id: uuid.UUID | None = None,
+) -> AgencyAdminInviteRequest:
+    """Build the `admin` block — required on AgencyCreateRequest.
+
+    Defaults to the new-user INVITED branch (no password). Pass
+    `existing_user_id` to use the promote-existing branch.
+    """
+    return AgencyAdminInviteRequest(
+        email=email,
+        full_name=full_name,
+        password=password,
+        existing_user_id=existing_user_id,
+    )
+
+
 # --------------------------------------------------------------------------
 # AgencyCreateRequest
 # --------------------------------------------------------------------------
 class TestAgencyCreateRequest:
     def test_minimal_valid(self) -> None:
-        r = AgencyCreateRequest(name="Acme Home Care")
+        r = AgencyCreateRequest(
+            name="Acme Home Care",
+            admin=_invite_admin(),
+        )
         assert r.name == "Acme Home Care"
         assert r.timezone == "America/Chicago"
         assert r.subscription_plan == AgencySubscriptionPlan.BASIC
@@ -81,6 +107,9 @@ class TestAgencyCreateRequest:
         assert r.trial_days == 14
         assert r.settings == {}
         assert r.initial_program_codes == []
+        # admin block carried through verbatim
+        assert r.admin.email == "owner@acme.example.com"
+        assert r.admin.existing_user_id is None
 
     def test_full_valid(self) -> None:
         r = AgencyCreateRequest(
@@ -91,6 +120,7 @@ class TestAgencyCreateRequest:
             trial_days=30,
             settings={"branding": {"primary": "#FF0000"}},
             initial_program_codes=["PCA", "ARMHS"],
+            admin=_invite_admin(),
         )
         assert r.timezone == "America/New_York"
         assert r.subscription_plan == AgencySubscriptionPlan.PROFESSIONAL
@@ -99,23 +129,50 @@ class TestAgencyCreateRequest:
         assert r.settings == {"branding": {"primary": "#FF0000"}}
         assert r.initial_program_codes == ["PCA", "ARMHS"]
 
+    def test_admin_required(self) -> None:
+        # Every agency must have a bound AGENCY_ADMIN; orphans are
+        # not allowed at the schema layer.
+        with pytest.raises(ValidationError) as exc:
+            AgencyCreateRequest(name="Acme")
+        assert "admin" in str(exc.value).lower()
+
+    def test_admin_block_supports_promote_existing_branch(self) -> None:
+        # When `existing_user_id` is set the new-user fields must
+        # be omitted — that's how we add an orphan-remediation admin
+        # without minting a new row.
+        existing = uuid.uuid4()
+        r = AgencyCreateRequest(
+            name="Acme",
+            admin=_invite_admin(
+                email=None,
+                full_name=None,
+                password=None,
+                existing_user_id=existing,
+            ),
+        )
+        assert r.admin.existing_user_id == existing
+        assert r.admin.email is None
+        assert r.admin.full_name is None
+        assert r.admin.password is None
+
     def test_blank_name_rejected(self) -> None:
         with pytest.raises(ValidationError):
-            AgencyCreateRequest(name="   ")
+            AgencyCreateRequest(name="   ", admin=_invite_admin())
 
     def test_blank_timezone_rejected(self) -> None:
         with pytest.raises(ValidationError):
-            AgencyCreateRequest(name="Acme", timezone="   ")
+            AgencyCreateRequest(name="Acme", timezone="   ", admin=_invite_admin())
 
     def test_name_too_long_rejected(self) -> None:
         with pytest.raises(ValidationError):
-            AgencyCreateRequest(name="x" * 256)
+            AgencyCreateRequest(name="x" * 256, admin=_invite_admin())
 
     def test_unknown_program_code_rejected(self) -> None:
         with pytest.raises(ValidationError) as exc:
             AgencyCreateRequest(
                 name="Acme",
                 initial_program_codes=["PCA", "NOT_A_REAL_CODE"],
+                admin=_invite_admin(),
             )
         # Error message lists the unknown codes
         assert "NOT_A_REAL_CODE" in str(exc.value)
@@ -124,16 +181,91 @@ class TestAgencyCreateRequest:
         r = AgencyCreateRequest(
             name="Acme",
             initial_program_codes=["PCA", "ARMHS", "PCA"],
+            admin=_invite_admin(),
         )
         assert r.initial_program_codes == ["PCA", "ARMHS"]
 
     def test_empty_program_codes_allowed(self) -> None:
-        r = AgencyCreateRequest(name="Acme", initial_program_codes=[])
+        r = AgencyCreateRequest(name="Acme", initial_program_codes=[], admin=_invite_admin())
         assert r.initial_program_codes == []
 
     def test_trial_days_range_validated(self) -> None:
         with pytest.raises(ValidationError):
-            AgencyCreateRequest(name="Acme", start_trial=True, trial_days=0)
+            AgencyCreateRequest(name="Acme", start_trial=True, trial_days=0, admin=_invite_admin())
+
+
+# --------------------------------------------------------------------------
+# AgencyAdminInviteRequest — discriminator
+# --------------------------------------------------------------------------
+class TestAgencyAdminInviteRequest:
+    """Two mutually exclusive branches on `existing_user_id`."""
+
+    def test_new_user_branch_email_and_full_name_required(self) -> None:
+        # New-user branch — email / full_name are mandatory.
+        with pytest.raises(ValidationError) as exc:
+            AgencyAdminInviteRequest(email=None, full_name="Owner")
+        assert "email" in str(exc.value).lower()
+
+        with pytest.raises(ValidationError) as exc:
+            AgencyAdminInviteRequest(email="owner@acme.example.com", full_name=None)
+        assert "full_name" in str(exc.value).lower()
+
+    def test_new_user_branch_whitespace_full_name_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            AgencyAdminInviteRequest(email="owner@acme.example.com", full_name="   ")
+
+    def test_new_user_branch_default_password_omitted_is_invited(self) -> None:
+        # No password → user is created INVITED, email carries OTP.
+        r = AgencyAdminInviteRequest(email="owner@acme.example.com", full_name="Acme Owner")
+        assert r.password is None
+        assert r.existing_user_id is None
+
+    def test_new_user_branch_with_policy_compliant_password_is_active(self) -> None:
+        r = AgencyAdminInviteRequest(
+            email="owner@acme.example.com",
+            full_name="Acme Owner",
+            password="LinkedAdminPass123!",
+        )
+        assert r.password == "LinkedAdminPass123!"
+
+    def test_new_user_branch_short_password_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            AgencyAdminInviteRequest(
+                email="owner@acme.example.com",
+                full_name="Acme Owner",
+                password="short",
+            )
+
+    def test_promote_existing_branch_email_must_be_omitted(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            AgencyAdminInviteRequest(
+                email="owner@acme.example.com",
+                existing_user_id=uuid.uuid4(),
+            )
+        assert "email" in str(exc.value).lower()
+
+    def test_promote_existing_branch_full_name_must_be_omitted(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            AgencyAdminInviteRequest(
+                full_name="Owner Name",
+                existing_user_id=uuid.uuid4(),
+            )
+        assert "full_name" in str(exc.value).lower()
+
+    def test_promote_existing_branch_password_must_be_omitted(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            AgencyAdminInviteRequest(
+                password="LinkedAdminPass123!",
+                existing_user_id=uuid.uuid4(),
+            )
+        assert "password" in str(exc.value).lower()
+
+    def test_promote_existing_branch_minimal_valid(self) -> None:
+        r = AgencyAdminInviteRequest(existing_user_id=uuid.uuid4())
+        assert r.existing_user_id is not None
+        assert r.email is None
+        assert r.full_name is None
+        assert r.password is None
 
 
 # --------------------------------------------------------------------------

@@ -266,6 +266,18 @@ async def _send_in_background(
             # `success=False` instead of raising (this is the
             # contract every provider follows).
             last_error = result.error or "unknown error"
+            # "SMTP disabled" is a configuration state, not a
+            # transient delivery failure. Retrying it 3× just wastes
+            # ~7s of wall time and floods the log with three copies
+            # of the same error. Bail out after the first attempt
+            # with one warning.
+            if last_error.startswith("SMTP disabled"):
+                logger.warning(
+                    f"auth.email.{kind}_smtp_disabled",
+                    to=recipient,
+                    error=last_error,
+                )
+                return
         except Exception as exc:
             # Backstop: `EmailProvider.send` is contractually not
             # supposed to raise, but if it ever does (a future bug,
