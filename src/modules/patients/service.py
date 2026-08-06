@@ -81,9 +81,16 @@ async def _get_guardian_or_404(
     guardian_id: uuid.UUID,
     agency_id: uuid.UUID,
 ) -> GuardianProfile:
-    stmt = select(GuardianProfile).where(
-        GuardianProfile.id == guardian_id,
-        GuardianProfile.agency_id == agency_id,
+    # Always selectinload the User row — the GuardianProfileResponse
+    # joins `full_name` / `email` / `phone` from it. Lazy-loading from
+    # inside an awaited Pydantic serializer would race.
+    stmt = (
+        select(GuardianProfile)
+        .where(
+            GuardianProfile.id == guardian_id,
+            GuardianProfile.agency_id == agency_id,
+        )
+        .options(selectinload(GuardianProfile.user))
     )
     g = (await session.execute(stmt)).scalar_one_or_none()
     if g is None:
@@ -262,8 +269,13 @@ async def get_patient(
     agency_id: uuid.UUID,
     with_relationships: bool = False,
 ) -> PatientProfile:
-    stmt = select(PatientProfile).where(
-        PatientProfile.id == patient_id, PatientProfile.agency_id == agency_id
+    # Always selectinload the User row — the response shapes join
+    # `full_name` / `email` / `phone` from it. Lazy-loading from inside
+    # an awaited Pydantic serializer would race.
+    stmt = (
+        select(PatientProfile)
+        .where(PatientProfile.id == patient_id, PatientProfile.agency_id == agency_id)
+        .options(selectinload(PatientProfile.user))
     )
     if with_relationships:
         stmt = stmt.options(selectinload(PatientProfile.guardian_links))
@@ -297,7 +309,8 @@ async def list_patients(
         count_base = count_base.where(PatientProfile.status == status_filter)
 
     base = (
-        base.order_by(PatientProfile.created_at.desc(), PatientProfile.id)
+        base.options(selectinload(PatientProfile.user))
+        .order_by(PatientProfile.created_at.desc(), PatientProfile.id)
         .limit(page_size)
         .offset((page - 1) * page_size)
     )
@@ -511,6 +524,7 @@ async def list_guardians(
     base = (
         select(GuardianProfile)
         .where(GuardianProfile.agency_id == agency_id)
+        .options(selectinload(GuardianProfile.user))
         .order_by(GuardianProfile.created_at.desc(), GuardianProfile.id)
         .limit(page_size)
         .offset((page - 1) * page_size)

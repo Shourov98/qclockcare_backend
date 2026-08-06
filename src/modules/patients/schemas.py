@@ -171,6 +171,9 @@ class PatientProfileResponse(BaseModel):
                     "id": "4d3c2b1a-0e9f-8d7c-6b5a-4f3e2d1c0b9a",
                     "agency_id": "8a3f12d0-7b5e-4a23-9c8e-1b2c3d4e5f6a",
                     "user_id": "5f3a7b1c-1d0a-4a23-9c8e-1b2c3d4e5f6a",
+                    "full_name": "Maria Alvarez",
+                    "email": "maria.alvarez@qlockcare-demo.com",
+                    "phone": "+1-612-555-0177",
                     "patient_code": "PT-1024",
                     "status": "ACTIVE",
                     "date_of_birth": "1948-03-14",
@@ -190,6 +193,22 @@ class PatientProfileResponse(BaseModel):
     agency_id: UUID = Field(description="Owning agency UUID.")
     user_id: UUID = Field(
         description="Underlying user account UUID (link to `/auth/me`).",
+    )
+    # Joined from the underlying User row (`PatientProfile.user`). All
+    # three are nullable on the response side because a soft-deleted or
+    # partially-populated user could leave them unset — we'd rather
+    # surface a null than 500.
+    full_name: str | None = Field(
+        default=None,
+        description="Joined from the underlying User row. `null` if unset.",
+    )
+    email: EmailStr | None = Field(
+        default=None,
+        description="Joined from the underlying User row.",
+    )
+    phone: str | None = Field(
+        default=None,
+        description="Joined from the underlying User row. E.164 preferred.",
     )
     patient_code: str = Field(description="Agency-scoped identifier.")
     status: UserStatus = Field(description="Lifecycle status.")
@@ -222,6 +241,9 @@ class PatientProfileSummaryResponse(BaseModel):
                     "id": "4d3c2b1a-0e9f-8d7c-6b5a-4f3e2d1c0b9a",
                     "agency_id": "8a3f12d0-7b5e-4a23-9c8e-1b2c3d4e5f6a",
                     "user_id": "5f3a7b1c-1d0a-4a23-9c8e-1b2c3d4e5f6a",
+                    "full_name": "Maria Alvarez",
+                    "email": "maria.alvarez@qlockcare-demo.com",
+                    "phone": "+1-612-555-0177",
                     "patient_code": "PT-1024",
                     "status": "ACTIVE",
                     "date_of_birth": "1948-03-14",
@@ -237,6 +259,18 @@ class PatientProfileSummaryResponse(BaseModel):
     id: UUID = Field(description="Patient profile UUID.")
     agency_id: UUID = Field(description="Owning agency UUID.")
     user_id: UUID = Field(description="Underlying user account UUID.")
+    full_name: str | None = Field(
+        default=None,
+        description="Joined from the underlying User row.",
+    )
+    email: EmailStr | None = Field(
+        default=None,
+        description="Joined from the underlying User row.",
+    )
+    phone: str | None = Field(
+        default=None,
+        description="Joined from the underlying User row. E.164 preferred.",
+    )
     patient_code: str = Field(description="Agency-scoped identifier.")
     status: UserStatus = Field(description="Lifecycle status.")
     date_of_birth: date | None = Field(description="Calendar date of birth, or null.")
@@ -337,6 +371,9 @@ class GuardianProfileResponse(BaseModel):
                     "id": "9e8d7c6b-5a4f-3e2d-1c0b-9a8f7e6d5c4b",
                     "agency_id": "8a3f12d0-7b5e-4a23-9c8e-1b2c3d4e5f6a",
                     "user_id": "5f3a7b1c-1d0a-4a23-9c8e-1b2c3d4e5f6a",
+                    "full_name": "Rosa Santos",
+                    "email": "rosa.santos@example.com",
+                    "phone": "+1-612-555-0199",
                     "status": "ACTIVE",
                     "contact_phone": "+1-612-555-0177",
                     "contact_email": "rosa.santos@example.com",
@@ -351,6 +388,22 @@ class GuardianProfileResponse(BaseModel):
     id: UUID = Field(description="Guardian profile UUID.")
     agency_id: UUID = Field(description="Owning agency UUID.")
     user_id: UUID = Field(description="Underlying user account UUID.")
+    # Joined from the underlying User row (`GuardianProfile.user`).
+    # `contact_email` / `contact_phone` (below) are guardian-specific
+    # outreach fields distinct from the user account's `email` /
+    # `phone`; both pairs are returned and may legitimately differ.
+    full_name: str | None = Field(
+        default=None,
+        description="Joined from the underlying User row.",
+    )
+    email: EmailStr | None = Field(
+        default=None,
+        description="Joined from the underlying User row (account email).",
+    )
+    phone: str | None = Field(
+        default=None,
+        description="Joined from the underlying User row (account phone).",
+    )
     status: UserStatus = Field(description="Lifecycle status.")
     contact_phone: str | None = Field(description="Outreach phone, or null.")
     contact_email: str | None = Field(description="Outreach email, or null.")

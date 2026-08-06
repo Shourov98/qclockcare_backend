@@ -101,15 +101,24 @@ def _ensure_can_view_guardian(ctx: CurrentAuth, guardian_user_id: uuid.UUID) -> 
     raise CrossAgencyAccessDeniedError()
 
 
-def _to_patient_response(
-    patient: object,
-    *,
-    with_relationships: bool = False,
-) -> PatientProfileResponse:
-    data: dict = {
+def _patient_to_dict(patient: object) -> dict[str, object]:
+    """Build a flat dict from a PatientProfile ORM row.
+
+    Reads the joined user fields eagerly (`full_name` / `email` /
+    `phone`) — `PatientProfile.user` is selectinloaded by
+    `list_patients` / `get_patient` so this never triggers a lazy load
+    inside an awaited serializer. Used by both `_to_patient_response`
+    (detail path) and the list endpoint (summary path) so the user
+    fields are populated consistently.
+    """
+    user = getattr(patient, "user", None)
+    return {
         "id": patient.id,
         "agency_id": patient.agency_id,
         "user_id": patient.user_id,
+        "full_name": getattr(user, "full_name", None) if user is not None else None,
+        "email": getattr(user, "email", None) if user is not None else None,
+        "phone": getattr(user, "phone", None) if user is not None else None,
         "patient_code": patient.patient_code,
         "status": patient.status,
         "date_of_birth": patient.date_of_birth,
@@ -121,6 +130,40 @@ def _to_patient_response(
         "created_at": patient.created_at,
         "updated_at": patient.updated_at,
     }
+
+
+def _guardian_to_dict(guardian: object) -> dict[str, object]:
+    """Build a flat dict from a GuardianProfile ORM row.
+
+    Mirrors `_patient_to_dict` — reads the joined user fields
+    (`full_name` / `email` / `phone`) eagerly. Guardian-specific
+    `contact_email` / `contact_phone` / `notes` come from the
+    GuardianProfile row directly and may legitimately differ from
+    the user account's `email` / `phone`.
+    """
+    user = getattr(guardian, "user", None)
+    return {
+        "id": guardian.id,
+        "agency_id": guardian.agency_id,
+        "user_id": guardian.user_id,
+        "full_name": getattr(user, "full_name", None) if user is not None else None,
+        "email": getattr(user, "email", None) if user is not None else None,
+        "phone": getattr(user, "phone", None) if user is not None else None,
+        "status": guardian.status,
+        "contact_phone": guardian.contact_phone,
+        "contact_email": guardian.contact_email,
+        "notes": guardian.notes,
+        "created_at": guardian.created_at,
+        "updated_at": guardian.updated_at,
+    }
+
+
+def _to_patient_response(
+    patient: object,
+    *,
+    with_relationships: bool = False,
+) -> PatientProfileResponse:
+    data: dict = _patient_to_dict(patient)
     if with_relationships:
         try:
             data["guardian_links"] = list(patient.guardian_links)
@@ -129,6 +172,10 @@ def _to_patient_response(
     else:
         data["guardian_links"] = None
     return PatientProfileResponse.model_validate(data)
+
+
+def _to_guardian_response(guardian: object) -> GuardianProfileResponse:
+    return GuardianProfileResponse.model_validate(_guardian_to_dict(guardian))
 
 
 # --------------------------------------------------------------------------
@@ -166,7 +213,9 @@ async def create_patient_endpoint(
         admitted_by_user_id=ctx.user_id,
     )
     await session.commit()
-    await session.refresh(result.profile)
+    # Refresh + eagerly load the user row so the response can read
+    # `full_name` / `email` / `phone` without triggering a lazy load.
+    await session.refresh(result.profile, attribute_names=["user"])
     # Best-effort audit log.
     with contextlib.suppress(Exception):
         ip, ua = audit_logs_service.request_ip_ua(request)
@@ -225,7 +274,13 @@ async def list_patients_endpoint(
         page=page,
         page_size=page_size,
     )
-    data = [PatientProfileSummaryResponse.model_validate(r) for r in rows]
+    # Build dicts explicitly so the joined user fields
+    # (`full_name`, `email`, `phone`) — which live on the User row,
+    # not on the PatientProfile column — are populated reliably.
+    data = [
+        PatientProfileSummaryResponse.model_validate(_patient_to_dict(r))
+        for r in rows
+    ]
     return build_offset_response(data, total=total, page=page, page_size=page_size)
 
 
@@ -305,7 +360,7 @@ async def update_patient_endpoint(
         session, patient_id=patient_id, agency_id=agency_id, payload=payload
     )
     await session.commit()
-    await session.refresh(patient)
+    await session.refresh(patient, attribute_names=["user"])
     # Best-effort audit log.
     try:
         ip, ua = audit_logs_service.request_ip_ua(request)
@@ -353,7 +408,7 @@ async def archive_patient_endpoint(
         session, patient_id=patient_id, agency_id=agency_id
     )
     await session.commit()
-    await session.refresh(patient)
+    await session.refresh(patient, attribute_names=["user"])
     # Best-effort audit log.
     try:
         ip, ua = audit_logs_service.request_ip_ua(request)
@@ -507,7 +562,7 @@ async def create_guardian_endpoint(
         invited_by_user_id=ctx.user_id,
     )
     await session.commit()
-    await session.refresh(result.profile)
+    await session.refresh(result.profile, attribute_names=["user"])
     # Best-effort audit log.
     with contextlib.suppress(Exception):
         ip, ua = audit_logs_service.request_ip_ua(request)
@@ -532,7 +587,7 @@ async def create_guardian_endpoint(
         expires_in_minutes=settings.OTP_EXPIRY_MINUTES,
         recipient_user_id=result.user_id,
     )
-    return GuardianProfileResponse.model_validate(result.profile)
+    return _to_guardian_response(result.profile)
 
 
 @router.get(
@@ -557,7 +612,13 @@ async def list_guardians_endpoint(
     rows, total = await patients_service.list_guardians(
         session, agency_id=agency_id, page=page, page_size=page_size
     )
-    data = [GuardianProfileResponse.model_validate(r) for r in rows]
+    # Build dicts explicitly so the joined user fields
+    # (`full_name`, `email`, `phone`) — which live on the User row,
+    # not on the GuardianProfile column — are populated reliably.
+    data = [
+        GuardianProfileResponse.model_validate(_guardian_to_dict(r))
+        for r in rows
+    ]
     return build_offset_response(data, total=total, page=page, page_size=page_size)
 
 
@@ -582,7 +643,7 @@ async def get_guardian_endpoint(
         session, guardian_id=guardian_id, agency_id=agency_id
     )
     _ensure_can_view_guardian(ctx, guardian.user_id)
-    return GuardianProfileResponse.model_validate(guardian)
+    return _to_guardian_response(guardian)
 
 
 @router.patch(
@@ -612,7 +673,7 @@ async def update_guardian_endpoint(
         session, guardian_id=guardian_id, agency_id=agency_id, payload=payload
     )
     await session.commit()
-    await session.refresh(guardian)
+    await session.refresh(guardian, attribute_names=["user"])
     # Best-effort audit log.
     try:
         ip, ua = audit_logs_service.request_ip_ua(request)
@@ -630,7 +691,7 @@ async def update_guardian_endpoint(
         await session.commit()
     except Exception:
         pass
-    return GuardianProfileResponse.model_validate(guardian)
+    return _to_guardian_response(guardian)
 
 
 @router.delete(
@@ -659,7 +720,7 @@ async def archive_guardian_endpoint(
         session, guardian_id=guardian_id, agency_id=agency_id
     )
     await session.commit()
-    await session.refresh(guardian)
+    await session.refresh(guardian, attribute_names=["user"])
     # Best-effort audit log.
     try:
         ip, ua = audit_logs_service.request_ip_ua(request)
@@ -677,7 +738,7 @@ async def archive_guardian_endpoint(
         await session.commit()
     except Exception:
         pass
-    return GuardianProfileResponse.model_validate(guardian)
+    return _to_guardian_response(guardian)
 
 
 # --------------------------------------------------------------------------
