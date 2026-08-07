@@ -47,6 +47,23 @@ def test_cors_origins_csv_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
 
 
+def test_cors_origins_strip_trailing_slashes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CORS origins match browser Origin headers exactly."""
+    from src.core import config
+
+    monkeypatch.setenv(
+        "CORS_ORIGINS",
+        "https://qlockcare-admin.vercel.app/,https://qlockcare-site.vercel.app/",
+    )
+    config.get_settings.cache_clear()
+    settings = config.get_settings()
+
+    assert settings.CORS_ORIGINS == [
+        "https://qlockcare-admin.vercel.app",
+        "https://qlockcare-site.vercel.app",
+    ]
+
+
 def test_storage_backend_defaults_to_supabase(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default storage backend is Supabase Storage (matches the common
     client deployment where the same Supabase project hosts DB + Storage)."""

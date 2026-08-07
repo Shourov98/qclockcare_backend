@@ -46,11 +46,11 @@ class Settings(BaseSettings):
     # their `.env`; production should set the full allow-list explicitly.
     CORS_ORIGINS: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: [
-            "https://qlockcare-admin.vercel.app/",
-            "https://qlockcare-site.vercel.app/",
-            "http://localhost:3000/",
-            "http://localhost:5173/",
-            "http://localhost:3001/",
+            "https://qlockcare-admin.vercel.app",
+            "https://qlockcare-site.vercel.app",
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://localhost:3001",
         ]
     )
     REQUEST_BODY_SIZE_LIMIT: str = "2mb"
@@ -250,6 +250,24 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @field_validator("CORS_ORIGINS")
+    @classmethod
+    def _normalize_cors_origins(cls, value: list[str]) -> list[str]:
+        """Normalize to browser `Origin` header format.
+
+        Browsers send origins as `scheme://host[:port]` without a trailing
+        slash. Starlette's CORS middleware does exact matching, so
+        `https://example.com/` does not match `https://example.com`.
+        """
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            origin = item.strip().rstrip("/")
+            if origin and origin not in seen:
+                normalized.append(origin)
+                seen.add(origin)
+        return normalized
 
     @field_validator("STORAGE_ALLOWED_MIME_TYPES")
     @classmethod
