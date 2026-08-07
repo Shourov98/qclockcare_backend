@@ -46,11 +46,11 @@ class Settings(BaseSettings):
     # their `.env`; production should set the full allow-list explicitly.
     CORS_ORIGINS: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: [
-            "https://qlockcare-admin.vercel.app",
-            "https://qlockcare-site.vercel.app",
-            "http://localhost:3000",
-            "http://localhost:5173",
-            "http://localhost:3001",
+            "https://qlockcare-admin.vercel.app/",
+            "https://qlockcare-site.vercel.app/",
+            "http://localhost:3000/",
+            "http://localhost:5173/",
+            "http://localhost:3001/",
         ]
     )
     REQUEST_BODY_SIZE_LIMIT: str = "2mb"
