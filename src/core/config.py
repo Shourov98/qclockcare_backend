@@ -16,6 +16,18 @@ from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
+DEPLOYED_CORS_ORIGINS = [
+    "https://qlockcare-admin.vercel.app",
+    "https://qlockcare-site.vercel.app",
+]
+
+LOCAL_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:5173",
+]
+
+
 class Settings(BaseSettings):
     """Application settings. All env-driven; immutable after construction."""
 
@@ -45,13 +57,7 @@ class Settings(BaseSettings):
     # set `CORS_ORIGINS=http://localhost:3000,http://localhost:3001` in
     # their `.env`; production should set the full allow-list explicitly.
     CORS_ORIGINS: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: [
-            "https://qlockcare-admin.vercel.app",
-            "https://qlockcare-site.vercel.app",
-            "http://localhost:3000",
-            "http://localhost:5173",
-            "http://localhost:3001",
-        ]
+        default_factory=lambda: [*DEPLOYED_CORS_ORIGINS, *LOCAL_CORS_ORIGINS]
     )
     REQUEST_BODY_SIZE_LIMIT: str = "2mb"
 
@@ -314,6 +320,25 @@ class Settings(BaseSettings):
     @property
     def is_test(self) -> bool:
         return self.APP_ENV == "test"
+
+    @property
+    def effective_cors_origins(self) -> list[str]:
+        """CORS allow-list used by the HTTP middleware.
+
+        Render deployments may already have an older `CORS_ORIGINS`
+        variable set, which overrides the defaults. Keep the known
+        production Vercel frontends allowed even when that env var is
+        stale, while preserving any explicitly configured origins.
+        """
+        merged = [*self.CORS_ORIGINS, *DEPLOYED_CORS_ORIGINS]
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in merged:
+            origin = item.strip().rstrip("/")
+            if origin and origin not in seen:
+                normalized.append(origin)
+                seen.add(origin)
+        return normalized
 
     @property
     def effective_database_url(self) -> str:

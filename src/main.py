@@ -315,18 +315,15 @@ def create_app() -> FastAPI:
     register_exception_handlers(app)
 
     # ---- CORS ----
-    if settings.CORS_ORIGINS:
+    cors_origins = settings.effective_cors_origins
+    if cors_origins:
+        logger.info("cors.enabled", origins=cors_origins)
         app.add_middleware(
             CORSMiddleware,
-            allow_origins=settings.CORS_ORIGINS,
+            allow_origins=cors_origins,
             allow_credentials=True,
             allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-            allow_headers=[
-                "Authorization",
-                "Content-Type",
-                "X-Request-ID",
-                "X-CSRF-Token",
-            ],
+            allow_headers=["*"],
             expose_headers=[
                 "X-Request-ID",
                 "X-RateLimit-Limit",
