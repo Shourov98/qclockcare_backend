@@ -40,7 +40,19 @@ class Settings(BaseSettings):
     # `NoDecode` tells pydantic-settings NOT to JSON-parse this from env —
     # we want the raw comma-separated string so the `_split_csv` validator
     # can split it.
-    CORS_ORIGINS: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # Defaults to the two production Vercel frontends so a fresh deploy
+    # doesn't ship with CORS accidentally locked down. Local dev should
+    # set `CORS_ORIGINS=http://localhost:3000,http://localhost:3001` in
+    # their `.env`; production should set the full allow-list explicitly.
+    CORS_ORIGINS: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "https://qlockcare-admin.vercel.app",
+            "https://qlockcare-site.vercel.app",
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://localhost:3001",
+        ]
+    )
     REQUEST_BODY_SIZE_LIMIT: str = "2mb"
 
     # ----- Database -----
