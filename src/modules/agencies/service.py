@@ -16,7 +16,6 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.config import settings
 from src.core.exceptions import ConflictError, NotFoundError, ValidationError
 from src.core.security import hash_password
 from src.modules.agencies.models import Agency, AgencyProgram, Program
@@ -27,7 +26,13 @@ from src.modules.agencies.schemas import (
 )
 from src.modules.identity import otp_service
 from src.modules.identity.models import User, UserRoleAssignment
-from src.shared.domain.enums import AgencyStatus, AgencySubscriptionPlan, ProgramType, UserRole, UserStatus
+from src.shared.domain.enums import (
+    AgencyStatus,
+    AgencySubscriptionPlan,
+    ProgramType,
+    UserRole,
+    UserStatus,
+)
 
 SUBSCRIPTION_PACKAGES: dict[AgencySubscriptionPlan, dict] = {
     AgencySubscriptionPlan.BASIC: {
@@ -434,12 +439,16 @@ async def list_agencies(
     page_size: int,
     include_deleted: bool = False,
     status_filter: str | None = None,
+    plan_filter: str | None = None,
+    search: str | None = None,
 ) -> tuple[list[Agency], int]:
     """List all agencies (SUPER_ADMIN only — bypasses RLS scoping).
 
     Filters:
       - include_deleted: include soft-deleted rows
       - status_filter:   narrow to one AgencyStatus value
+      - plan_filter:     narrow to one AgencySubscriptionPlan value
+      - search:          case-insensitive search on name
 
     Returns (rows, total).
     """
@@ -448,6 +457,11 @@ async def list_agencies(
         base = base.where(Agency.deleted_at.is_(None))
     if status_filter is not None:
         base = base.where(Agency.status == status_filter)
+    if plan_filter is not None:
+        base = base.where(Agency.subscription_plan == plan_filter)
+    if search:
+        pattern = f"%{search.strip()}%"
+        base = base.where(Agency.name.ilike(pattern))
 
     total = (await session.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
 

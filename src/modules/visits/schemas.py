@@ -93,6 +93,61 @@ class VisitStatusTransitionRequest(BaseModel):
     status: VisitStatus
 
 
+class VisitLocationPingRequest(BaseModel):
+    """POST /visits/{id}/location-ping — staff device updates its live GPS.
+
+    Sent by the staff browser every ~15 seconds while the visit is in
+    progress and the user has opted into sharing. The server persists
+    only the most recent lat/lng + timestamp on the visit row (no
+    history table, per product decision). `accuracy_m` is optional
+    but recommended — the EVV page uses it to weight the freshness
+    indicator.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    lat: Decimal
+    lng: Decimal
+    accuracy_m: Decimal | None = None
+    device_id: Annotated[str, StringConstraints(max_length=512)] | None = None
+
+    @model_validator(mode="after")
+    def _validate_lat_lng_range(self) -> VisitLocationPingRequest:
+        if not (-90 <= self.lat <= 90):
+            raise ValueError("lat must be in [-90, 90]")
+        if not (-180 <= self.lng <= 180):
+            raise ValueError("lng must be in [-180, 180]")
+        return self
+
+
+class VisitStartLocationSharingRequest(BaseModel):
+    """POST /visits/{id}/start-location-sharing — staff opts in to live GPS.
+
+    The staff mobile app sends this when the user toggles "Share my
+    location" on. The `initial_*` fields are optional — if the caller
+    already has a fresh fix, it can be seeded on the visit row to
+    avoid a "live but no position" gap on the EVV UI.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    initial_lat: Decimal | None = None
+    initial_lng: Decimal | None = None
+    initial_accuracy_m: Decimal | None = None
+
+    @model_validator(mode="after")
+    def _validate_initial_lat_lng_pair(self) -> VisitStartLocationSharingRequest:
+        if (self.initial_lat is None) != (self.initial_lng is None):
+            raise ValueError(
+                "initial_lat and initial_lng must both be set or both be null"
+            )
+        if self.initial_lat is not None and not (-90 <= self.initial_lat <= 90):
+            raise ValueError("initial_lat must be in [-90, 90]")
+        if self.initial_lng is not None and not (-180 <= self.initial_lng <= 180):
+            raise ValueError("initial_lng must be in [-180, 180]")
+        return self
+
+
 class VisitResponse(BaseModel):
     """Single visit, optionally with nested service items / notes / issues."""
 
@@ -115,6 +170,12 @@ class VisitResponse(BaseModel):
     check_out_lng: Decimal | None
     check_out_accuracy_m: Decimal | None
     duration_seconds: int | None
+    # Live GPS — staff opt-in. See VisitLocationPingRequest.
+    live_lat: Decimal | None
+    live_lng: Decimal | None
+    live_ping_at: datetime | None
+    live_accuracy_m: Decimal | None
+    sharing_location: bool
     created_at: datetime
     updated_at: datetime
     # Optional nested — populated only by GET /visits/{id}/with-items
@@ -137,6 +198,13 @@ class VisitSummaryResponse(BaseModel):
     check_in_time: datetime | None
     check_out_time: datetime | None
     duration_seconds: int | None
+    # Live GPS — staff opt-in. The EVV Live Monitor reads this from
+    # the list endpoint.
+    live_lat: Decimal | None
+    live_lng: Decimal | None
+    live_ping_at: datetime | None
+    live_accuracy_m: Decimal | None
+    sharing_location: bool
     created_at: datetime
     updated_at: datetime
 
@@ -315,12 +383,14 @@ __all__ = [
     "VisitIssueCreateRequest",
     "VisitIssueResolveRequest",
     "VisitIssueResponse",
+    "VisitLocationPingRequest",
     "VisitNoteCreateRequest",
     "VisitNoteResponse",
     "VisitResponse",
     "VisitServiceItemCreateRequest",
     "VisitServiceItemResponse",
     "VisitServiceItemUpdateRequest",
+    "VisitStartLocationSharingRequest",
     "VisitStatusTransitionRequest",
     "VisitSummaryResponse",
 ]

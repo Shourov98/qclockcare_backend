@@ -120,6 +120,23 @@ class Visit(IdMixin, TimestampedMixin, Base):
     )
     duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # ---- live location (staff opt-in while CHECKED_IN) ----
+    # Updated by `POST /visits/{id}/location-ping`. Used by the EVV
+    # Live Monitor to render a moving marker per visit.
+    # `sharing_location` is the user's opt-in flag — when False the
+    # pings are ignored even if the device sends them.
+    live_lat: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), nullable=True)
+    live_lng: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), nullable=True)
+    live_ping_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    live_accuracy_m: Mapped[Decimal | None] = mapped_column(
+        Numeric(6, 2), nullable=True
+    )
+    sharing_location: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+
     # Relationships
     appointment: Mapped[Appointment] = relationship(
         "Appointment", back_populates="visit"
@@ -160,6 +177,12 @@ class Visit(IdMixin, TimestampedMixin, Base):
             "idx_visits_status",
             "status",
             postgresql_where=text("status <> 'COMPLETED'"),
+        ),
+        Index(
+            "idx_visits_live_ping",
+            "agency_id",
+            text("live_ping_at DESC"),
+            postgresql_where=text("sharing_location = true"),
         ),
         CheckConstraint(
             "(check_out_time IS NULL) OR (check_in_time IS NULL) OR "

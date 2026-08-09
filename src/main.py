@@ -49,6 +49,7 @@ from src.modules.billing.router import (
 from src.modules.billing.router import (
     webhook_router as billing_webhook_router,
 )
+from src.modules.identity.admin_router import router as identity_admin_router
 from src.modules.identity.models import (  # noqa: F401
     AuthAuditEvent,
     EmailVerificationOtp,
@@ -57,7 +58,7 @@ from src.modules.identity.models import (  # noqa: F401
     User,
     UserRoleAssignment,
 )
-from src.modules.identity.admin_router import router as identity_admin_router
+from src.modules.identity.platform_router import router as identity_platform_router
 from src.modules.identity.router import router as auth_router
 from src.modules.locations.models import Location  # noqa: F401
 from src.modules.locations.router import router as locations_router
@@ -360,6 +361,7 @@ def create_app() -> FastAPI:
 
     # Platform admin management — SUPER_ADMIN-only users for global dashboard.
     app.include_router(identity_admin_router)
+    app.include_router(identity_platform_router)
 
     # Staff — agency-scoped staff profiles, qualifications, availability.
     app.include_router(staff_router)

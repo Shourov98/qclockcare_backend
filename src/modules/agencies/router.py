@@ -43,7 +43,7 @@ from src.modules.identity.dependencies import (
     get_session_with_auth,
     require_role,
 )
-from src.shared.domain.enums import AuditAction, UserRole, UserStatus
+from src.shared.domain.enums import AuditAction, UserRole
 from src.shared.schemas.docs import standard_responses
 from src.shared.schemas.pagination import build_offset_response
 
@@ -91,6 +91,14 @@ async def list_agencies_endpoint(
         str | None,
         Query(description="Narrow to one AgencyStatus (ACTIVE | TRIAL | SUSPENDED | CHURNED)"),
     ] = None,
+    plan_filter: Annotated[
+        str | None,
+        Query(description="Narrow to one AgencySubscriptionPlan"),
+    ] = None,
+    search: Annotated[
+        str | None,
+        Query(max_length=255, description="Case-insensitive name search"),
+    ] = None,
 ) -> AgencyListResponse:
     """List all agencies (SUPER_ADMIN only, paginated)."""
     rows, total = await agencies_service.list_agencies(
@@ -99,6 +107,8 @@ async def list_agencies_endpoint(
         page_size=page_size,
         include_deleted=include_deleted,
         status_filter=status_filter,
+        plan_filter=plan_filter,
+        search=search,
     )
     data = [AgencyResponse.model_validate(r) for r in rows]
     body = build_offset_response(data, total=total, page=page, page_size=page_size)

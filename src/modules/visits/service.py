@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from decimal import Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -50,6 +51,7 @@ from src.modules.visits.schemas import (
     VisitCreateRequest,
     VisitIssueCreateRequest,
     VisitIssueResolveRequest,
+    VisitLocationPingRequest,
     VisitServiceItemCreateRequest,
     VisitServiceItemUpdateRequest,
     VisitStatusTransitionRequest,
@@ -272,6 +274,7 @@ async def list_visits(
     staff_id: uuid.UUID | None = None,
     patient_id: uuid.UUID | None = None,
     status_filter: VisitStatus | None = None,
+    sharing_only: bool = False,
     page: int = 1,
     page_size: int = 20,
 ) -> tuple[Sequence[Visit], int]:
@@ -303,6 +306,9 @@ async def list_visits(
     if status_filter is not None:
         base = base.where(Visit.status == status_filter)
         count_base = count_base.where(Visit.status == status_filter)
+    if sharing_only:
+        base = base.where(Visit.sharing_location.is_(True))
+        count_base = count_base.where(Visit.sharing_location.is_(True))
 
     base = (
         base.order_by(Visit.check_in_time.desc(), Visit.id)
@@ -396,6 +402,7 @@ async def check_out_visit(
 
     # Auto-progress to CHECKED_OUT (then COMPLETED on the next transition)
     visit.status = VisitStatus.CHECKED_OUT
+    visit.sharing_location = False
     await session.flush()
     return visit
 
@@ -422,6 +429,113 @@ async def transition_visit_status(
         )
 
     visit.status = payload.status
+    if payload.status == VisitStatus.COMPLETED:
+        visit.sharing_location = False
+    await session.flush()
+    return visit
+
+
+# --------------------------------------------------------------------------
+# Live location sharing (EVV)
+# --------------------------------------------------------------------------
+async def start_location_sharing(
+    session: AsyncSession,
+    *,
+    visit_id: uuid.UUID,
+    agency_id: uuid.UUID,
+    initial_lat: Decimal | None = None,
+    initial_lng: Decimal | None = None,
+    initial_accuracy_m: Decimal | None = None,
+) -> Visit:
+    """Mark the visit as having the staff device sharing live GPS.
+
+    Called by the staff mobile app when the user toggles "Share my
+    location" on. Subsequent `record_location_ping` calls update the
+    live lat/lng. Idempotent — calling twice is a no-op.
+
+    Staff must be the assigned staff member on the visit. Agency
+    admins may also call this remotely (e.g. to mark a visit as
+    sharing while debugging).
+    """
+    visit = await _get_visit_or_404(
+        session, visit_id=visit_id, agency_id=agency_id
+    )
+    if visit.status not in {VisitStatus.CHECKED_IN, VisitStatus.IN_PROGRESS}:
+        raise InvalidStateTransitionError(
+            "Cannot share location while the visit is not in progress.",
+            details={"current_status": visit.status.value},
+        )
+
+    visit.sharing_location = True
+    # If the caller passed an initial pinpoint, store it as the first
+    # live location (avoids a "live but no position" gap on the EVV UI).
+    if initial_lat is not None and initial_lng is not None:
+        visit.live_lat = initial_lat
+        visit.live_lng = initial_lng
+        visit.live_ping_at = utc_now()
+        if initial_accuracy_m is not None:
+            visit.live_accuracy_m = initial_accuracy_m
+    await session.flush()
+    return visit
+
+
+async def record_location_ping(
+    session: AsyncSession,
+    *,
+    visit_id: uuid.UUID,
+    agency_id: uuid.UUID,
+    payload: VisitLocationPingRequest,
+) -> Visit:
+    """Update the visit's live lat/lng with a fresh ping.
+
+    Called by the staff mobile app every ~15 seconds while sharing is
+    active. Pings are ignored (the visit row is left untouched) if:
+      - the visit is not CHECKED_IN or IN_PROGRESS, OR
+      - `sharing_location` is False (the staff user revoked permission).
+
+    No-op for completed/no-show/cancelled visits so a stale device
+    doesn't keep updating a finished visit.
+    """
+    visit = await _get_visit_or_404(
+        session, visit_id=visit_id, agency_id=agency_id
+    )
+    if visit.status not in {VisitStatus.CHECKED_IN, VisitStatus.IN_PROGRESS}:
+        # Silently drop the ping — the visit is over.
+        return visit
+    if not visit.sharing_location:
+        # The staff user revoked permission; ignore pings.
+        return visit
+
+    visit.live_lat = payload.lat
+    visit.live_lng = payload.lng
+    visit.live_ping_at = utc_now()
+    if payload.accuracy_m is not None:
+        visit.live_accuracy_m = payload.accuracy_m
+    # Persist the device_id on the first ping only — subsequent pings
+    # don't overwrite since callers may not send it every time.
+    if payload.device_id is not None and visit.check_in_device_id is None:
+        visit.check_in_device_id = payload.device_id
+    await session.flush()
+    return visit
+
+
+async def stop_location_sharing(
+    session: AsyncSession,
+    *,
+    visit_id: uuid.UUID,
+    agency_id: uuid.UUID,
+) -> Visit:
+    """Mark the visit as no longer sharing live GPS.
+
+    Called by the staff app when the user toggles "Share my location"
+    off, or by the agency admin to force-stop sharing. The previous
+    lat/lng + timestamp are kept on the row so the EVV page can still
+    show "Last seen: 5 min ago" until the visit is checked out.
+    """
+    visit = await _get_visit_or_404(
+        session, visit_id=visit_id, agency_id=agency_id
+    )
+    visit.sharing_location = False
     await session.flush()
     return visit
 
@@ -739,7 +853,10 @@ __all__ = [
     "list_visit_notes",
     "list_visit_service_items",
     "list_visits",
+    "record_location_ping",
     "resolve_visit_issue",
+    "start_location_sharing",
+    "stop_location_sharing",
     "transition_visit_status",
     "update_visit_service_item",
 ]
