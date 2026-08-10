@@ -509,14 +509,15 @@ class TestSendInBackgroundLoggingFields:
 
 
 # ---------------------------------------------------------------------------
-# SMTP-disabled short-circuit
+# Email-disabled short-circuit
 # ---------------------------------------------------------------------------
 class TestSendInBackgroundSmtpDisabled:
-    """`SMTP disabled (set SMTP_ENABLED=true to deliver email)` is a
-    configuration state, not a transient delivery failure. Retrying
-    it 3× just wastes ~7s of wall time and floods the log with three
-    copies of the same error. The retry loop bails after one attempt
-    with a single `*_smtp_disabled` warning.
+    """`Email disabled (set RESEND_ENABLED=true with RESEND_API_KEY, or
+    SMTP_ENABLED=true, to deliver email)` is a configuration state,
+    not a transient delivery failure. Retrying it 3x just wastes ~7s
+    of wall time and floods the log with three copies of the same
+    error. The retry loop bails after one attempt with a single
+    `*_smtp_disabled` warning.
     """
 
     async def test_smtp_disabled_short_circuits_no_retries(self) -> None:
@@ -526,7 +527,10 @@ class TestSendInBackgroundSmtpDisabled:
         provider.send = AsyncMock(
             return_value=_FakeResult(
                 success=False,
-                error="SMTP disabled (set SMTP_ENABLED=true to deliver email)",
+                error=(
+                    "Email disabled (set RESEND_ENABLED=true with "
+                    "RESEND_API_KEY, or SMTP_ENABLED=true, to deliver email)"
+                ),
             )
         )
 
@@ -598,7 +602,10 @@ class TestSendInBackgroundSmtpDisabled:
         provider.send = AsyncMock(
             return_value=_FakeResult(
                 success=False,
-                error="SMTP disabled (set SMTP_ENABLED=true to deliver email)",
+                error=(
+                    "Email disabled (set RESEND_ENABLED=true with "
+                    "RESEND_API_KEY, or SMTP_ENABLED=true, to deliver email)"
+                ),
             )
         )
 

@@ -5,7 +5,9 @@ Phase 1 covers:
     `dispatch_notification`). The provider here is a thin wrapper that
     marks a `NotificationDelivery` row as DELIVERED once the in-app
     row is committed.
-  - EMAIL: real SMTP via aiosmtplib, controlled by `SMTP_ENABLED`.
+  - EMAIL: real delivery via Resend (ADR-0020) when `RESEND_ENABLED=true`
+    and `RESEND_API_KEY` is set; otherwise real SMTP via aiosmtplib when
+    `SMTP_ENABLED=true`; otherwise dev-log fallback.
   - SMS: stub provider. When `SMS_ENABLED=false`, logs the message and
     returns success=True so the dispatch loop completes. When
     `SMS_ENABLED=true` and Twilio creds are missing, raises
@@ -22,6 +24,7 @@ from email.message import EmailMessage
 from typing import Any, ClassVar
 
 import aiosmtplib
+import httpx
 
 from src.core.config import settings
 from src.core.logging import get_logger
@@ -110,7 +113,26 @@ class InAppProvider(NotificationProvider):
 
 
 class EmailProvider(NotificationProvider):
-    """SMTP provider — uses aiosmtplib for async delivery."""
+    """Transactional email provider.
+
+    Delivery order (ADR-0020):
+
+    1. **Resend** — when `RESEND_ENABLED=true` AND `RESEND_API_KEY` is
+       set. POSTs to `https://api.resend.com/emails` via httpx.
+       The Resend branch wins over SMTP because it's the project's
+       preferred delivery path — better deliverability than generic
+       SMTP relays, and the env validator refuses to start the app
+       with `RESEND_ENABLED=true` and an empty key.
+    2. **SMTP** — when `SMTP_ENABLED=true`. Uses aiosmtplib. Kept for
+       self-hosted deployments that prefer to relay through their own
+       mail server.
+    3. **Dev-log fallback** — when neither is enabled. Logs the full
+       rendered email at INFO so local devs can complete the auth
+       flow without configuring either provider.
+
+    The `_DEV_LOGGED_EMAILS` set is shared across all branches below —
+    only branch (3) writes to it, but the dedupe key is the same.
+    """
 
     channel = NotificationChannel.EMAIL
 
@@ -122,12 +144,18 @@ class EmailProvider(NotificationProvider):
         body: str,
         metadata: dict[str, Any] | None = None,
     ) -> DeliveryResult:
-        if not settings.SMTP_ENABLED:
-            # Dev escape hatch — when SMTP is disabled (the default in
-            # local dev / unit tests), log the full rendered email so the
-            # caller can complete the flow without a real SMTP server.
-            # Gated on APP_ENV != "production" so production never logs
-            # PII/PHI even if SMTP_ENABLED is accidentally left off.
+        resend_active = bool(
+            settings.RESEND_ENABLED and settings.RESEND_API_KEY
+        )
+        smtp_active = bool(settings.SMTP_ENABLED)
+
+        if not (resend_active or smtp_active):
+            # Dev escape hatch — when both Resend and SMTP are disabled
+            # (the default in local dev / unit tests), log the full
+            # rendered email so the caller can complete the flow
+            # without a real provider. Gated on APP_ENV != "production"
+            # so production never logs PII/PHI even if both flags are
+            # accidentally left off.
             #
             # Deduped by (to, subject) so the retry loop in
             # `auth/email_service.py:_send_in_background` doesn't spam
@@ -148,17 +176,31 @@ class EmailProvider(NotificationProvider):
                     )
             return DeliveryResult(
                 success=False,
-                error="SMTP disabled (set SMTP_ENABLED=true to deliver email)",
+                error=(
+                    "Email disabled (set RESEND_ENABLED=true with "
+                    "RESEND_API_KEY, or SMTP_ENABLED=true, to deliver email)"
+                ),
             )
 
         message = EmailMessage()
-        message["From"] = (
-            f"{settings.SMTP_FROM_NAME} <{settings.SMTP_FROM_EMAIL}>"
-        )
         message["To"] = to
         message["Subject"] = subject
         message.set_content(body)
 
+        # Resend path takes precedence over SMTP when both are on.
+        # `RESEND_ENABLED=true` without a key is rejected at startup by
+        # `_resend_enabled_needs_key`, so we don't need to re-check the
+        # key here.
+        if resend_active:
+            message["From"] = (
+                f"{settings.SMTP_FROM_NAME} <{settings.RESEND_EMAIL}>"
+            )
+            return await _send_via_resend(message, body)
+
+        # SMTP path.
+        message["From"] = (
+            f"{settings.SMTP_FROM_NAME} <{settings.SMTP_FROM_EMAIL}>"
+        )
         try:
             await aiosmtplib.send(
                 message,
@@ -183,6 +225,103 @@ class EmailProvider(NotificationProvider):
             return DeliveryResult(success=False, error=str(exc))
 
         return DeliveryResult(success=True)
+
+
+async def _send_via_resend(
+    message: EmailMessage, body: str
+) -> DeliveryResult:
+    """POST one transactional email through Resend's `/emails` endpoint.
+
+    The Resend API accepts a JSON body with `from`, `to` (string or
+    list), `subject`, and either `text` or `html`. We send `text`
+    because every template in `auth/email_service.py` is plain text
+    today — promoting any of them to HTML is a separate decision.
+
+    Returns `DeliveryResult(success=True, provider_message_id=<id>)`
+    on a 2xx response. Resend returns `{"id": "<uuid>"}` on success;
+    we surface that id so the retry-success log can include it.
+
+    Failure modes mapped to `DeliveryResult(success=False, ...)`:
+      - non-2xx HTTP status — surfaces the upstream status + body so
+        ops can grep for it.
+      - network / timeout exception — same shape as the SMTP branch.
+
+    Never raises; the `_send_in_background` retry loop relies on the
+    `success=False` return to trigger a backoff. Raises here would
+    short-circuit the retry contract documented on
+    `NotificationProvider.send`.
+    """
+    recipient = str(message["To"])
+    from_addr = str(message["From"])
+    subject = str(message["Subject"])
+
+    api_key = settings.RESEND_API_KEY
+    if api_key is None:  # pragma: no cover — guarded by config validator
+        return DeliveryResult(
+            success=False,
+            error="RESEND_API_KEY missing at runtime",
+        )
+
+    payload = {
+        "from": from_addr,
+        "to": [recipient],
+        "subject": subject,
+        "text": body,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key.get_secret_value()}",
+        "Content-Type": "application/json",
+        # Resend echoes the `Idempotency-Key` header on retries; using
+        # a stable key would let us coalesce duplicate background-task
+        # dispatches. Today the auth retry loop sends distinct payloads
+        # (different recipients), so we omit the header and rely on
+        # the From/To/Subject triple as the natural dedupe key.
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=settings.RESEND_API_TIMEOUT_SECONDS
+        ) as client:
+            response = await client.post(
+                "https://api.resend.com/emails",
+                json=payload,
+                headers=headers,
+            )
+    except Exception as exc:
+        log.warning(
+            "notifications.email_resend_send_failed",
+            to=recipient,
+            error=type(exc).__name__,
+            detail=str(exc),
+        )
+        return DeliveryResult(success=False, error=str(exc))
+
+    if 200 <= response.status_code < 300:
+        provider_message_id: str | None = None
+        try:
+            provider_message_id = response.json().get("id")
+        except (ValueError, AttributeError):
+            # Response wasn't JSON or had no `id` field — unusual for
+            # Resend but not fatal. The caller still sees
+            # `success=True`.
+            provider_message_id = None
+        return DeliveryResult(
+            success=True,
+            provider_message_id=f"resend:{provider_message_id}"
+            if provider_message_id
+            else "resend",
+        )
+
+    log.warning(
+        "notifications.email_resend_non_2xx",
+        to=recipient,
+        status=response.status_code,
+        body=response.text[:512],
+    )
+    return DeliveryResult(
+        success=False,
+        error=f"Resend {response.status_code}: {response.text[:256]}",
+    )
 
 
 class SMSProvider(NotificationProvider):
@@ -234,8 +373,9 @@ class ProviderRegistry:
 
     Providers are cheap and stateless; we cache them on the module-level
     `_PROVIDERS` dict. IN_APP + SMS are always present; EMAIL is only
-    present when `SMTP_ENABLED=true`. A provider missing for a channel
-    means the channel is disabled in this environment.
+    present when `RESEND_ENABLED=true` (with a key) OR `SMTP_ENABLED=true`.
+    A provider missing for a channel means the channel is disabled in
+    this environment.
     """
 
     _PROVIDERS: ClassVar[dict[NotificationChannel, NotificationProvider]] = {}
@@ -246,7 +386,10 @@ class ProviderRegistry:
             if channel == NotificationChannel.IN_APP:
                 cls._PROVIDERS[channel] = InAppProvider()
             elif channel == NotificationChannel.EMAIL:
-                if settings.SMTP_ENABLED:
+                resend_active = bool(
+                    settings.RESEND_ENABLED and settings.RESEND_API_KEY
+                )
+                if resend_active or settings.SMTP_ENABLED:
                     cls._PROVIDERS[channel] = EmailProvider()
                 # else: leave un-cached — EMAIL is disabled in this env
             elif channel == NotificationChannel.SMS:
@@ -261,11 +404,15 @@ class ProviderRegistry:
     @classmethod
     def enabled_channels(cls) -> list[NotificationChannel]:
         """Channels that have a usable provider right now."""
+        resend_active = bool(
+            settings.RESEND_ENABLED and settings.RESEND_API_KEY
+        )
+        email_active = resend_active or settings.SMTP_ENABLED
         return [
             ch
             for ch in NotificationChannel
             if ch in {NotificationChannel.IN_APP, NotificationChannel.SMS}
-            or (ch == NotificationChannel.EMAIL and settings.SMTP_ENABLED)
+            or (ch == NotificationChannel.EMAIL and email_active)
         ]
 
 

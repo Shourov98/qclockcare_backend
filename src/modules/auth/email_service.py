@@ -13,8 +13,8 @@ issued by the auth flow:
 We deliberately skip the `notifications` table (no bell-icon entry for
 transactional auth emails) and route directly through
 `EmailProvider.send(...)`. The provider call is scheduled on
-FastAPI's `BackgroundTasks` so an unreachable SMTP server cannot
-block the request thread — same pattern as the just-shipped
+FastAPI's `BackgroundTasks` so an unreachable SMTP or Resend endpoint
+cannot block the request thread — same pattern as the just-shipped
 `notifications/background.py:run_dispatch_in_background`.
 
 Public API:
@@ -33,14 +33,15 @@ the network call. The deep-link URL in the body uses
 `settings.FRONTEND_URL` so the SPA can deep-link to the
 verify/reset/accept-invitation page with the OTP / token pre-filled.
 
-When SMTP is disabled (`SMTP_ENABLED=false`, the default in unit
-tests), `EmailProvider.send` returns a `DeliveryResult(success=False)`
-and the user is told "email sent" optimistically. Devs who need to
-test the flow end-to-end without configuring SMTP can set
-`LOG_INCLUDE_DEV_OTPS=true` — the OTP / reset token / invitation
-token then appears in the application log at INFO level under a
-clearly-labelled `dev_*` field so production log scanners don't
-accidentally ingest secrets. MUST stay False in production.
+When email is disabled (`RESEND_ENABLED=false` AND `SMTP_ENABLED=false`,
+the default in unit tests), `EmailProvider.send` returns a
+`DeliveryResult(success=False)` and the user is told "email sent"
+optimistically. Devs who need to test the flow end-to-end without
+configuring either provider can set `LOG_INCLUDE_DEV_OTPS=true` —
+the OTP / reset token / invitation token then appears in the
+application log at INFO level under a clearly-labelled `dev_*` field
+so production log scanners don't accidentally ingest secrets. MUST
+stay False in production.
 """
 
 from __future__ import annotations
@@ -207,8 +208,8 @@ async def _send_in_background(
     log. Never raises.
     """
     # Dev escape hatch — log the OTP / reset token at INFO level so
-    # local dev can complete the flow without configuring SMTP.
-    # Logged with a clear "DEV ONLY" prefix and gated on
+    # local dev can complete the flow without configuring SMTP or
+    # Resend. Logged with a clear "DEV ONLY" prefix and gated on
     # LOG_INCLUDE_DEV_OTPS so production log scanners do not ingest
     # secrets. Runs once per request, before the retry loop, so we
     # don't re-log secrets on retries.
@@ -266,12 +267,12 @@ async def _send_in_background(
             # `success=False` instead of raising (this is the
             # contract every provider follows).
             last_error = result.error or "unknown error"
-            # "SMTP disabled" is a configuration state, not a
-            # transient delivery failure. Retrying it 3× just wastes
+            # "Email disabled" is a configuration state, not a
+            # transient delivery failure. Retrying it 3x just wastes
             # ~7s of wall time and floods the log with three copies
             # of the same error. Bail out after the first attempt
             # with one warning.
-            if last_error.startswith("SMTP disabled"):
+            if last_error.startswith("Email disabled"):
                 logger.warning(
                     f"auth.email.{kind}_smtp_disabled",
                     to=recipient,

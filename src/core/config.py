@@ -15,7 +15,6 @@ from typing import Annotated, Literal
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-
 DEPLOYED_CORS_ORIGINS = [
     "https://qlockcare-admin.vercel.app",
     "https://qlockcare-site.vercel.app",
@@ -129,6 +128,22 @@ class Settings(BaseSettings):
     # Jitter as a fraction of the computed delay (+/-50% means the
     # actual sleep is uniformly chosen from [0.5*base, 1.5*base]).
     SMTP_RETRY_JITTER: float = Field(default=0.5, ge=0.0, le=1.0)
+
+    # ----- Email (Resend) — ADR-0020 -----
+    # Resend is the project's preferred transactional email provider
+    # (see ADR-0020). When `RESEND_ENABLED=true` and `RESEND_API_KEY` is
+    # set, `EmailProvider` POSTs to `https://api.resend.com/emails`
+    # instead of going through aiosmtplib. Falls back to SMTP if Resend
+    # is not enabled, then to the dev-log fallback if neither is on.
+    RESEND_ENABLED: bool = False
+    RESEND_API_KEY: SecretStr | None = None
+    # From-address used by the Resend branch. The domain must be
+    # verified in the Resend dashboard before mail can be sent from it.
+    RESEND_EMAIL: str = "noreply@qlockcare.com"
+    # Connect / send timeout for the outbound Resend call. Mirrors
+    # `SMTP_TIMEOUT_SECONDS` so the retry loop has a comparable upper
+    # bound on per-attempt wall time.
+    RESEND_API_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=120)
 
     # ----- Frontend (deep links in transactional emails) -----
     # Base URL of the SPA — used by transactional auth emails
@@ -306,6 +321,30 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @field_validator("RESEND_API_KEY")
+    @classmethod
+    def _resend_enabled_needs_key(
+        cls, value: SecretStr | None, info
+    ) -> SecretStr | None:
+        """Refuse to start if Resend is enabled but no API key was set.
+
+        `RESEND_ENABLED=true` with `RESEND_API_KEY=` would crash at send
+        time with a 401 from Resend — far less helpful than failing the
+        settings load up front. Mirrors the Stripe `STRIPE_SECRET_KEY`
+        pattern in this file.
+        """
+        # `info.data` carries the already-validated sibling fields.
+        # `RESEND_ENABLED` is validated before `RESEND_API_KEY` because
+        # it appears first in the class body, so it is safe to read.
+        enabled = bool(info.data.get("RESEND_ENABLED"))
+        if enabled and (value is None or not value.get_secret_value().strip()):
+            raise ValueError(
+                "RESEND_ENABLED=true but RESEND_API_KEY is empty. "
+                "Set RESEND_API_KEY to a valid Resend API key, "
+                "or flip RESEND_ENABLED=false to fall back to SMTP / dev-log."
+            )
+        return value
+
     # ------------------------------------------------------------------
     # Derived properties
     # ------------------------------------------------------------------
@@ -364,7 +403,7 @@ class Settings(BaseSettings):
         # from the async runtime URL. Supabase's transaction-mode pooler
         # works fine over asyncpg without that flag.
         if "pgbouncer=true" in url:
-            from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+            from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
             parts = urlsplit(url)
             q = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "pgbouncer"]
