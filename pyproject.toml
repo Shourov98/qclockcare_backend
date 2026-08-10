@@ -47,6 +47,11 @@ dependencies = [
     "httpx>=0.28.0",
     # Email (notifications SMTP provider)
     "aiosmtplib>=3.0.0",
+    # AI / LLM (Reports narrative generation — `/reports/{type}/stream`)
+    "anthropic>=0.40.0",
+    # Export (PDF + XLSX for `/reports/runs/{id}/export`)
+    "reportlab>=4.0.0",
+    "openpyxl>=3.1.0",
     # Misc
     "python-json-logger>=2.0.7",
     "orjson>=3.10.0",
@@ -164,6 +169,8 @@ filterwarnings = [
     "error",
     "ignore::DeprecationWarning:botocore.*",
     "ignore::DeprecationWarning:dateutil.*",
+    "ignore::DeprecationWarning:slowapi.*",
+    "ignore:asyncio.iscoroutinefunction.*:DeprecationWarning:slowapi.*",
     "ignore::starlette.exceptions.StarletteDeprecationWarning",
 ]
 

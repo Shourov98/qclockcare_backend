@@ -162,6 +162,18 @@ tags_metadata: Final[list[dict[str, str]]] = [
         ),
     },
     {
+        "name": "reports",
+        "description": (
+            "AI-generated narrative reports powered by Claude. "
+            "`POST /reports/{type}/stream` opens an SSE stream of the "
+            "narrative as Claude writes it; `GET /reports/runs[/{id}]` "
+            "returns the persisted history; `GET /reports/runs/{id}/export` "
+            "renders the snapshot as PDF / CSV / XLSX. **Requires "
+            "`CLAUDE_API_KEY`** — disable with "
+            "`FEATURE_REPORTS_AI_NARRATIVE=false`."
+        ),
+    },
+    {
         "name": "health",
         "description": (
             "Liveness (`/health`) and readiness (`/ready`) probes. "

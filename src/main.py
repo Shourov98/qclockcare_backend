@@ -71,6 +71,8 @@ from src.modules.patients.models import (  # noqa: F401
 )
 from src.modules.patients.router import router as patients_router
 from src.modules.portal.router import router as portal_router
+from src.modules.reports.models import ReportRun  # noqa: F401
+from src.modules.reports.router import router as reports_router
 from src.modules.staff.models import (  # noqa: F401
     StaffAvailability,
     StaffProfile,
@@ -386,6 +388,12 @@ def create_app() -> FastAPI:
 
     # Audit logs — admin-facing list/get endpoints.
     app.include_router(audit_logs_router)
+
+    # Reports — Claude narrative generation + PDF/CSV/XLSX export.
+    # Per-request gates in the router handle the FEATURE_REPORTS_AI_NARRATIVE
+    # + CLAUDE_API_KEY flags; the read endpoints stay live even when AI is
+    # disabled so the UI can still show history.
+    app.include_router(reports_router)
 
     # Agencies — SUPER_ADMIN-only management of agency tenants.
     app.include_router(agencies_router)

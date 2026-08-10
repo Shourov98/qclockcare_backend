@@ -223,12 +223,38 @@ class Settings(BaseSettings):
     RATE_LIMIT_RESEND_PER_HOUR: int = Field(default=20, ge=1, le=1000)
     RATE_LIMIT_ACCEPT_INVITATION_PER_MINUTE: int = Field(default=10, ge=1, le=100)
     RATE_LIMIT_REFRESH_PER_MINUTE: int = Field(default=30, ge=1, le=1000)
+    # AI narrative generation is expensive (60-90s per call, $0.01-0.10
+    # per report). Keep the per-minute budget tight so a runaway script
+    # can't burn through the monthly Anthropic allowance.
+    RATE_LIMIT_AI_NARRATIVE_PER_MINUTE: int = Field(default=5, ge=1, le=100)
 
     # ----- Observability -----
     SENTRY_DSN: SecretStr | None = None
     SENTRY_TRACES_SAMPLE_RATE: float = Field(default=0.1, ge=0.0, le=1.0)
     OTEL_ENABLED: bool = False
     OTEL_EXPORTER_OTLP_ENDPOINT: str | None = None
+
+    # ----- AI / LLM (Reports narrative generation) -----
+    # Anthropic Claude API key used by the `/reports/{type}/stream` SSE
+    # endpoint. When unset (or `FEATURE_REPORTS_AI_NARRATIVE=False`) the
+    # endpoint returns 503 with a clear "feature disabled" message —
+    # the rest of the system keeps working so CI and unit tests don't
+    # need a real key. The orphan `CLAUDE_API_KEY=` line in `.env` is
+    # finally picked up here; previously it crashed Settings init
+    # because `extra="forbid"` rejected unknown fields.
+    CLAUDE_API_KEY: SecretStr | None = None
+    # Model id. Sonnet is the default — best cost/quality balance for
+    # 4-6k-token narratives. Override with `CLAUDE_MODEL=claude-haiku-...`
+    # in `.env` for cheaper bulk runs.
+    CLAUDE_MODEL: str = "claude-sonnet-4-5"
+    # Per-request timeout. Claude narratives can take 60-90s for the
+    # wider report types (Audit Readiness pulls from audit_logs;
+    # Group Home synthesizes a placeholder); the upper bound of 600s
+    # covers the worst case without leaving a hung request indefinitely.
+    CLAUDE_API_TIMEOUT_SECONDS: int = Field(default=120, ge=10, le=600)
+    # Max tokens to generate per report. 4k is enough for a tight
+    # clinical narrative; bump to 8k for the wider report types.
+    CLAUDE_MAX_TOKENS: int = Field(default=4096, ge=256, le=8192)
 
     # ----- Feature Flags -----
     FEATURE_REGISTRATION_ENABLED: bool = False
@@ -237,6 +263,11 @@ class Settings(BaseSettings):
     # `STRIPE_SECRET_KEY` + `STRIPE_WEBHOOK_SECRET` and run migration 0015.
     FEATURE_BILLING_ENABLED: bool = False
     FEATURE_2FA_ENABLED: bool = False
+    # When True, `/reports/{type}/stream` will call Claude. Flip off
+    # at runtime to disable AI narrative generation without a deploy
+    # (e.g. cost cap reached, provider outage). Mirrors
+    # `FEATURE_BILLING_ENABLED`.
+    FEATURE_REPORTS_AI_NARRATIVE: bool = True
 
     # ----- Stripe / Billing (ADR-0021) -----
     # Required when FEATURE_BILLING_ENABLED=True. None in dev keeps the
@@ -457,6 +488,20 @@ class Settings(BaseSettings):
             or (self.STRIPE_PRICE_ENTERPRISE or "")
         )
         return secret_ok and prices_ok
+
+    @property
+    def claude_configured(self) -> bool:
+        """True iff Claude narrative generation is ready to serve.
+
+        Both the feature flag and the API key must be on — a present
+        key alone doesn't mean we should call Claude (e.g. ops may have
+        disabled the feature for cost reasons). Mirrors
+        `stripe_configured`.
+        """
+        if not self.FEATURE_REPORTS_AI_NARRATIVE:
+            return False
+        key = self.CLAUDE_API_KEY
+        return key is not None and bool(key.get_secret_value().strip())
 
 
 @lru_cache(maxsize=1)
