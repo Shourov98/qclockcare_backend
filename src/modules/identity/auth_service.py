@@ -31,6 +31,7 @@ from src.core.exceptions import (
     AccountLockedError,
     AgencySuspendedError,
     EmailNotVerifiedError,
+    InsufficientPermissionsError,
     InvalidCredentialsError,
     InvalidResetTokenError,
     InvitationAlreadyConsumedError,
@@ -86,14 +87,37 @@ def _role_priority(role: UserRole) -> int:
     }.get(role, 99)
 
 
-def _pick_primary_role(roles: list[UserRoleAssignment]) -> tuple[UserRole, uuid.UUID | None]:
+def _pick_primary_role(
+    roles: list[UserRoleAssignment],
+    *,
+    user_id: uuid.UUID | None = None,
+) -> tuple[UserRole, uuid.UUID | None]:
     """Pick the most-privileged role for the access token.
 
     SUPER_ADMIN wins. Otherwise, the lowest-priority role wins.
     Returns (role, agency_id).
+
+    Raises `InsufficientPermissionsError` if the user has *no* role rows.
+    This is a data-integrity failure — every ACTIVE user must have at
+    least one role row. The previous fallback (`return STAFF, None`)
+    silently masked such corruption and issued a token claiming the
+    user was a STAFF with no agency — turning the user into a no-op
+    ghost across the whole API. Loud failure is the correct behaviour.
     """
     if not roles:
-        return UserRole.STAFF, None  # shouldn't happen for ACTIVE users
+        logger.error(
+            "auth.pick_primary_role.no_roles",
+            user_id=str(user_id) if user_id else None,
+            message=(
+                "User has no role rows — refusing to mint a token. "
+                "Re-run scripts/seed_test_user.py or repair user_roles "
+                "manually."
+            ),
+        )
+        raise InsufficientPermissionsError(
+            message="No role assigned to this user. Contact support.",
+            details={"user_id": str(user_id) if user_id else None},
+        )
     sa = [r for r in roles if r.role == UserRole.SUPER_ADMIN]
     if sa:
         return UserRole.SUPER_ADMIN, None
@@ -137,7 +161,7 @@ async def _record_audit(
 
 
 def _to_current_user(user: User) -> CurrentUser:
-    role, agency_id = _pick_primary_role(user.roles)
+    role, agency_id = _pick_primary_role(user.roles, user_id=user.id)
     return CurrentUser(
         id=str(user.id),
         email=user.email,
@@ -194,7 +218,7 @@ async def _issue_pair(
     """Issue access + refresh tokens, persist the refresh row, return pair."""
     from src.core.database import set_session_context
 
-    role, agency_id = _pick_primary_role(user.roles)
+    role, agency_id = _pick_primary_role(user.roles, user_id=user.id)
     await set_session_context(
         session,
         user_id=str(user.id),
@@ -390,7 +414,7 @@ async def refresh(
         raise AccountDisabledError()
 
     # Update the session context now that we have role + agency.
-    role, agency_id = _pick_primary_role(user.roles)
+    role, agency_id = _pick_primary_role(user.roles, user_id=user.id)
     await set_session_context(
         session,
         user_id=str(payload.user_id),
