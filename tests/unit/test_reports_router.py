@@ -103,4 +103,52 @@ def test_reports_tag_in_tags_metadata(client_reports_off: TestClient) -> None:
     assert "reports" in tag_names
 
 
+# --------------------------------------------------------------------------
+# CORS regression — the SPA runs on `http://localhost:3000` and posts
+# a credentialed preflight before calling /reports/*. CORS middleware
+# MUST be the outermost layer so the preflight is answered without
+# other middleware stripping the headers on the way back.
+# --------------------------------------------------------------------------
+def test_reports_runs_responds_to_preflight(client_reports_off: TestClient) -> None:
+    """OPTIONS preflight from the SPA carries `Access-Control-Allow-*`
+    headers even though the route itself returns 401/503.
+
+    This is the regression that bites the SPA at the moment a user
+    loads `/reports` — the request never reaches `/reports/runs`
+    because the browser blocks it at the preflight stage.
+    """
+    response = client_reports_off.options(
+        "/reports/runs",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert response.status_code in (200, 204)
+    assert (
+        response.headers.get("access-control-allow-origin")
+        == "http://localhost:3000"
+    )
+    methods = response.headers.get("access-control-allow-methods", "")
+    assert "GET" in methods.upper()
+
+
+def test_reports_stream_responds_to_preflight(client_reports_off: TestClient) -> None:
+    """OPTIONS on the streaming endpoint also gets CORS headers."""
+    response = client_reports_off.options(
+        "/reports/visit_summary/stream",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert response.status_code in (200, 204)
+    assert (
+        response.headers.get("access-control-allow-origin")
+        == "http://localhost:3000"
+    )
+
+
 __all__ = []

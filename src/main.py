@@ -318,6 +318,40 @@ def create_app() -> FastAPI:
     register_exception_handlers(app)
 
     # ---- CORS ----
+    # IMPORTANT: CORS middleware MUST be the outermost layer so it can
+    # answer OPTIONS preflight requests before any other middleware
+    # touches the request. Otherwise `RequestContextMiddleware` (a
+    # `BaseHTTPMiddleware`) wraps the response and strips the CORS
+    # headers on the way back, manifesting as the browser-side
+    # error: "No 'Access-Control-Allow-Origin' header is present on
+    # the requested resource." — even though the route itself never
+    # ran. See https://github.com/encode/starlette/issues/1438 for
+    # the underlying BaseHTTPMiddleware buffering behaviour.
+    #
+    # We register CORS FIRST in source code but Starlette runs
+    # middleware outside-in by registration order, so to make CORS
+    # outermost we have to add it LAST. We therefore register all
+    # other middleware first, then add CORS last.
+    pass  # placeholder — CORS is added below, after every other middleware
+
+    # ---- Trusted hosts (production only) ----
+    if settings.is_production:
+        app.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=["*"],  # tighten via reverse proxy / ingress in real prod
+        )
+
+    # ---- Rate limiting (built before middleware so the limiter is on app.state) ----
+    app.state.limiter = _build_limiter()
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(SlowAPIMiddleware)
+
+    # ---- Request context (wraps everything so request_id is available everywhere) ----
+    app.add_middleware(RequestContextMiddleware)
+
+    # ---- CORS — registered LAST so it becomes the OUTERMOST middleware ----
+    # See the long comment above for why this can't live next to the
+    # other middleware registration.
     cors_origins = settings.effective_cors_origins
     if cors_origins:
         logger.info("cors.enabled", origins=cors_origins)
@@ -335,24 +369,6 @@ def create_app() -> FastAPI:
         )
     else:
         logger.warning("cors.disabled", reason="CORS_ORIGINS is empty")
-
-    # ---- Trusted hosts (production only) ----
-    if settings.is_production:
-        app.add_middleware(
-            TrustedHostMiddleware,
-            allowed_hosts=["*"],  # tighten via reverse proxy / ingress in real prod
-        )
-
-    # ---- Rate limiting (built before middleware so the limiter is on app.state) ----
-    app.state.limiter = _build_limiter()
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-    app.add_middleware(SlowAPIMiddleware)
-
-    # ---- Request context (added last so it runs FIRST in the middleware chain) ----
-    # NOTE: Starlette executes middleware in reverse order of registration.
-    # Registering RequestContextMiddleware last ensures it wraps everything else
-    # and produces a request_id before any other middleware logs.
-    app.add_middleware(RequestContextMiddleware)
 
     # ---- Routers ----
     # Health is always exposed (k8s probes never auth).
