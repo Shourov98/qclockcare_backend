@@ -39,11 +39,27 @@ config = context.config
 # the pool URL — DDL needs session-level features that pgbouncer in
 # transaction mode does not support.
 #
-# Alembic runs synchronously (no async drivers), so we swap the asyncpg
-# prefix for psycopg (v3) which is already in our dev/runtime dependencies.
-url = settings.DATABASE_URL.get_secret_value()
+# Alembic runs synchronously (no async drivers), so we always rewrite
+# the driver prefix to `postgresql+psycopg://` (psycopg v3, installed
+# already as a dev dep). The runtime URL can arrive in three shapes:
+#
+#   postgresql://...                 (no driver — bare psycopg-v3 URL)
+#   postgresql+asyncpg://...         (app's runtime driver)
+#   postgresql+psycopg://...         (already canonical)
+#
+# All three get normalized to `postgresql+psycopg://...` so SQLAlchemy
+# doesn't default to psycopg2 (which isn't installed).
+#
+# We also strip the `?pgbouncer=true` query string that Supabase emits
+# for transaction-mode pooling — psycopg v3 mis-parses it as an
+# unknown connection option. The driver itself handles pgbouncer
+# compatibility via its own settings, so the URL hint is redundant
+# for a sync migration run.
+url = settings.DATABASE_URL.get_secret_value().split("?")[0]
 if url.startswith("postgresql+asyncpg://"):
     url = "postgresql+psycopg://" + url[len("postgresql+asyncpg://") :]
+elif url.startswith("postgresql://"):
+    url = "postgresql+psycopg://" + url[len("postgresql://") :]
 config.set_main_option("sqlalchemy.url", url)
 
 # Configure stdlib logging from alembic.ini
