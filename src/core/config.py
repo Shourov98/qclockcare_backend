@@ -185,6 +185,20 @@ class Settings(BaseSettings):
     FEATURE_BILLING_ENABLED: bool = False
     FEATURE_2FA_ENABLED: bool = False
 
+    # ----- Stripe / Billing (ADR-0021) -----
+    # All optional: when STRIPE_SECRET_KEY is unset, billing routes
+    # return 503 instead of attempting a Stripe call. The price IDs
+    # and checkout URLs are only consulted when billing is actually
+    # invoked, so leaving them blank in local dev is safe.
+    STRIPE_SECRET_KEY: SecretStr | None = None
+    STRIPE_WEBHOOK_SECRET: SecretStr | None = None
+    STRIPE_PRICE_BASIC: str | None = None
+    STRIPE_PRICE_PROFESSIONAL: str | None = None
+    STRIPE_PRICE_ENTERPRISE: str | None = None
+    STRIPE_CHECKOUT_SUCCESS_URL: str = "http://localhost:3000/billing/success"
+    STRIPE_CHECKOUT_CANCEL_URL: str = "http://localhost:3000/billing/cancel"
+    STRIPE_API_TIMEOUT_SECONDS: int = Field(default=15, ge=1, le=120)
+
     # ----- Seed / Bootstrap -----
     SEED_SUPER_ADMIN_EMAIL: str | None = None
     SEED_SUPER_ADMIN_PASSWORD: SecretStr | None = None
