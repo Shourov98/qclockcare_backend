@@ -18,6 +18,10 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 DEPLOYED_CORS_ORIGINS = [
     "https://qlockcare-admin.vercel.app",
     "https://qlockcare-site.vercel.app",
+    # Netlify-hosted admin + site (the live deployments currently in use).
+    # Render is the backend host; the SPAs are on Netlify, not Vercel.
+    "https://qlockcare-admin.netlify.app",
+    "https://qlockcare-site.netlify.app",
 ]
 
 LOCAL_CORS_ORIGINS = [
