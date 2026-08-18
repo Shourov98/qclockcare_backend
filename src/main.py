@@ -414,6 +414,11 @@ def create_app() -> FastAPI:
     # Agencies — SUPER_ADMIN-only management of agency tenants.
     app.include_router(agencies_router)
 
+    # Admin cross-tenant people read endpoints (SUPER_ADMIN-only).
+    # Mounted under `/admin/people` so the URL space stays grouped.
+    from src.modules.admin_people.router import router as admin_people_router
+    app.include_router(admin_people_router)
+
     # Billing — Stripe checkout + portal (per-agency) + webhook receiver.
     # Routes are mounted unconditionally but each handler short-circuits
     # with 503 when FEATURE_BILLING_ENABLED=False, so the OpenAPI schema

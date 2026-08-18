@@ -2,7 +2,10 @@
 
 Manual exploration + CI smoke testing for the QlockCare backend.
 
-The collection covers **all 107 routes** across 11 modules. Each request
+The collection covers **all 112 routes** across 12 modules (including the
+3 live-GPS endpoints: start-location-sharing / location-ping /
+stop-location-sharing on `/visits/{id}`, plus the cross-tenant
+`/admin/people/{staff,patients}` SUPER_ADMIN views). Each request
 has standard test scripts (status code, envelope shape, X-Request-ID
 round-trip) and the requests that produce IDs auto-extract them into
 the active environment, so chained requests (create → read → update →
@@ -83,7 +86,7 @@ helps you find "what can a Staff user actually do?" at a glance.
 | 6 | `Guardian` | GUARDIAN | linked patients, ward's appointment lifecycle, visit verify / dispute / report-issue, `/portal/*` |
 | 7 | `health` | public | `/health`, `/ready` |
 
-**Total: 7 folders, 222 requests** (107 unique routes, intentionally
+**Total: 7 folders, 230 requests** (112 unique routes, intentionally
 duplicated across roles). The collection was regenerated against the
 live `require_role(...)` decorators on every router, so the role
 boundaries match the code exactly.

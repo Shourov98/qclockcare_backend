@@ -800,8 +800,44 @@ VISITS_FOLDER = folder(
             path="/visits/{{visit_id}}/issues/00000000-0000-0000-0000-000000000000/resolve",
             body={"resolution": "Patient took medication at 10:30"},
         ),
+        # Live GPS — staff opt-in EVV location sharing. The staff mobile
+        # app calls `start-location-sharing` once when the user toggles
+        # sharing on, then `location-ping` ~every 15 s while sharing.
+        # `stop-location-sharing` is the opt-out. All three are
+        # POST-only, idempotent, and return the visit row so the SPA can
+        # refresh `live_lat` / `live_lng` / `live_ping_at` from the
+        # response without a second GET.
+        make_request(
+            name="Start location sharing for visit",
+            method="POST",
+            path="/visits/{{visit_id}}/start-location-sharing",
+            body={
+                "initial_lat": 44.9778,
+                "initial_lng": -93.2650,
+                "initial_accuracy_m": 12.5,
+            },
+        ),
+        make_request(
+            name="Send location ping for visit",
+            method="POST",
+            path="/visits/{{visit_id}}/location-ping",
+            body={
+                "lat": 44.9778,
+                "lng": -93.2650,
+                "accuracy_m": 12.5,
+                "device_id": "ios-abc-123",
+            },
+        ),
+        make_request(
+            name="Stop location sharing for visit",
+            method="POST",
+            path="/visits/{{visit_id}}/stop-location-sharing",
+        ),
     ],
-    description="Field visits by care staff — check-in/out, notes, patient verification, issue reporting.",
+    description=(
+        "Field visits by care staff — check-in/out, notes, patient "
+        "verification, issue reporting, and live GPS sharing."
+    ),
 )
 
 # --------------------------------------------------------------------------
@@ -1115,6 +1151,36 @@ def _by_name(source: dict[str, Any], role: str) -> dict[str, Any] | None:
     return None
 
 
+# --------------------------------------------------------------------------
+# 1b. Admin cross-tenant people (SUPER_ADMIN) — see
+#     qclockcare_backend/src/modules/admin_people/router.py
+# --------------------------------------------------------------------------
+ADMIN_PEOPLE_FOLDER = folder(
+    "admin-people",
+    [
+        make_request(
+            name="List staff across all agencies",
+            method="GET",
+            path="/admin/people/staff?page=1&page_size=25",
+        ),
+        make_request(
+            name="List patients across all agencies",
+            method="GET",
+            path="/admin/people/patients?page=1&page_size=25",
+        ),
+    ],
+    description=(
+        "Cross-tenant read views for staff + patients (SUPER_ADMIN only). "
+        "Use `agency_id`, `status`, and `search` query params to narrow."
+    ),
+)
+
+
+# --------------------------------------------------------------------------
+# 1. Admin (SUPER_ADMIN) — cross-tenant ops
+
+
+# (rest of the helper functions unchanged below)
 def _requests(source: dict[str, Any], *names: str) -> list[dict[str, Any]]:
     """Resolve a list of request names from a source folder.
 
@@ -1148,6 +1214,11 @@ ADMIN_FOLDER = folder(
             "Patch agency (rename + status flip)",
             "Soft-delete agency",
             "List programs the agency offers",
+        ),
+        # Cross-tenant people read views
+        *_requests(ADMIN_PEOPLE_FOLDER,
+            "List staff across all agencies",
+            "List patients across all agencies",
         ),
         # Audit trail — SUPER_ADMIN sees everything across all agencies
         *_requests(AUDIT_LOGS_FOLDER,
@@ -1263,6 +1334,9 @@ AGENCY_ADMIN_FOLDER = folder(
             "List visit issues",
             "Report visit issue",
             "Resolve visit issue",
+            "Start location sharing for visit",
+            "Send location ping for visit",
+            "Stop location sharing for visit",
         ),
         # Locations — admin of one tenant
         *_requests(LOCATIONS_FOLDER,
@@ -1348,6 +1422,9 @@ STAFF_FOLDER_RF = folder(
             "Add visit note",
             "List visit issues",
             "Report visit issue",
+            "Start location sharing for visit",
+            "Send location ping for visit",
+            "Stop location sharing for visit",
         ),
         # Locations — read-only
         *_requests(LOCATIONS_FOLDER,
