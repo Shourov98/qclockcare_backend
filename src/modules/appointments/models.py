@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
@@ -24,6 +25,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     Text,
     text,
 )
@@ -143,6 +145,19 @@ class Appointment(IdMixin, TimestampedMixin, Base):
     # Context
     location: Mapped[str | None] = mapped_column(Text, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # ---- Location override (migration 0019) ----
+    # When `location_lat`/`location_lng` are set, the appointment has its
+    # own address (e.g. "doctor's office this Tuesday"). When NULL, the
+    # visits service falls back to the linked patient's home address.
+    # `location_source` records how the row was populated for audit.
+    # `geofence_radius_m` lets a single visit relax or tighten the
+    # geofence around its specific location (10-5000 m, enforced in DB).
+    location_lat: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), nullable=True)
+    location_lng: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), nullable=True)
+    location_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    location_source: Mapped[str | None] = mapped_column(Text, nullable=True)
+    geofence_radius_m: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Cancellation
     cancelled_reason: Mapped[str | None] = mapped_column(Text, nullable=True)

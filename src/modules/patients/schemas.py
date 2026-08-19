@@ -20,6 +20,7 @@ out" pre-fills with sensible values.
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Annotated
 from uuid import UUID
 
@@ -40,6 +41,18 @@ from src.shared.domain.enums import RelationshipType, UserStatus
 PatientCodeStr = Annotated[
     str,
     StringConstraints(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_\-.]+$"),
+]
+
+# Shared address-field constraints used by both patient and (via shared
+# component) appointment schemas. Two-letter codes match the existing
+# `Location` model from migration 0011.
+CountryCodeStr = Annotated[
+    str,
+    StringConstraints(min_length=2, max_length=2, to_upper=True),
+]
+StateCodeStr = Annotated[
+    str,
+    StringConstraints(min_length=2, max_length=2, to_upper=True),
 ]
 
 
@@ -106,6 +119,45 @@ class PatientProfileCreateRequest(BaseModel):
         default=None,
         description="Admission date. Defaults to today if omitted.",
     )
+    # ---- Home address (optional; migration 0019) ----
+    address_line1: Annotated[str, StringConstraints(max_length=255)] | None = Field(
+        default=None,
+        description="Street address line 1 (e.g. `1247 Maple Ave`).",
+    )
+    address_line2: Annotated[str, StringConstraints(max_length=255)] | None = Field(
+        default=None,
+        description="Apartment / suite / unit (e.g. `Apt 3B`).",
+    )
+    city: Annotated[str, StringConstraints(max_length=120)] | None = Field(
+        default=None,
+        description="City.",
+    )
+    state: StateCodeStr | None = Field(
+        default=None,
+        description=(
+            "Two-letter US state code (e.g. `NY`, `CA`). Uppercased on input. "
+            "ISO 3166-2 subdivision codes are also accepted for non-US addresses."
+        ),
+    )
+    postal_code: Annotated[str, StringConstraints(max_length=20)] | None = Field(
+        default=None,
+        description="Postal / ZIP code.",
+    )
+    country: CountryCodeStr | None = Field(
+        default=None,
+        description=(
+            "Two-letter ISO 3166-1 alpha-2 country code (e.g. `US`, `CA`). "
+            "Uppercased on input. Defaults to `US` on the database when omitted."
+        ),
+    )
+    home_lat: Decimal | None = Field(
+        default=None,
+        description="Home latitude in decimal degrees (`-90.0` to `90.0`, 6dp).",
+    )
+    home_lng: Decimal | None = Field(
+        default=None,
+        description="Home longitude in decimal degrees (`-180.0` to `180.0`, 6dp).",
+    )
 
 
 class PatientProfileUpdateRequest(BaseModel):
@@ -157,6 +209,40 @@ class PatientProfileUpdateRequest(BaseModel):
     )
     status: UserStatus | None = Field(
         default=None, description="New lifecycle status."
+    )
+    # ---- Home address (migration 0019) ----
+    address_line1: Annotated[str, StringConstraints(max_length=255)] | None = Field(
+        default=None,
+        description="New street address line 1. Send `null` to clear.",
+    )
+    address_line2: Annotated[str, StringConstraints(max_length=255)] | None = Field(
+        default=None,
+        description="New apartment / suite / unit. Send `null` to clear.",
+    )
+    city: Annotated[str, StringConstraints(max_length=120)] | None = Field(
+        default=None, description="New city. Send `null` to clear."
+    )
+    state: StateCodeStr | None = Field(
+        default=None,
+        description="New 2-letter state code (uppercased on input). `null` clears.",
+    )
+    postal_code: Annotated[str, StringConstraints(max_length=20)] | None = Field(
+        default=None,
+        description="New postal / ZIP code. Send `null` to clear.",
+    )
+    country: CountryCodeStr | None = Field(
+        default=None,
+        description=(
+            "New 2-letter country code (uppercased on input). `null` clears."
+        ),
+    )
+    home_lat: Decimal | None = Field(
+        default=None,
+        description="New home latitude. Send `null` to clear.",
+    )
+    home_lng: Decimal | None = Field(
+        default=None,
+        description="New home longitude. Send `null` to clear.",
     )
 
 
@@ -218,6 +304,15 @@ class PatientProfileResponse(BaseModel):
     care_notes: str | None = Field(description="Free-text care notes, or null.")
     admitted_at: date | None = Field(description="Admission date, or null.")
     discharged_at: date | None = Field(description="Discharge date, or null.")
+    # ---- Home address (migration 0019) ----
+    address_line1: str | None = Field(default=None, description="Street address line 1, or null.")
+    address_line2: str | None = Field(default=None, description="Apartment / suite / unit, or null.")
+    city: str | None = Field(default=None, description="City, or null.")
+    state: str | None = Field(default=None, description="2-letter state code, or null.")
+    postal_code: str | None = Field(default=None, description="Postal / ZIP code, or null.")
+    country: str | None = Field(default=None, description="2-letter country code, or null.")
+    home_lat: Decimal | None = Field(default=None, description="Home latitude (decimal degrees), or null.")
+    home_lng: Decimal | None = Field(default=None, description="Home longitude (decimal degrees), or null.")
     created_at: datetime = Field(description="UTC ISO-8601 of row creation.")
     updated_at: datetime = Field(description="UTC ISO-8601 of last mutation.")
     # Optional nested — populated by GET /patients/{id}/with-relationships
@@ -276,6 +371,15 @@ class PatientProfileSummaryResponse(BaseModel):
     date_of_birth: date | None = Field(description="Calendar date of birth, or null.")
     admitted_at: date | None = Field(description="Admission date, or null.")
     discharged_at: date | None = Field(description="Discharge date, or null.")
+    # ---- Home address (migration 0019) ----
+    address_line1: str | None = Field(default=None, description="Street address line 1, or null.")
+    address_line2: str | None = Field(default=None, description="Apartment / suite / unit, or null.")
+    city: str | None = Field(default=None, description="City, or null.")
+    state: str | None = Field(default=None, description="2-letter state code, or null.")
+    postal_code: str | None = Field(default=None, description="Postal / ZIP code, or null.")
+    country: str | None = Field(default=None, description="2-letter country code, or null.")
+    home_lat: Decimal | None = Field(default=None, description="Home latitude (decimal degrees), or null.")
+    home_lng: Decimal | None = Field(default=None, description="Home longitude (decimal degrees), or null.")
     created_at: datetime = Field(description="UTC ISO-8601 of row creation.")
     updated_at: datetime = Field(description="UTC ISO-8601 of last mutation.")
 

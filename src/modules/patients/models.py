@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
@@ -29,6 +30,7 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     Index,
+    Numeric,
     Text,
     UniqueConstraint,
     text,
@@ -91,6 +93,19 @@ class PatientProfile(IdMixin, TimestampedMixin, Base):
     # Enrolment dates
     admitted_at: Mapped[date | None] = mapped_column(Date, nullable=True)
     discharged_at: Mapped[date | None] = mapped_column(Date, nullable=True)
+
+    # Home address + coordinates (migration 0019). All nullable — an
+    # upstream intake may capture a patient before the address is known.
+    # The appointments module reads these to seed `Appointment.location_*`
+    # when an appointment's `location_source = 'PATIENT_HOME'`.
+    address_line1: Mapped[str | None] = mapped_column(Text, nullable=True)
+    address_line2: Mapped[str | None] = mapped_column(Text, nullable=True)
+    city: Mapped[str | None] = mapped_column(Text, nullable=True)
+    state: Mapped[str | None] = mapped_column(Text, nullable=True)
+    postal_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    country: Mapped[str | None] = mapped_column(Text, nullable=True)
+    home_lat: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), nullable=True)
+    home_lng: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), nullable=True)
 
     # Relationships
     agency: Mapped[Agency] = relationship(
