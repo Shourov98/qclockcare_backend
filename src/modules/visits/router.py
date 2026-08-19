@@ -128,6 +128,23 @@ def _to_response(
     *,
     with_relations: bool = False,
 ) -> VisitResponse:
+    # Hydrate `staff_name` from the joined `visit.staff.user.full_name`
+    # when the relationship is loaded. `_get_visit_or_404` doesn't
+    # pre-load `staff`; only `GET /visits/{id}/with-items` and a few
+    # list paths do (see the service layer). The `getattr(..., None)`
+    # chain means an unloaded relationship simply yields `None` instead
+    # of raising — mirrors the existing `service_items` / `notes`
+    # pattern below.
+    staff_name: str | None = None
+    try:
+        staff = getattr(visit, "staff", None)
+        if staff is not None:
+            user = getattr(staff, "user", None)
+            if user is not None:
+                staff_name = getattr(user, "full_name", None)
+    except Exception:
+        staff_name = None
+
     data: dict = {
         "id": visit.id,
         "appointment_id": visit.appointment_id,
@@ -153,6 +170,7 @@ def _to_response(
         "sharing_location": getattr(visit, "sharing_location", False),
         "created_at": visit.created_at,
         "updated_at": visit.updated_at,
+        "staff_name": staff_name,
     }
     if with_relations:
         try:

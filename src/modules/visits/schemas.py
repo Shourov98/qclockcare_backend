@@ -178,6 +178,10 @@ class VisitResponse(BaseModel):
     sharing_location: bool
     created_at: datetime
     updated_at: datetime
+    # Joined from `users.full_name` via `visit.staff.user`. `null` if
+    # the staff profile / user row isn't loaded or the user is
+    # soft-deleted. Hydrated by `_to_response` in the visits router.
+    staff_name: str | None = None
     # Optional nested — populated only by GET /visits/{id}/with-items
     service_items: list[VisitServiceItemResponse] | None = None
     notes: list[VisitNoteResponse] | None = None
@@ -207,6 +211,11 @@ class VisitSummaryResponse(BaseModel):
     sharing_location: bool
     created_at: datetime
     updated_at: datetime
+    # Joined from `users.full_name` via `visit.staff.user`. Lets the
+    # EVV Live Monitor render "Sarah Johnson" instead of a UUID prefix
+    # on the right-hand cards and the map pin tooltips. `null` if
+    # the relationship isn't loaded or the user is soft-deleted.
+    staff_name: str | None = None
 
 
 # --------------------------------------------------------------------------

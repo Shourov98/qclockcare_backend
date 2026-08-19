@@ -38,6 +38,7 @@ from src.core.exceptions import (
 )
 from src.modules.appointments.models import Appointment, AppointmentServiceItem
 from src.modules.patients.models import PatientProfile
+from src.modules.staff.models import StaffProfile
 from src.modules.visits.models import (
     ServiceVerification,
     Visit,
@@ -105,10 +106,20 @@ async def _get_visit_or_404(
     visit_id: uuid.UUID,
     agency_id: uuid.UUID,
     with_relations: bool = False,
+    with_staff: bool = True,
 ) -> Visit:
     stmt = select(Visit).where(
         Visit.id == visit_id, Visit.agency_id == agency_id
     )
+    # Always eager-load staff→user so `_to_response` can hydrate
+    # `staff_name`. The relationship is one short IN-join (the staff
+    # row + the user row), so the cost is negligible on a per-detail
+    # call. Pass `with_staff=False` only for hot internal paths that
+    # don't need the name (currently none — default is True).
+    if with_staff:
+        stmt = stmt.options(
+            selectinload(Visit.staff).selectinload(StaffProfile.user)
+        )
     if with_relations:
         stmt = stmt.options(
             selectinload(Visit.service_items),
@@ -368,7 +379,17 @@ async def list_visits(
     page = max(1, page)
     page_size = max(1, min(100, page_size))
 
-    base = select(Visit).where(Visit.agency_id == agency_id)
+    base = (
+        select(Visit)
+        .where(Visit.agency_id == agency_id)
+        # Pre-load staff→user so the EVV Live Monitor can render the
+        # real staff name on each card (and the map pin tooltip).
+        # `_to_response` reads `visit.staff.user.full_name`; without
+        # this eager load `staff_name` would always be None.
+        .options(
+            selectinload(Visit.staff).selectinload(StaffProfile.user)
+        )
+    )
     count_base = (
         select(func.count())
         .select_from(Visit)
@@ -603,6 +624,14 @@ async def record_location_ping(
 
     No-op for completed/no-show/cancelled visits so a stale device
     doesn't keep updating a finished visit.
+
+    Also denormalises the same ping onto `staff_profiles.last_known_*`
+    so the EVV Live Monitor's staff-level view can show a staff pin
+    even when the staff isn't on a clocked-in visit (see migration 0021).
+    The staff-level write is gated by the same `sharing_location` guard
+    as the visit-level write — a staff member who explicitly revoked
+    permission keeps their previous last-known location; the new ping
+    is silently suppressed.
     """
     visit = await _get_visit_or_404(
         session, visit_id=visit_id, agency_id=agency_id
@@ -623,6 +652,30 @@ async def record_location_ping(
     # don't overwrite since callers may not send it every time.
     if payload.device_id is not None and visit.check_in_device_id is None:
         visit.check_in_device_id = payload.device_id
+
+    # Mirror the ping onto the staff profile so the EVV Live Monitor's
+    # staff-level view can show a "last seen at" pin. The staff row
+    # isn't pre-loaded by `_get_visit_or_404`; cheap single-row fetch.
+    # Done inline (rather than via staff_service._get_staff_or_404) to
+    # keep this module dependency-free — visits is a leaf module.
+    staff = (
+        await session.execute(
+            select(StaffProfile).where(
+                StaffProfile.id == visit.staff_id,
+                StaffProfile.agency_id == agency_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if staff is not None:
+        staff.last_known_lat = payload.lat
+        staff.last_known_lng = payload.lng
+        staff.last_known_ping_at = visit.live_ping_at
+        staff.last_known_visit_id = visit.id
+        if payload.accuracy_m is not None:
+            staff.last_known_accuracy_m = payload.accuracy_m
+        if payload.device_id is not None:
+            staff.last_known_device_id = payload.device_id
+
     await session.flush()
     return visit
 

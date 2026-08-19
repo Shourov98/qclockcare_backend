@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, time
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
@@ -30,6 +31,7 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     Index,
+    Numeric,
     SmallInteger,
     Text,
     Time,
@@ -92,6 +94,33 @@ class StaffProfile(IdMixin, TimestampedMixin, Base):
     hired_at: Mapped[date | None] = mapped_column(Date, nullable=True)
     terminated_at: Mapped[date | None] = mapped_column(Date, nullable=True)
 
+    # ---- last-known location (EVV Live Monitor) ----
+    # Mirrors `visits.live_lat/lng` but is keyed on the staff member
+    # rather than the visit, so the admin map can show a staff pin
+    # even when the staff isn't on a clocked-in visit. Populated by
+    # the same `POST /visits/{id}/location-ping` writer that updates
+    # the visit row (see `visits/service.py:record_location_ping`).
+    # `last_known_visit_id` is `ON DELETE SET NULL` so historical
+    # staff locations aren't deleted when an old visit is purged.
+    last_known_lat: Mapped[Decimal | None] = mapped_column(
+        Numeric(9, 6), nullable=True
+    )
+    last_known_lng: Mapped[Decimal | None] = mapped_column(
+        Numeric(9, 6), nullable=True
+    )
+    last_known_accuracy_m: Mapped[Decimal | None] = mapped_column(
+        Numeric(6, 2), nullable=True
+    )
+    last_known_ping_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_known_device_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_known_visit_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("visits.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     # Relationships
     agency: Mapped[Agency] = relationship(
         "Agency", back_populates="staff_profiles"
@@ -135,6 +164,19 @@ class StaffProfile(IdMixin, TimestampedMixin, Base):
         CheckConstraint(
             "(terminated_at IS NULL) OR (hired_at IS NULL) OR (terminated_at >= hired_at)",
             name="ck_staff_terminated_after_hired",
+        ),
+        # Last-known GPS constraints (mirror migration 0021).
+        CheckConstraint(
+            "last_known_lat IS NULL OR last_known_lat BETWEEN -90 AND 90",
+            name="ck_staff_last_lat_range",
+        ),
+        CheckConstraint(
+            "last_known_lng IS NULL OR last_known_lng BETWEEN -180 AND 180",
+            name="ck_staff_last_lng_range",
+        ),
+        CheckConstraint(
+            "(last_known_lat IS NULL) = (last_known_lng IS NULL)",
+            name="ck_staff_last_lat_lng_pair",
         ),
     )
 

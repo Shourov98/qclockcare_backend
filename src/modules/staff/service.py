@@ -354,6 +354,85 @@ async def list_staff(
     return rows, int(total)
 
 
+# Hard cap on the live-locations endpoint so a giant agency (e.g. one
+# with 4,000 staff) doesn't return a multi-megabyte response. The
+# freshness window effectively shrinks this in practice; the cap is
+# only a defensive ceiling.
+_LIVE_STAFF_MAX_ENTRIES: int = 500
+
+
+async def list_live_staff_locations(
+    session: AsyncSession,
+    *,
+    agency_id: uuid.UUID,
+    freshness_minutes: int = 30,
+) -> list[dict]:
+    """Aggregate staff-level last-known GPS for the EVV Live Monitor.
+
+    Returns a flat list of dicts (one per staff with a fresh ping)
+    already shaped to feed `LiveStaffLocationEntry` directly. We use
+    a LEFT OUTER JOIN to `visits` so staff whose linked visit was
+    deleted still show up — `last_visit_status` is `None` in that
+    case rather than the row being dropped.
+
+    Filters:
+      - `agency_id = current agency`
+      - `status = ACTIVE` (matches the active-roster semantics of
+        `list_staff`; archived / inactive staff don't appear on the
+        live monitor even if they once pinged)
+      - `last_known_ping_at >= now() - freshness_minutes`
+
+    Order: most-recently-seen first, then by `staff_id` for stability.
+
+    Cap: `_LIVE_STAFF_MAX_ENTRIES` (500). If you legitimately need
+    more, add pagination — don't raise the cap.
+    """
+    from src.modules.visits.models import Visit
+
+    freshness_minutes = max(1, min(1440, freshness_minutes))
+    cutoff = datetime.now(UTC) - timedelta(minutes=freshness_minutes)
+
+    # We use a LEFT OUTER JOIN to visits so deleted-visit rows still
+    # surface. `selectinload(StaffProfile.user)` is the same pattern
+    # `list_staff` uses; the visit fields are read off the joined row.
+    stmt = (
+        select(StaffProfile, User, Visit)
+        .join(User, User.id == StaffProfile.user_id)
+        .outerjoin(Visit, Visit.id == StaffProfile.last_known_visit_id)
+        .where(
+            StaffProfile.agency_id == agency_id,
+            StaffProfile.status == UserStatus.ACTIVE,
+            StaffProfile.last_known_ping_at.is_not(None),
+            StaffProfile.last_known_ping_at >= cutoff,
+        )
+        .order_by(
+            StaffProfile.last_known_ping_at.desc().nulls_last(),
+            StaffProfile.id,
+        )
+        .limit(_LIVE_STAFF_MAX_ENTRIES)
+    )
+
+    rows = (await session.execute(stmt)).all()
+
+    entries: list[dict] = []
+    for staff, user, visit in rows:
+        entries.append(
+            {
+                "staff_id": staff.id,
+                "full_name": user.full_name or "",
+                "staff_code": staff.staff_code,
+                "status": staff.status,
+                "last_known_lat": staff.last_known_lat,
+                "last_known_lng": staff.last_known_lng,
+                "last_known_ping_at": staff.last_known_ping_at,
+                "last_known_accuracy_m": staff.last_known_accuracy_m,
+                "last_known_visit_id": staff.last_known_visit_id,
+                "last_visit_status": visit.status if visit is not None else None,
+            }
+        )
+    return entries
+
+
 async def update_staff(
     session: AsyncSession,
     *,
