@@ -721,9 +721,7 @@ Body:
   "check_in_lat": 44.9778,
   "check_in_lng": -93.2650,
   "check_in_accuracy_m": 12.5,
-  "check_in_device_id": "ios-abc-123",
-  "check_in_address_match": true,
-  "check_in_distance_from_location_m": 8
+  "check_in_device_id": "ios-abc-123"
 }
 ```
 

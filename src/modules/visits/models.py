@@ -104,10 +104,6 @@ class Visit(IdMixin, TimestampedMixin, Base):
         Numeric(6, 2), nullable=True
     )
     check_in_device_id: Mapped[str | None] = mapped_column(Text, nullable=True)
-    check_in_address_match: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    check_in_distance_from_location_m: Mapped[Decimal | None] = mapped_column(
-        Numeric(8, 2), nullable=True
-    )
 
     # ---- check-out ----
     check_out_time: Mapped[datetime | None] = mapped_column(

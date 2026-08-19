@@ -37,7 +37,6 @@ from src.core.exceptions import (
     ValidationError,
 )
 from src.modules.appointments.models import Appointment, AppointmentServiceItem
-from src.modules.patients.models import PatientProfile
 from src.modules.staff.models import StaffProfile
 from src.modules.visits.models import (
     ServiceVerification,
@@ -64,7 +63,6 @@ from src.shared.domain.enums import (
     VerificationStatus,
     VisitStatus,
 )
-from src.shared.geo import within_geofence
 from src.shared.utils.datetime_utils import utc_now
 
 # --------------------------------------------------------------------------
@@ -191,67 +189,6 @@ def _extract_constraint(exc: IntegrityError) -> str:
     return "unknown"
 
 
-async def _resolve_effective_location(
-    session: AsyncSession,
-    *,
-    appointment: Appointment,
-) -> tuple[Decimal | None, Decimal | None, int | None]:
-    """Resolve the (lat, lng, geofence_radius_m) tuple used for geofence
-    checks at check-in time.
-
-    Resolution order:
-      1. `appointment.location_lat` / `appointment.location_lng` if both
-         are set (an explicit per-visit override).
-      2. The linked patient's `home_lat` / `home_lng` (loaded via a
-         single targeted select — no full patient hydration).
-      3. Falls through to `(None, None, None)` — caller treats this as
-         "no geofence target, skip the distance/address-match write".
-
-    `geofence_radius_m` is taken from the appointment when set, else
-    `None` (the geo helper then falls back to its 150 m default).
-    """
-    if appointment.location_lat is not None and appointment.location_lng is not None:
-        return (
-            appointment.location_lat,
-            appointment.location_lng,
-            appointment.geofence_radius_m,
-        )
-    patient = await session.get(PatientProfile, appointment.patient_id)
-    if patient is None or patient.home_lat is None or patient.home_lng is None:
-        return None, None, appointment.geofence_radius_m
-    return patient.home_lat, patient.home_lng, appointment.geofence_radius_m
-
-
-def _compute_geofence_fields(
-    *,
-    staff_lat: Decimal | None,
-    staff_lng: Decimal | None,
-    target_lat: Decimal | None,
-    target_lng: Decimal | None,
-    radius_m: int | None,
-) -> tuple[Decimal | None, bool | None]:
-    """Run the haversine + geofence comparison and return (distance_m, match).
-
-    Returns `(None, None)` if either the staff or target coordinates are
-    missing — the caller should leave the existing field values alone in
-    that case.
-    """
-    if (
-        staff_lat is None
-        or staff_lng is None
-        or target_lat is None
-        or target_lng is None
-    ):
-        return None, None
-    within, distance = within_geofence(
-        staff_lat, staff_lng, target_lat, target_lng, radius_m
-    )
-    return (
-        Decimal(distance).quantize(Decimal("0.01")) if distance is not None else None,
-        within,
-    )
-
-
 # --------------------------------------------------------------------------
 # Visits — CRUD
 # --------------------------------------------------------------------------
@@ -280,23 +217,6 @@ async def create_visit(
             details={"appointment_id": str(appt.id)},
         )
 
-    # Server-compute the geofence fields (migration 0019). Resolve the
-    # effective target lat/lng from the appointment, falling back to the
-    # patient's home address. The device-supplied `address_match` and
-    # `distance_from_location_m` are intentionally overridden with the
-    # server's truth — clients can still compute locally, but the
-    # persisted row reflects what the backend measured.
-    target_lat, target_lng, radius_m = await _resolve_effective_location(
-        session, appointment=appt
-    )
-    server_distance, server_match = _compute_geofence_fields(
-        staff_lat=payload.check_in_lat,
-        staff_lng=payload.check_in_lng,
-        target_lat=target_lat,
-        target_lng=target_lng,
-        radius_m=radius_m,
-    )
-
     # UNIQUE(appointment_id) constraint catches double-check-ins
     visit = Visit(
         appointment_id=appt.id,
@@ -308,15 +228,6 @@ async def create_visit(
         check_in_lng=payload.check_in_lng,
         check_in_accuracy_m=payload.check_in_accuracy_m,
         check_in_device_id=payload.check_in_device_id,
-        # Server-computed values take precedence when we have both
-        # endpoints; fall back to the client-supplied payload when the
-        # server couldn't compute (e.g. no target address yet).
-        check_in_address_match=server_match
-        if server_match is not None
-        else payload.check_in_address_match,
-        check_in_distance_from_location_m=server_distance
-        if server_distance is not None
-        else payload.check_in_distance_from_location_m,
     )
     session.add(visit)
     try:
@@ -457,33 +368,6 @@ async def check_in_visit(
         visit.check_in_accuracy_m = payload.check_in_accuracy_m
     if payload.check_in_device_id is not None:
         visit.check_in_device_id = payload.check_in_device_id
-
-    # Server-compute geofence fields (migration 0019). Resolve the
-    # effective target from the appointment (or its patient) and
-    # recompute distance + address_match using the haversine helper.
-    # This overrides any client-supplied values.
-    appt = await session.get(Appointment, visit.appointment_id)
-    if appt is not None:
-        target_lat, target_lng, radius_m = await _resolve_effective_location(
-            session, appointment=appt
-        )
-        server_distance, server_match = _compute_geofence_fields(
-            staff_lat=visit.check_in_lat,
-            staff_lng=visit.check_in_lng,
-            target_lat=target_lat,
-            target_lng=target_lng,
-            radius_m=radius_m,
-        )
-        if server_match is not None:
-            visit.check_in_address_match = server_match
-        elif payload.check_in_address_match is not None:
-            visit.check_in_address_match = payload.check_in_address_match
-        if server_distance is not None:
-            visit.check_in_distance_from_location_m = server_distance
-        elif payload.check_in_distance_from_location_m is not None:
-            visit.check_in_distance_from_location_m = (
-                payload.check_in_distance_from_location_m
-            )
 
     await session.flush()
     return visit

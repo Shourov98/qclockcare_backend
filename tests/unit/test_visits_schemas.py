@@ -47,11 +47,9 @@ class TestVisitCreateRequest:
             check_in_lng=Decimal("-93.2650"),
             check_in_accuracy_m=Decimal("5.00"),
             check_in_device_id="iphone-15-A",
-            check_in_address_match=True,
-            check_in_distance_from_location_m=Decimal("12.5"),
         )
         assert req.check_in_lat == Decimal("44.9778")
-        assert req.check_in_address_match is True
+        assert req.check_in_device_id == "iphone-15-A"
 
     def test_lat_lng_pair_required(self) -> None:
         # Only lat, no lng

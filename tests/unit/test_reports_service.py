@@ -156,7 +156,6 @@ def _fake_session_with_run(run_id: uuid.UUID | None = None) -> AsyncMock:
         completed=0,
         total_seconds=0,
         with_gps=0,
-        with_address_match=0,
     )
     empty_scalars = _MM()
     empty_scalars.all.return_value = []

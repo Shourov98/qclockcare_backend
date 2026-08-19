@@ -408,10 +408,10 @@ async def aggregate_evv(
     """Electronic Visit Verification snapshot.
 
     We don't have a separate EVV table — all of the data lives on
-    `visits` (check-in coordinates, address-match flag, duration). The
-    "manual override" detector is `check_in_address_match IS NULL` —
-    when the staff checked in without GPS verification (offline clock-in
-    or location services denied).
+    `visits` (check-in coordinates, duration). The "manual override"
+    detector is `check_in_lat IS NULL` — when the staff checked in
+    without GPS verification (offline clock-in or location services
+    denied).
     """
     start, end = _resolve_date_range(params)
 
@@ -419,7 +419,6 @@ async def aggregate_evv(
         select(
             func.count(Visit.id).label("total"),
             func.count(Visit.check_in_lat).label("with_gps"),
-            func.count(Visit.check_in_address_match).label("with_address_match"),
             func.coalesce(func.sum(Visit.duration_seconds), 0).label("total_seconds"),
         )
         .where(Visit.agency_id == agency_id)
@@ -429,7 +428,6 @@ async def aggregate_evv(
     row = (await session.execute(base)).one()
     total = int(row.total or 0)
     with_gps = int(row.with_gps or 0)
-    with_address_match = int(row.with_address_match or 0)
     hours = _hours_billed(int(row.total_seconds or 0))
 
     # Manual overrides — clock-ins without a GPS fix.
@@ -464,7 +462,6 @@ async def aggregate_evv(
             "visits": total,
             "with_gps_verification": with_gps,
             "gps_verification_rate": round(with_gps / total, 3) if total else 0.0,
-            "address_match_rate": round(with_address_match / total, 3) if total else 0.0,
             "manual_overrides": manual_overrides,
             "missed_clock_ins": missed_clock_ins,
             "hours_billed": hours,

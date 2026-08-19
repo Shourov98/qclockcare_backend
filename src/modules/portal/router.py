@@ -49,8 +49,6 @@ def _to_response(visit, *, with_relations: bool = False) -> PortalVisitResponse:
         "check_in_lat": visit.check_in_lat,
         "check_in_lng": visit.check_in_lng,
         "check_in_accuracy_m": visit.check_in_accuracy_m,
-        "check_in_address_match": visit.check_in_address_match,
-        "check_in_distance_from_location_m": visit.check_in_distance_from_location_m,
         "check_out_time": visit.check_out_time,
         "check_out_lat": visit.check_out_lat,
         "check_out_lng": visit.check_out_lng,

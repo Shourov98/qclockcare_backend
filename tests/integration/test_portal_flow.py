@@ -215,8 +215,6 @@ async def _create_visit_for_appt(client, auth: dict, appt_id: str) -> str:
             "check_in_lng": "-93.2650",
             "check_in_accuracy_m": "5.0",
             "check_in_device_id": "iphone-test",
-            "check_in_address_match": True,
-            "check_in_distance_from_location_m": "12.5",
         },
         headers=auth,
     )

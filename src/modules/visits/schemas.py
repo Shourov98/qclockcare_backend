@@ -47,8 +47,6 @@ class VisitCreateRequest(BaseModel):
     check_in_lng: Decimal | None = None
     check_in_accuracy_m: Decimal | None = None
     check_in_device_id: Annotated[str, StringConstraints(max_length=512)] | None = None
-    check_in_address_match: bool | None = None
-    check_in_distance_from_location_m: Decimal | None = None
 
     @model_validator(mode="after")
     def _validate_lat_lng_pair(self) -> VisitCreateRequest:
@@ -70,8 +68,6 @@ class VisitCheckInRequest(BaseModel):
     check_in_lng: Decimal | None = None
     check_in_accuracy_m: Decimal | None = None
     check_in_device_id: Annotated[str, StringConstraints(max_length=512)] | None = None
-    check_in_address_match: bool | None = None
-    check_in_distance_from_location_m: Decimal | None = None
 
 
 class VisitCheckOutRequest(BaseModel):
@@ -163,8 +159,6 @@ class VisitResponse(BaseModel):
     check_in_lng: Decimal | None
     check_in_accuracy_m: Decimal | None
     check_in_device_id: str | None
-    check_in_address_match: bool | None
-    check_in_distance_from_location_m: Decimal | None
     check_out_time: datetime | None
     check_out_lat: Decimal | None
     check_out_lng: Decimal | None

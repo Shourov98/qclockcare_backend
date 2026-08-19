@@ -14,8 +14,7 @@ status lifecycle.
 from __future__ import annotations
 
 from datetime import datetime
-from decimal import Decimal
-from typing import Annotated, Literal
+from typing import Annotated
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
@@ -46,40 +45,6 @@ class AppointmentCreateRequest(BaseModel):
     scheduled_end: datetime
     location: Annotated[str, StringConstraints(max_length=512)] | None = None
     notes: Annotated[str, StringConstraints(max_length=4000)] | None = None
-    # ---- Location override (migration 0019) ----
-    location_lat: Decimal | None = Field(
-        default=None,
-        description=(
-            "Per-visit latitude override. When omitted, the visits "
-            "service falls back to the linked patient's home address."
-        ),
-    )
-    location_lng: Decimal | None = Field(
-        default=None,
-        description="Per-visit longitude override (paired with `location_lat`).",
-    )
-    location_address: str | None = Field(
-        default=None,
-        description=(
-            "Free-text address shown to the staff member "
-            "(`1247 Maple Ave, Brooklyn NY 11201`)."
-        ),
-    )
-    location_source: Literal["PATIENT_HOME", "OVERRIDE", "INHERITED"] | None = Field(
-        default=None,
-        description=(
-            "How the location was populated. `PATIENT_HOME` = copied "
-            "from the patient on creation, `OVERRIDE` = manual override, "
-            "`INHERITED` = re-derived from the patient later."
-        ),
-    )
-    geofence_radius_m: Annotated[int, Field(ge=10, le=5000)] | None = Field(
-        default=None,
-        description=(
-            "Geofence radius in metres for this visit. Overrides the "
-            "default 150 m when the appointment is at an unusual location."
-        ),
-    )
     # Optional initial set of service items
     service_items: list[AppointmentServiceItemCreateRequest] = Field(
         default_factory=list
@@ -108,30 +73,6 @@ class AppointmentUpdateRequest(BaseModel):
     scheduled_end: datetime | None = None
     location: Annotated[str, StringConstraints(max_length=512)] | None = None
     notes: Annotated[str, StringConstraints(max_length=4000)] | None = None
-    # ---- Location override (migration 0019) ----
-    location_lat: Decimal | None = Field(
-        default=None,
-        description="New latitude. `null` clears the override.",
-    )
-    location_lng: Decimal | None = Field(
-        default=None,
-        description="New longitude. `null` clears the override.",
-    )
-    location_address: str | None = Field(
-        default=None,
-        description="New free-text address. `null` clears.",
-    )
-    location_source: Literal["PATIENT_HOME", "OVERRIDE", "INHERITED"] | None = Field(
-        default=None,
-        description=(
-            "How the location was populated. `null` leaves the existing "
-            "value untouched."
-        ),
-    )
-    geofence_radius_m: Annotated[int, Field(ge=10, le=5000)] | None = Field(
-        default=None,
-        description="New geofence radius in metres. `null` clears.",
-    )
 
     @model_validator(mode="after")
     def _validate_window(self) -> AppointmentUpdateRequest:
@@ -183,12 +124,6 @@ class AppointmentResponse(BaseModel):
     completed_at: datetime | None
     location: str | None
     notes: str | None
-    # ---- Location override (migration 0019) ----
-    location_lat: Decimal | None
-    location_lng: Decimal | None
-    location_address: str | None
-    location_source: str | None
-    geofence_radius_m: int | None
     cancelled_reason: str | None
     cancelled_at: datetime | None
     created_at: datetime
