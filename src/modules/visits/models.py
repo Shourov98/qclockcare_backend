@@ -138,7 +138,16 @@ class Visit(IdMixin, TimestampedMixin, Base):
         "Appointment", back_populates="visit"
     )
     agency: Mapped[Agency] = relationship("Agency")  # no back-ref needed
-    staff: Mapped[StaffProfile] = relationship("StaffProfile")
+    staff: Mapped[StaffProfile] = relationship(
+        "StaffProfile",
+        # Two FKs exist between `visits` and `staff_profiles`:
+        #  - `visits.staff_id`           -> `staff_profiles.id`  (assigned staff)
+        #  - `staff_profiles.last_known_visit_id` -> `visits.id`  (last visit)
+        # Disambiguate `Visit.staff` to the first FK so the mapper doesn't
+        # raise AmbiguousForeignKeysError during configuration (which would
+        # break every login via `.options(selectinload(User.roles))`).
+        foreign_keys=[staff_id],
+    )
     service_items: Mapped[list[VisitServiceItem]] = relationship(
         back_populates="visit",
         cascade="all, delete-orphan",
