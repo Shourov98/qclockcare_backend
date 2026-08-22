@@ -2,10 +2,12 @@
 
 Manual exploration + CI smoke testing for the QlockCare backend.
 
-The collection covers **all 99 routes** across 10 modules. Each request
-has standard test scripts (status code, envelope shape, X-Request-ID
-round-trip) and the requests that produce IDs auto-extract them into
-the active environment, so chained requests (create → read → update →
+The collection covers every route across 15 folders (auth, staff, patients,
+appointments, visits, portal, notifications, locations, audit-logs, agencies,
+change-password, admin-tickets, admin-compliance, admin-admins, health).
+Each request has standard test scripts (status code, envelope shape,
+X-Request-ID round-trip) and the requests that produce IDs auto-extract them
+into the active environment, so chained requests (create → read → update →
 delete) work without copy-pasting UUIDs.
 
 ---
@@ -70,7 +72,7 @@ collection-level auth helper.
 
 | Folder | Auth | Role required |
 |---|---|---|
-| `auth` | none | public — login, refresh, logout, OTP, password reset |
+| `auth` | none | public — login, refresh, logout, OTP, password reset, accept-invitation |
 | `health` | none | public — `/health`, `/ready` |
 | `staff` | bearer | AGENCY_ADMIN |
 | `patients` | bearer | AGENCY_ADMIN |
@@ -79,7 +81,12 @@ collection-level auth helper.
 | `portal` | bearer | **PATIENT** — these will 403 with AGENCY_ADMIN |
 | `notifications` | bearer | any authenticated user (broadcast is AGENCY_ADMIN) |
 | `locations` | bearer | AGENCY_ADMIN |
-| `audit-logs` | bearer | SUPER_ADMIN |
+| `audit-logs` | bearer | SUPER_ADMIN or PLATFORM_ADMIN(SUPPORT) |
+| `agencies` | bearer | SUPER_ADMIN (write); SUPER_ADMIN + PLATFORM_ADMIN(AGENCIES) (read) |
+| `change-password` | bearer | any authenticated user |
+| `admin-tickets` | bearer | SUPER_ADMIN or PLATFORM_ADMIN(SUPPORT) |
+| `admin-compliance` | bearer | SUPER_ADMIN or PLATFORM_ADMIN(AGENCIES) |
+| `admin-admins` | bearer | SUPER_ADMIN (write); SUPER_ADMIN + PLATFORM_ADMIN (read) |
 
 The `portal/` folder is the one place you'll need to switch roles:
 
