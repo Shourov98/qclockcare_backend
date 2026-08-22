@@ -8,8 +8,11 @@ Claims layout:
     sub              — user UUID
     email            — user email (cheap client display)
     role             — current role (defaults to highest-privilege role)
-    agency_id        — current agency context (NULL for SUPER_ADMIN / no role)
+    agency_id        — current agency context (NULL for SUPER_ADMIN / PLATFORM_ADMIN)
     agency_role      — alias for `role`, kept for clarity in policies
+    scopes           — list of AdminScope strings for PLATFORM_ADMIN;
+                       empty for SUPER_ADMIN (treated as full bypass) and
+                       for non-admin roles
     typ              — "access"
     iss / aud / iat / exp / jti
 
@@ -27,7 +30,7 @@ from __future__ import annotations
 
 import secrets
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -49,6 +52,11 @@ class AccessTokenPayload:
     email: str
     role: str
     agency_id: uuid.UUID | None
+    # Scopes are non-empty only for PLATFORM_ADMIN. SUPER_ADMIN has
+    # full cross-tenant access and doesn't need scopes recorded; the
+    # `require_scope` dependency treats `role == SUPER_ADMIN` as a
+    # bypass. Empty list for AGENCY_ADMIN, STAFF, PATIENT, GUARDIAN.
+    scopes: tuple[str, ...]
     jti: str
 
 
@@ -111,8 +119,14 @@ def issue_access_token(
     email: str,
     role: str,
     agency_id: uuid.UUID | None,
+    scopes: Sequence[str] = (),
 ) -> tuple[str, int]:
-    """Issue a short-lived access token. Returns (token, expires_in_seconds)."""
+    """Issue a short-lived access token. Returns (token, expires_in_seconds).
+
+    `scopes` is included in the payload so the client doesn't need a
+    second round-trip to fetch them. SUPER_ADMIN users can pass an empty
+    list — `require_scope` treats SUPER_ADMIN as a bypass regardless.
+    """
     now = _now()
     ttl = timedelta(minutes=settings.JWT_ACCESS_TOKEN_TTL_MINUTES)
     jti = secrets.token_urlsafe(16)
@@ -122,6 +136,9 @@ def issue_access_token(
         "role": role,
         "agency_id": str(agency_id) if agency_id is not None else None,
         "agency_role": role,
+        # Scopes are always serialised as a list, even if empty, so the
+        # client never has to check for missing key.
+        "scopes": list(scopes),
         "typ": "access",
         "jti": jti,
         "iss": settings.JWT_ISSUER,
@@ -162,6 +179,7 @@ def verify_access_token(token: str) -> AccessTokenPayload:
         email=claims.get("email", ""),
         role=claims.get("role", ""),
         agency_id=uuid.UUID(claims["agency_id"]) if claims.get("agency_id") else None,
+        scopes=tuple(claims.get("scopes") or ()),
         jti=claims["jti"],
     )
 

@@ -94,8 +94,8 @@ def _pick_primary_role(
 ) -> tuple[UserRole, uuid.UUID | None]:
     """Pick the most-privileged role for the access token.
 
-    SUPER_ADMIN wins. Otherwise, the lowest-priority role wins.
-    Returns (role, agency_id).
+    SUPER_ADMIN > PLATFORM_ADMIN > agency-scoped roles. For each
+    tier, the lowest-priority role wins. Returns (role, agency_id).
 
     Raises `InsufficientPermissionsError` if the user has *no* role rows.
     This is a data-integrity failure — every ACTIVE user must have at
@@ -121,6 +121,9 @@ def _pick_primary_role(
     sa = [r for r in roles if r.role == UserRole.SUPER_ADMIN]
     if sa:
         return UserRole.SUPER_ADMIN, None
+    pa = [r for r in roles if r.role == UserRole.PLATFORM_ADMIN]
+    if pa:
+        return UserRole.PLATFORM_ADMIN, None
     ranked = sorted(roles, key=lambda r: _role_priority(r.role))
     top = ranked[0]
     return top.role, top.agency_id
@@ -137,6 +140,29 @@ async def _load_user_with_roles(
     if user is None:
         raise NotFoundError(details={"resource": "user"})
     return user
+
+
+async def _load_user_scopes(
+    session: AsyncSession, *, user_id: uuid.UUID
+) -> tuple[str, ...]:
+    """Return the AdminScope values granted to this user.
+
+    Returns an empty tuple for users without rows in `admin_scopes`
+    (SUPER_ADMIN, AGENCY_ADMIN, STAFF, PATIENT, GUARDIAN). SUPER_ADMIN
+    does not need scopes recorded — `require_scope` treats it as a
+    bypass regardless of this return value.
+
+    Lazy-imported so the module-load order doesn't pull in the admin
+    scopes table for paths that never exercise scope checks.
+    """
+    from src.modules.identity.models import AdminScope as _AdminScope
+
+    rows = (
+        await session.execute(
+            select(_AdminScope.scope_name).where(_AdminScope.user_id == user_id)
+        )
+    ).scalars().all()
+    return tuple(rows)
 
 
 async def _record_audit(
@@ -226,11 +252,13 @@ async def _issue_pair(
         user_role=role.value,
     )
     await assert_agency_allows_auth(session, agency_id=agency_id)
+    scopes = await _load_user_scopes(session, user_id=user.id)
     access_token, expires_in = jwt_service.issue_access_token(
         user_id=user.id,
         email=user.email,
         role=role.value,
         agency_id=agency_id,
+        scopes=scopes,
     )
     refresh_token, jti, expires_at = jwt_service.issue_refresh_token(user_id=user.id)
     session.add(

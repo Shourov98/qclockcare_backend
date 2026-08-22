@@ -43,7 +43,8 @@ from src.modules.identity.dependencies import (
     get_session_with_auth,
     require_role,
 )
-from src.shared.domain.enums import AuditAction, UserRole
+from src.modules.identity.scope_deps import require_scope
+from src.shared.domain.enums import AdminScope, AuditAction, UserRole
 from src.shared.schemas.docs import standard_responses
 from src.shared.schemas.pagination import build_offset_response
 
@@ -53,6 +54,10 @@ router = APIRouter(prefix="/agencies", tags=["agencies"])
 
 # All agencies routes require SUPER_ADMIN.
 _SUPER_ADMIN_ONLY = [Depends(require_role(UserRole.SUPER_ADMIN))]
+# Read-only or scoped-mutation endpoints that PLATFORM_ADMIN with
+# AGENCIES scope can also reach. POST/DELETE stay SUPER_ADMIN-only
+# because they change the agency hierarchy fundamentally.
+_AGENCIES_SCOPE = [Depends(require_scope(AdminScope.AGENCIES))]
 
 
 # --------------------------------------------------------------------------
@@ -78,7 +83,7 @@ async def list_subscription_packages_endpoint() -> AgencySubscriptionPackageList
 @router.get(
     "",
     response_model=AgencyListResponse,
-    dependencies=_SUPER_ADMIN_ONLY,
+    dependencies=_AGENCIES_SCOPE,
     responses=standard_responses(include=[401, 403]),
 )
 async def list_agencies_endpoint(
@@ -100,7 +105,7 @@ async def list_agencies_endpoint(
         Query(max_length=255, description="Case-insensitive name search"),
     ] = None,
 ) -> AgencyListResponse:
-    """List all agencies (SUPER_ADMIN only, paginated)."""
+    """List all agencies (SUPER_ADMIN or PLATFORM_ADMIN w/ AGENCIES, paginated)."""
     rows, total = await agencies_service.list_agencies(
         session,
         page=page,
@@ -285,7 +290,7 @@ async def add_agency_admin_endpoint(
 @router.get(
     "/{agency_id}",
     response_model=AgencyResponse,
-    dependencies=_SUPER_ADMIN_ONLY,
+    dependencies=_AGENCIES_SCOPE,
     responses=standard_responses(include=[401, 403, 404]),
 )
 async def get_agency_endpoint(
@@ -309,7 +314,7 @@ async def get_agency_endpoint(
 @router.patch(
     "/{agency_id}",
     response_model=AgencyResponse,
-    dependencies=_SUPER_ADMIN_ONLY,
+    dependencies=_AGENCIES_SCOPE,
     responses=standard_responses(include=[401, 403, 404, 409, 422]),
 )
 async def update_agency_endpoint(
@@ -406,7 +411,7 @@ async def delete_agency_endpoint(
 @router.get(
     "/{agency_id}/programs",
     response_model=AgencyProgramListResponse,
-    dependencies=_SUPER_ADMIN_ONLY,
+    dependencies=_AGENCIES_SCOPE,
     responses=standard_responses(include=[401, 403, 404]),
 )
 async def list_agency_programs_endpoint(

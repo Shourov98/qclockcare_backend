@@ -36,20 +36,22 @@ from src.modules.identity.dependencies import (
     get_session_with_auth,
     require_role,
 )
+from src.modules.identity.scope_deps import require_scope
 from src.modules.patients.models import PatientProfile
 from src.modules.staff.models import StaffProfile
-from src.shared.domain.enums import UserRole, UserStatus
+from src.shared.domain.enums import AdminScope, UserRole, UserStatus
 from src.shared.schemas.docs import standard_responses
 from src.shared.schemas.pagination import PaginatedResponse, build_offset_response
 
 # Single router under `/admin/people` keeps the URL surface tight:
 #   GET /admin/people/staff
 #   GET /admin/people/patients
-# Both are SUPER_ADMIN-only.
+# Both are SUPER_ADMIN-only OR PLATFORM_ADMIN with CLINICAL scope.
 
 router = APIRouter(prefix="/admin/people", tags=["admin-people"])
 
 _SUPER_ADMIN_ONLY = [Depends(require_role(UserRole.SUPER_ADMIN))]
+_CLINICAL_SCOPE = [Depends(require_scope(AdminScope.CLINICAL))]
 
 
 # --------------------------------------------------------------------------
@@ -205,9 +207,9 @@ class AdminPatientSummaryResponse(PaginatedResponse[dict]):
 @router.get(
     "/staff",
     response_model=AdminStaffSummaryResponse,
-    dependencies=_SUPER_ADMIN_ONLY,
+    dependencies=_CLINICAL_SCOPE,
     responses=standard_responses(include=[401, 403, 422]),
-    summary="List staff across all agencies (SUPER_ADMIN)",
+    summary="List staff across all agencies (SUPER_ADMIN or PLATFORM_ADMIN w/ CLINICAL)",
     description=(
         "Paginated staff list with optional `agency_id`, `status`, "
         "and `search` (case-insensitive `staff_code` substring) "
@@ -265,9 +267,9 @@ async def list_admin_staff_endpoint(
 @router.get(
     "/patients",
     response_model=AdminPatientSummaryResponse,
-    dependencies=_SUPER_ADMIN_ONLY,
+    dependencies=_CLINICAL_SCOPE,
     responses=standard_responses(include=[401, 403, 422]),
-    summary="List patients across all agencies (SUPER_ADMIN)",
+    summary="List patients across all agencies (SUPER_ADMIN or PLATFORM_ADMIN w/ CLINICAL)",
     description=(
         "Paginated patient list with optional `agency_id`, `status`, "
         "and `search` (case-insensitive `patient_code` substring) "
