@@ -303,7 +303,8 @@ pm.test('Login (negative) — error.code is INVALID_CREDENTIALS', () => {
             method="POST",
             path="/auth/accept-invitation",
             body={
-                "token": "<invitation-token>",
+                "email": "<invitee-email>",
+                "otp": "000000",
                 "password": "InviteePass123!",
             },
             auth=_noauth(),
@@ -803,8 +804,44 @@ VISITS_FOLDER = folder(
             path="/visits/{{visit_id}}/issues/00000000-0000-0000-0000-000000000000/resolve",
             body={"resolution": "Patient took medication at 10:30"},
         ),
+        # Live GPS — staff opt-in EVV location sharing. The staff mobile
+        # app calls `start-location-sharing` once when the user toggles
+        # sharing on, then `location-ping` ~every 15 s while sharing.
+        # `stop-location-sharing` is the opt-out. All three are
+        # POST-only, idempotent, and return the visit row so the SPA can
+        # refresh `live_lat` / `live_lng` / `live_ping_at` from the
+        # response without a second GET.
+        make_request(
+            name="Start location sharing for visit",
+            method="POST",
+            path="/visits/{{visit_id}}/start-location-sharing",
+            body={
+                "initial_lat": 44.9778,
+                "initial_lng": -93.2650,
+                "initial_accuracy_m": 12.5,
+            },
+        ),
+        make_request(
+            name="Send location ping for visit",
+            method="POST",
+            path="/visits/{{visit_id}}/location-ping",
+            body={
+                "lat": 44.9778,
+                "lng": -93.2650,
+                "accuracy_m": 12.5,
+                "device_id": "ios-abc-123",
+            },
+        ),
+        make_request(
+            name="Stop location sharing for visit",
+            method="POST",
+            path="/visits/{{visit_id}}/stop-location-sharing",
+        ),
     ],
-    description="Field visits by care staff — check-in/out, notes, patient verification, issue reporting.",
+    description=(
+        "Field visits by care staff — check-in/out, notes, patient "
+        "verification, issue reporting, and live GPS sharing."
+    ),
 )
 
 # --------------------------------------------------------------------------
@@ -990,6 +1027,15 @@ AGENCIES_FOLDER = folder(
                 "timezone": "America/Chicago",
                 "settings": {"theme": "light"},
                 "initial_program_codes": ["PCA", "ARMHS"],
+                "admin": {
+                    "email": "agencyadmin{{$randomUUID}}@qlockcare.dev",
+                    "full_name": "Agency Admin",
+                    # `password` omitted → admin is created in INVITED
+                    # status and an invitation email is scheduled. Copy
+                    # the OTP from the terminal log line
+                    # `auth.email.dev_invitation_for_test_only` and
+                    # submit it via `POST /auth/accept-invitation`.
+                },
             },
             extract=[("agency_id", "id")],
         ),
@@ -997,6 +1043,19 @@ AGENCIES_FOLDER = folder(
             name="Get agency by id",
             method="GET",
             path="/agencies/{{agency_id}}",
+        ),
+        make_request(
+            name="Add agency admin (orphan remediation)",
+            method="POST",
+            path="/agencies/{{agency_id}}/admins",
+            body={
+                "email": "agencyadmin{{$randomUUID}}@qlockcare.dev",
+                "full_name": "Agency Admin",
+                # `password` omitted → admin is created in INVITED
+                # status. Copy the OTP from the terminal log line
+                # `auth.email.dev_invitation_for_test_only` and submit
+                # it via `POST /auth/accept-invitation`.
+            },
         ),
         make_request(
             name="Get deleted agency by id (?include_deleted=true)",
@@ -1297,6 +1356,489 @@ HEALTH_FOLDER = folder(
 # Assemble the collection
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Role-based ordering
+# --------------------------------------------------------------------------
+# The resource-level folders above (AUTH_FOLDER, STAFF_FOLDER, …)
+# are the source of truth for request bodies, scripts, and field
+# extraction. Below we re-cut them into per-role folders so a frontend
+# dev can open one folder and see every API that role can call.
+#
+# Roles (top-level folders):
+#   1. Auth           — public (login, refresh, OTP, forgot/reset, accept-invitation)
+#   2. Admin          — SUPER_ADMIN across all tenants
+#   3. Agency Admin   — AGENCY_ADMIN within their tenant
+#   4. Staff          — STAFF (field caregivers)
+#   5. Patient        — PATIENT (self-service)
+#   6. Guardian       — GUARDIAN (linked to children / wards)
+#   7. Health         — public probes
+#
+# Redundancy is intentional and accepted by the product team: the same
+# endpoint (e.g. `GET /staff/{id}`) shows up under both Agency Admin
+# (read all staff) and Staff (read own profile). Each occurrence is a
+# full request so the frontend dev can just open the right folder and
+# run them in order.
+# --------------------------------------------------------------------------
+
+# `_by_name` re-emits a request from a resource folder by name. We
+# rebuild the request entry from a source dict so each role folder
+# gets a fresh Auth/header pre-request test that says "this request
+# is being run by <Role>".
+def _by_name(source: dict[str, Any], role: str) -> dict[str, Any] | None:
+    """Return a copy of the request from `source` whose `name` matches.
+
+    `source` is a folder dict (has `item` key). We deep-copy the
+    matching request so the role-tagged copy doesn't mutate the
+    source folder.
+    """
+    for req in source.get("item", []):
+        if req.get("name") == role:
+            return json.loads(json.dumps(req))
+    return None
+
+
+# --------------------------------------------------------------------------
+# 1b. Admin cross-tenant people (SUPER_ADMIN) — see
+#     qclockcare_backend/src/modules/admin_people/router.py
+# --------------------------------------------------------------------------
+ADMIN_PEOPLE_FOLDER = folder(
+    "admin-people",
+    [
+        make_request(
+            name="List staff across all agencies",
+            method="GET",
+            path="/admin/people/staff?page=1&page_size=25",
+        ),
+        make_request(
+            name="List patients across all agencies",
+            method="GET",
+            path="/admin/people/patients?page=1&page_size=25",
+        ),
+    ],
+    description=(
+        "Cross-tenant read views for staff + patients (SUPER_ADMIN only). "
+        "Use `agency_id`, `status`, and `search` query params to narrow."
+    ),
+)
+
+
+# --------------------------------------------------------------------------
+# 1. Admin (SUPER_ADMIN) — cross-tenant ops
+
+
+# (rest of the helper functions unchanged below)
+def _requests(source: dict[str, Any], *names: str) -> list[dict[str, Any]]:
+    """Resolve a list of request names from a source folder.
+
+    Skips (and warns) any name that doesn't exist — better than
+    silently dropping a request.
+    """
+    found: list[dict[str, Any]] = []
+    for n in names:
+        r = _by_name(source, n)
+        if r is None:
+            raise ValueError(
+                f"Request '{n}' not found in folder '{source.get('name')}'"
+            )
+        found.append(r)
+    return found
+
+
+# --------------------------------------------------------------------------
+# 1. Admin (SUPER_ADMIN) — cross-tenant ops
+# --------------------------------------------------------------------------
+ADMIN_FOLDER = folder(
+    "Admin",
+    [
+        # Tenant setup
+        *_requests(AGENCIES_FOLDER,
+            "List agencies (paginated)",
+            "Create agency",
+            "Get agency by id",
+            "Add agency admin (orphan remediation)",
+            "Get deleted agency by id (?include_deleted=true)",
+            "Patch agency (rename + status flip)",
+            "Soft-delete agency",
+            "List programs the agency offers",
+        ),
+        # Cross-tenant people read views
+        *_requests(ADMIN_PEOPLE_FOLDER,
+            "List staff across all agencies",
+            "List patients across all agencies",
+        ),
+        # Audit trail — SUPER_ADMIN sees everything across all agencies
+        *_requests(AUDIT_LOGS_FOLDER,
+            "List audit logs (paginated, filterable)",
+            "Get audit log by id",
+        ),
+        # Locations — admin can write to any agency
+        *_requests(LOCATIONS_FOLDER,
+            "List locations",
+            "Create location",
+            "Get location by id",
+            "Update location",
+            "Archive location (DELETE)",
+        ),
+        # Notifications — admin can broadcast
+        *_requests(NOTIFICATIONS_FOLDER,
+            "List my notifications",
+            "Get unread badge count",
+            "Get notification by id",
+            "Mark notification as read",
+            "Mark all notifications as read",
+            "Send broadcast (AGENCY_ADMIN)",
+        ),
+    ],
+    description=(
+        "Cross-tenant admin (SUPER_ADMIN role). Tenant setup, orphan-admin "
+        "remediation, agency programs, audit trail, broadcast, and any "
+        "location/notification endpoint that SUPER_ADMIN can act on. "
+        "Log in as `super@qlockcare.dev` before running these."
+    ),
+)
+
+
+# --------------------------------------------------------------------------
+# 2. Agency Admin — tenant-level admin
+# --------------------------------------------------------------------------
+AGENCY_ADMIN_FOLDER = folder(
+    "Agency Admin",
+    [
+        # Staff management
+        *_requests(STAFF_FOLDER,
+            "List staff (paginated)",
+            "Create staff",
+            "Get staff by id",
+            "Get staff with details",
+            "Update staff",
+            "Archive staff (DELETE)",
+            "List qualifications for staff",
+            "Add qualification",
+            "Update qualification",
+            "Delete qualification",
+            "Download qualification file",
+            "List availability slots",
+            "Add availability slot",
+            "Update availability slot",
+            "Delete availability slot",
+        ),
+        # Patient + guardian management
+        *_requests(PATIENTS_FOLDER,
+            "List patients (paginated)",
+            "Create patient",
+            "Get patient by id",
+            "Get patient with relationships",
+            "Update patient",
+            "Archive patient (DELETE)",
+            "Link guardian to patient",
+            "List guardians for patient",
+            "Create standalone guardian",
+            "List guardians (paginated)",
+            "Get guardian by id",
+            "Update guardian",
+            "Delete guardian",
+            "Update relationship",
+            "Delete relationship",
+        ),
+        # Scheduling
+        *_requests(APPOINTMENTS_FOLDER,
+            "List appointments (paginated)",
+            "Create appointment",
+            "Get appointment with items",
+            "Get appointment by id",
+            "Update appointment",
+            "Cancel appointment",
+            "Transition appointment state",
+            "Assign staff to appointment",
+            "Confirm appointment (patient)",
+            "Request reschedule (patient)",
+            "Request cancellation (patient)",
+            "List appointment events",
+            "Get appointment confirmation",
+            "List service items for appointment",
+            "Add service item",
+            "Update service item",
+            "Delete service item",
+        ),
+        # Visits — agency admin can do everything
+        *_requests(VISITS_FOLDER,
+            "Create visit (from appointment)",
+            "Get visit by id",
+            "Get visit with items",
+            "List visits (paginated)",
+            "Check in to visit",
+            "Check out of visit",
+            "Transition visit state",
+            "List visit service items",
+            "Add visit service item",
+            "Update visit service item",
+            "Delete visit service item",
+            "List visit notes",
+            "Add visit note",
+            "Verify visit (PATIENT role)",
+            "Dispute visit (PATIENT role)",
+            "List visit issues",
+            "Report visit issue",
+            "Resolve visit issue",
+            "Start location sharing for visit",
+            "Send location ping for visit",
+            "Stop location sharing for visit",
+        ),
+        # Locations — admin of one tenant
+        *_requests(LOCATIONS_FOLDER,
+            "List locations",
+            "Create location",
+            "Get location by id",
+            "Update location",
+            "Archive location (DELETE)",
+        ),
+        # Notifications
+        *_requests(NOTIFICATIONS_FOLDER,
+            "List my notifications",
+            "Get unread badge count",
+            "Get my preferences",
+            "Update a preference",
+            "Get notification by id",
+            "Mark notification as read",
+            "Mark all notifications as read",
+            "Send broadcast (AGENCY_ADMIN)",
+        ),
+        # Audit logs — own agency
+        *_requests(AUDIT_LOGS_FOLDER,
+            "List audit logs (paginated, filterable)",
+            "Get audit log by id",
+        ),
+    ],
+    description=(
+        "Agency-scoped admin (AGENCY_ADMIN role). Full CRUD on staff, "
+        "patients, guardians, appointments, visits, locations, and "
+        "notifications within their own agency. Can also broadcast. "
+        "Log in as `admin@qlockcare.dev` before running these."
+    ),
+)
+
+
+# --------------------------------------------------------------------------
+# 3. Staff — field caregivers
+# --------------------------------------------------------------------------
+STAFF_FOLDER_RF = folder(
+    "Staff",
+    [
+        # Own profile
+        *_requests(STAFF_FOLDER,
+            "Get staff by id",
+            "Get staff with details",
+            "List qualifications for staff",
+            "Update qualification",
+            "Download qualification file",
+            "List availability slots",
+            "Add availability slot",
+            "Update availability slot",
+            "Delete availability slot",
+        ),
+        # Patient list — staff needs to see who they visit
+        *_requests(PATIENTS_FOLDER,
+            "List patients (paginated)",
+            "Get patient by id",
+            "List guardians (paginated)",
+        ),
+        # Appointments — staff sees their assignments
+        *_requests(APPOINTMENTS_FOLDER,
+            "List appointments (paginated)",
+            "Get appointment with items",
+            "Get appointment by id",
+            "List appointment events",
+            "Get appointment confirmation",
+            "List service items for appointment",
+        ),
+        # Visits — staff check-in/out, notes, services
+        *_requests(VISITS_FOLDER,
+            "Create visit (from appointment)",
+            "Get visit by id",
+            "Get visit with items",
+            "List visits (paginated)",
+            "Check in to visit",
+            "Check out of visit",
+            "Transition visit state",
+            "List visit service items",
+            "Add visit service item",
+            "Update visit service item",
+            "Delete visit service item",
+            "List visit notes",
+            "Add visit note",
+            "List visit issues",
+            "Report visit issue",
+            "Start location sharing for visit",
+            "Send location ping for visit",
+            "Stop location sharing for visit",
+        ),
+        # Locations — read-only
+        *_requests(LOCATIONS_FOLDER,
+            "List locations",
+            "Get location by id",
+        ),
+        # Notifications
+        *_requests(NOTIFICATIONS_FOLDER,
+            "List my notifications",
+            "Get unread badge count",
+            "Get my preferences",
+            "Update a preference",
+            "Get notification by id",
+            "Mark notification as read",
+            "Mark all notifications as read",
+        ),
+    ],
+    description=(
+        "Field-caregiver role (STAFF). Own profile + qualifications + "
+        "availability, assigned appointments + visits, check-in / "
+        "check-out, notes, services, and location reads. "
+        "Log in as `staff@qlockcare.dev` before running these."
+    ),
+)
+
+
+# --------------------------------------------------------------------------
+# 4. Patient — self-service
+# --------------------------------------------------------------------------
+PATIENT_FOLDER = folder(
+    "Patient",
+    [
+        # Own profile
+        *_requests(PATIENTS_FOLDER,
+            "Get patient by id",
+            "Get patient with relationships",
+            "List guardians for patient",
+        ),
+        # Appointment lifecycle (patient-side actions)
+        *_requests(APPOINTMENTS_FOLDER,
+            "List appointments (paginated)",
+            "Get appointment with items",
+            "Get appointment by id",
+            "Confirm appointment (patient)",
+            "Request reschedule (patient)",
+            "Request cancellation (patient)",
+            "List appointment events",
+            "Get appointment confirmation",
+            "List service items for appointment",
+        ),
+        # Visits — patient verify/dispute via regular visits endpoints
+        *_requests(VISITS_FOLDER,
+            "Get visit by id",
+            "Get visit with items",
+            "List visits (paginated)",
+            "Verify visit (PATIENT role)",
+            "Dispute visit (PATIENT role)",
+            "List visit issues",
+            "Report visit issue",
+        ),
+        # Patient portal — self-service
+        *_requests(PORTAL_FOLDER,
+            "List my visits (PATIENT)",
+            "Get my visit detail (PATIENT)",
+            "Verify my visit (PATIENT)",
+            "Dispute my visit (PATIENT)",
+            "Report issue on my visit (PATIENT)",
+        ),
+        # Locations — read-only
+        *_requests(LOCATIONS_FOLDER,
+            "List locations",
+            "Get location by id",
+        ),
+        # Notifications
+        *_requests(NOTIFICATIONS_FOLDER,
+            "List my notifications",
+            "Get unread badge count",
+            "Get my preferences",
+            "Update a preference",
+            "Get notification by id",
+            "Mark notification as read",
+            "Mark all notifications as read",
+        ),
+    ],
+    description=(
+        "Patient self-service (PATIENT role). Own profile + appointments, "
+        "visit verify / dispute / report-issue, and the `/portal/*` "
+        "self-service endpoints. "
+        "Log in as `patient@qlockcare.dev` before running these."
+    ),
+)
+
+
+# --------------------------------------------------------------------------
+# 5. Guardian — linked to a patient
+# --------------------------------------------------------------------------
+GUARDIAN_FOLDER = folder(
+    "Guardian",
+    [
+        # Own profile
+        *_requests(PATIENTS_FOLDER,
+            "Get guardian by id",
+        ),
+        # Linked patients — guardians see their wards
+        *_requests(PATIENTS_FOLDER,
+            "Get patient by id",
+            "Get patient with relationships",
+            "List guardians for patient",
+        ),
+        # Appointment lifecycle (guardian-side actions)
+        *_requests(APPOINTMENTS_FOLDER,
+            "List appointments (paginated)",
+            "Get appointment with items",
+            "Get appointment by id",
+            "Confirm appointment (patient)",
+            "Request reschedule (patient)",
+            "Request cancellation (patient)",
+            "List appointment events",
+            "Get appointment confirmation",
+            "List service items for appointment",
+        ),
+        # Visits — guardian verify/dispute
+        *_requests(VISITS_FOLDER,
+            "Get visit by id",
+            "Get visit with items",
+            "List visits (paginated)",
+            "Verify visit (PATIENT role)",
+            "Dispute visit (PATIENT role)",
+            "List visit issues",
+            "Report visit issue",
+        ),
+        # Portal — guardian sees same self-service endpoints
+        *_requests(PORTAL_FOLDER,
+            "List my visits (PATIENT)",
+            "Get my visit detail (PATIENT)",
+            "Verify my visit (PATIENT)",
+            "Dispute my visit (PATIENT)",
+            "Report issue on my visit (PATIENT)",
+        ),
+        # Locations — read-only
+        *_requests(LOCATIONS_FOLDER,
+            "List locations",
+            "Get location by id",
+        ),
+        # Notifications
+        *_requests(NOTIFICATIONS_FOLDER,
+            "List my notifications",
+            "Get unread badge count",
+            "Get my preferences",
+            "Update a preference",
+            "Get notification by id",
+            "Mark notification as read",
+            "Mark all notifications as read",
+        ),
+    ],
+    description=(
+        "Guardian role (GUARDIAN). Linked patients, ward's appointment "
+        "lifecycle, visit verify / dispute / report-issue, and the "
+        "`/portal/*` self-service endpoints. "
+        "Log in as a guardian (seed via `patients > Create guardian` "
+        "under Agency Admin) before running these."
+    ),
+)
+
+
+# --------------------------------------------------------------------------
+# Assemble the collection
+# --------------------------------------------------------------------------
 COLLECTION: dict[str, Any] = {
     "info": {
         "_postman_id": COLLECTION_ID,
@@ -1316,11 +1858,34 @@ COLLECTION: dict[str, Any] = {
             "- `change-password`, `admin-tickets`, `admin-compliance`, `admin-admins` — admin dashboard.\n"
             "- `notifications > list/read/badge` — any authenticated user.\n"
             "- `portal` — PATIENT role only.\n\n"
+            "4. Open `Auth > Login` and click Send. Tokens auto-populate into the env.\n"
+            "5. Click into any role folder — each request is auto-authenticated.\n\n"
+            "**Folders are organized by role**, so a frontend dev can open "
+            "one folder and see every API that role can call:\n\n"
+            "1. `Auth` — public (login, refresh, logout, me, OTP, forgot/reset, accept-invitation).\n"
+            "2. `Admin` — SUPER_ADMIN across all tenants (agencies, audit, locations, broadcasts).\n"
+            "3. `Agency Admin` — AGENCY_ADMIN within their tenant (staff, patients, guardians, appointments, visits, locations, notifications, audit).\n"
+            "4. `Staff` — STAFF (own profile, qualifications, availability, assigned visits, check-in/out, notes).\n"
+            "5. `Patient` — PATIENT (own profile, appointment confirm/reschedule/cancel, visit verify/dispute, `/portal/*`).\n"
+            "6. `Guardian` — GUARDIAN (linked patients, ward's appointment lifecycle, visit verify/dispute, `/portal/*`).\n"
+            "7. `Health` — public liveness/readiness probes.\n\n"
+            "**Redundancy is intentional**: the same endpoint shows up under every "
+            "role that can call it. Each occurrence is a full request so the frontend "
+            "dev can just open the right folder and run them in order.\n\n"
+            "**Smoke-test order for a brand-new tenant:**\n"
+            "Auth > Login → Agency Admin > Create agency → Admin > Create staff → "
+            "Agency Admin > Create patient → sign out → share the invite link "
+            "from the terminal logs (look for `auth.email.dev_invitation_for_test_only`).\n\n"
+            "**Role swap:** when switching folders, re-run `Auth > Login` with the "
+            "appropriate seeded credentials (`super@`, `admin@`, `staff@`, "
+            "`patient@qlockcare.dev`). The collection pre-request script auto-refreshes "
+            "expired tokens, so you only need to re-login on role switch.\n\n"
             "**CI:** the same collection runs under Newman on every PR. See `.github/workflows/api-smoke.yml`."
         ),
         "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     },
     "item": [
+        # 1. Auth — public endpoints (no Bearer required).
         AUTH_FOLDER,
         STAFF_FOLDER,
         PATIENTS_FOLDER,
@@ -1335,6 +1900,17 @@ COLLECTION: dict[str, Any] = {
         ADMIN_TICKETS_FOLDER,
         ADMIN_COMPLIANCE_FOLDER,
         ADMIN_ADMINS_FOLDER,
+        # 2. Admin (SUPER_ADMIN) — cross-tenant ops.
+        ADMIN_FOLDER,
+        # 3. Agency Admin (AGENCY_ADMIN) — most-used role.
+        AGENCY_ADMIN_FOLDER,
+        # 4. Staff (STAFF) — field caregivers.
+        STAFF_FOLDER_RF,
+        # 5. Patient (PATIENT) — self-service.
+        PATIENT_FOLDER,
+        # 6. Guardian (GUARDIAN) — linked to patients.
+        GUARDIAN_FOLDER,
+        # 7. Health — public probes.
         HEALTH_FOLDER,
     ],
     "event": [
@@ -1363,8 +1939,13 @@ def main() -> None:
         return n
 
     print(f"Wrote {out}")
-    print(f"Folders: {len(COLLECTION['item'])}")
-    print(f"Total requests: {_count(COLLECTION['item'])}")
+    print(f"Top-level folders: {len(COLLECTION['item'])}")
+    total = _count(COLLECTION["item"])
+    print(f"Total requests (with intentional role duplication): {total}")
+    print()
+    print("Role order:")
+    for f in COLLECTION["item"]:
+        print(f"  {f['name']:<14} {_count(f['item']):>3} requests")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,21 @@ from typing import Annotated, Literal
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+DEPLOYED_CORS_ORIGINS = [
+    "https://qlockcare-admin.vercel.app",
+    "https://qlockcare-site.vercel.app",
+    # Netlify-hosted admin + site (the live deployments currently in use).
+    # Render is the backend host; the SPAs are on Netlify, not Vercel.
+    "https://qlockcare-admin.netlify.app",
+    "https://qlockcare-site.netlify.app",
+]
+
+LOCAL_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:5173",
+]
+
 
 class Settings(BaseSettings):
     """Application settings. All env-driven; immutable after construction."""
@@ -40,7 +55,13 @@ class Settings(BaseSettings):
     # `NoDecode` tells pydantic-settings NOT to JSON-parse this from env —
     # we want the raw comma-separated string so the `_split_csv` validator
     # can split it.
-    CORS_ORIGINS: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # Defaults to the two production Vercel frontends so a fresh deploy
+    # doesn't ship with CORS accidentally locked down. Local dev should
+    # set `CORS_ORIGINS=http://localhost:3000,http://localhost:3001` in
+    # their `.env`; production should set the full allow-list explicitly.
+    CORS_ORIGINS: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [*DEPLOYED_CORS_ORIGINS, *LOCAL_CORS_ORIGINS]
+    )
     REQUEST_BODY_SIZE_LIMIT: str = "2mb"
 
     # ----- Database -----
@@ -112,6 +133,22 @@ class Settings(BaseSettings):
     # actual sleep is uniformly chosen from [0.5*base, 1.5*base]).
     SMTP_RETRY_JITTER: float = Field(default=0.5, ge=0.0, le=1.0)
 
+    # ----- Email (Resend) — ADR-0020 -----
+    # Resend is the project's preferred transactional email provider
+    # (see ADR-0020). When `RESEND_ENABLED=true` and `RESEND_API_KEY` is
+    # set, `EmailProvider` POSTs to `https://api.resend.com/emails`
+    # instead of going through aiosmtplib. Falls back to SMTP if Resend
+    # is not enabled, then to the dev-log fallback if neither is on.
+    RESEND_ENABLED: bool = False
+    RESEND_API_KEY: SecretStr | None = None
+    # From-address used by the Resend branch. The domain must be
+    # verified in the Resend dashboard before mail can be sent from it.
+    RESEND_EMAIL: str = "noreply@qlockcare.com"
+    # Connect / send timeout for the outbound Resend call. Mirrors
+    # `SMTP_TIMEOUT_SECONDS` so the retry loop has a comparable upper
+    # bound on per-attempt wall time.
+    RESEND_API_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=120)
+
     # ----- Frontend (deep links in transactional emails) -----
     # Base URL of the SPA — used by transactional auth emails
     # (OTP verify, password reset) to build a clickable deep link.
@@ -121,6 +158,23 @@ class Settings(BaseSettings):
     # MUST stay False in production.
     LOG_INCLUDE_DEV_OTPS: bool = False
 
+    # ----- Cookies (ADR — HttpOnly auth) -----
+    # When True, the `qc_access` / `qc_refresh` cookies are sent with
+    # `Secure` (HTTPS-only). MUST stay False in local dev (browsers
+    # silently drop Secure cookies on `http://localhost`). Flip on in
+    # any environment that's served over TLS.
+    COOKIE_SECURE: bool = False
+    # SameSite policy for `qc_access` and `qc_csrf`. `lax` is the
+    # project default — it allows top-level GET navigations from
+    # third-party sites (good UX) while still blocking cross-origin
+    # POST/PUT/PATCH/DELETE. Use `strict` if you want full defense
+    # against OAuth-style confused-deputy flows.
+    COOKIE_SAMESITE: Literal["lax", "strict", "none"] = "lax"
+    # Optional cookie domain (e.g. `.qlockcare.com`) so cookies are
+    # shared across subdomains. `None` lets the browser default to the
+    # exact origin (recommended for single-host deployments).
+    COOKIE_DOMAIN: str | None = None
+
     # ----- SMS (Twilio) — Phase 2 -----
     SMS_ENABLED: bool = False
     TWILIO_ACCOUNT_SID: str | None = None
@@ -128,21 +182,29 @@ class Settings(BaseSettings):
     TWILIO_FROM_NUMBER: str | None = None
 
     # ----- Storage (ADR-0018) -----
-    STORAGE_BACKEND: Literal["s3", "supabase"] = "s3"
+    # Default is `supabase` — clients already running on Supabase don't
+    # need to set up a separate S3-compatible service. Switch to `s3`
+    # for AWS S3 / Floci / MinIO / Cloudflare R2 deployments.
+    STORAGE_BACKEND: Literal["s3", "supabase"] = "supabase"
     STORAGE_MAX_FILE_SIZE_MB: int = Field(default=10, ge=1, le=100)
     # `NoDecode` — same as CORS_ORIGINS, we want the raw CSV from env.
     STORAGE_ALLOWED_MIME_TYPES: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["image/png", "image/jpeg", "application/pdf"]
     )
+    # Signed-URL TTL — canonical setting shared by every storage backend.
+    STORAGE_PRESIGNED_URL_TTL_SECONDS: int = Field(default=900, ge=60, le=86400)
 
-    # ----- S3-Compatible -----
+    # ----- S3-Compatible (only used when STORAGE_BACKEND=s3) -----
     S3_ENDPOINT_URL: str | None = None
     S3_REGION: str = "us-east-1"
     S3_ACCESS_KEY_ID: SecretStr = SecretStr("any")
     S3_SECRET_ACCESS_KEY: SecretStr = SecretStr("any")
     S3_FORCE_PATH_STYLE: bool = False
     S3_BUCKET_QUALIFICATIONS: str = "qualifications"
-    S3_PRESIGNED_URL_TTL_SECONDS: int = Field(default=900, ge=60, le=86400)
+    # Deprecated alias for `STORAGE_PRESIGNED_URL_TTL_SECONDS`. Kept so
+    # existing deployments with `S3_PRESIGNED_URL_TTL_SECONDS=...` in
+    # their `.env` keep working after the rename.
+    S3_PRESIGNED_URL_TTL_SECONDS: int | None = Field(default=None)
 
     # ----- Notifications -----
     NOTIFICATION_RETRY_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=10)
@@ -165,6 +227,10 @@ class Settings(BaseSettings):
     RATE_LIMIT_RESEND_PER_HOUR: int = Field(default=20, ge=1, le=1000)
     RATE_LIMIT_ACCEPT_INVITATION_PER_MINUTE: int = Field(default=10, ge=1, le=100)
     RATE_LIMIT_REFRESH_PER_MINUTE: int = Field(default=30, ge=1, le=1000)
+    # AI narrative generation is expensive (60-90s per call, $0.01-0.10
+    # per report). Keep the per-minute budget tight so a runaway script
+    # can't burn through the monthly Anthropic allowance.
+    RATE_LIMIT_AI_NARRATIVE_PER_MINUTE: int = Field(default=5, ge=1, le=100)
 
     # ----- Observability -----
     SENTRY_DSN: SecretStr | None = None
@@ -172,10 +238,71 @@ class Settings(BaseSettings):
     OTEL_ENABLED: bool = False
     OTEL_EXPORTER_OTLP_ENDPOINT: str | None = None
 
+    # ----- AI / LLM (Reports narrative generation) -----
+    # Anthropic Claude API key used by the `/reports/{type}/stream` SSE
+    # endpoint. When unset (or `FEATURE_REPORTS_AI_NARRATIVE=False`) the
+    # endpoint returns 503 with a clear "feature disabled" message —
+    # the rest of the system keeps working so CI and unit tests don't
+    # need a real key. The orphan `CLAUDE_API_KEY=` line in `.env` is
+    # finally picked up here; previously it crashed Settings init
+    # because `extra="forbid"` rejected unknown fields.
+    CLAUDE_API_KEY: SecretStr | None = None
+    # Model id. Sonnet is the default — best cost/quality balance for
+    # 4-6k-token narratives. Override with `CLAUDE_MODEL=claude-haiku-...`
+    # in `.env` for cheaper bulk runs.
+    CLAUDE_MODEL: str = "claude-sonnet-4-5"
+    # Per-request timeout. Claude narratives can take 60-90s for the
+    # wider report types (Audit Readiness pulls from audit_logs;
+    # Group Home synthesizes a placeholder); the upper bound of 600s
+    # covers the worst case without leaving a hung request indefinitely.
+    CLAUDE_API_TIMEOUT_SECONDS: int = Field(default=120, ge=10, le=600)
+    # Max tokens to generate per report. 4k is enough for a tight
+    # clinical narrative; bump to 8k for the wider report types.
+    CLAUDE_MAX_TOKENS: int = Field(default=4096, ge=256, le=8192)
+
     # ----- Feature Flags -----
     FEATURE_REGISTRATION_ENABLED: bool = False
+    # When True, the `/billing` surface is mounted and Stripe checkout /
+    # webhook handlers are live. Leave False until you've set
+    # `STRIPE_SECRET_KEY` + `STRIPE_WEBHOOK_SECRET` and run migration 0015.
     FEATURE_BILLING_ENABLED: bool = False
     FEATURE_2FA_ENABLED: bool = False
+    # When True, `/reports/{type}/stream` will call Claude. Flip off
+    # at runtime to disable AI narrative generation without a deploy
+    # (e.g. cost cap reached, provider outage). Mirrors
+    # `FEATURE_BILLING_ENABLED`.
+    FEATURE_REPORTS_AI_NARRATIVE: bool = True
+
+    # ----- Stripe / Billing (ADR-0021) -----
+    # Required when FEATURE_BILLING_ENABLED=True. None in dev keeps the
+    # Stripe SDK in test/mock mode so the app starts.
+    STRIPE_SECRET_KEY: SecretStr | None = None
+    # Used to verify `Stripe-Signature` on inbound webhook deliveries.
+    STRIPE_WEBHOOK_SECRET: SecretStr | None = None
+    # One Stripe Price ID per agency package — drives Checkout line items.
+    STRIPE_PRICE_BASIC: str | None = None
+    STRIPE_PRICE_PROFESSIONAL: str | None = None
+    STRIPE_PRICE_ENTERPRISE: str | None = None
+    # Where Stripe Checkout redirects the customer after success / cancel.
+    STRIPE_CHECKOUT_SUCCESS_URL: str = "http://localhost:3000/billing/success"
+    STRIPE_CHECKOUT_CANCEL_URL: str = "http://localhost:3000/billing/cancel"
+    # Connect timeout for Stripe API calls (seconds). The SDK retries
+    # internally up to 2x by default; this caps the outer wait.
+    STRIPE_API_TIMEOUT_SECONDS: int = Field(default=15, ge=1, le=120)
+
+    # ----- Stripe / Billing (ADR-0021) -----
+    # All optional: when STRIPE_SECRET_KEY is unset, billing routes
+    # return 503 instead of attempting a Stripe call. The price IDs
+    # and checkout URLs are only consulted when billing is actually
+    # invoked, so leaving them blank in local dev is safe.
+    STRIPE_SECRET_KEY: SecretStr | None = None
+    STRIPE_WEBHOOK_SECRET: SecretStr | None = None
+    STRIPE_PRICE_BASIC: str | None = None
+    STRIPE_PRICE_PROFESSIONAL: str | None = None
+    STRIPE_PRICE_ENTERPRISE: str | None = None
+    STRIPE_CHECKOUT_SUCCESS_URL: str = "http://localhost:3000/billing/success"
+    STRIPE_CHECKOUT_CANCEL_URL: str = "http://localhost:3000/billing/cancel"
+    STRIPE_API_TIMEOUT_SECONDS: int = Field(default=15, ge=1, le=120)
 
     # ----- Seed / Bootstrap -----
     SEED_SUPER_ADMIN_EMAIL: str | None = None
@@ -193,6 +320,24 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @field_validator("CORS_ORIGINS")
+    @classmethod
+    def _normalize_cors_origins(cls, value: list[str]) -> list[str]:
+        """Normalize to browser `Origin` header format.
+
+        Browsers send origins as `scheme://host[:port]` without a trailing
+        slash. Starlette's CORS middleware does exact matching, so
+        `https://example.com/` does not match `https://example.com`.
+        """
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            origin = item.strip().rstrip("/")
+            if origin and origin not in seen:
+                normalized.append(origin)
+                seen.add(origin)
+        return normalized
 
     @field_validator("STORAGE_ALLOWED_MIME_TYPES")
     @classmethod
@@ -215,6 +360,40 @@ class Settings(BaseSettings):
         # (Pydantic v2 makes cross-field checks awkward in a single validator).
         return value
 
+    @field_validator("COOKIE_DOMAIN", mode="before")
+    @classmethod
+    def _empty_domain_to_none(cls, value: object) -> object:
+        """Coerce an empty `COOKIE_DOMAIN=` env value to `None` so the
+        cookie layer doesn't emit a `Domain=` attribute (which browsers
+        interpret as the empty string and refuse to scope the cookie)."""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("RESEND_API_KEY")
+    @classmethod
+    def _resend_enabled_needs_key(
+        cls, value: SecretStr | None, info
+    ) -> SecretStr | None:
+        """Refuse to start if Resend is enabled but no API key was set.
+
+        `RESEND_ENABLED=true` with `RESEND_API_KEY=` would crash at send
+        time with a 401 from Resend — far less helpful than failing the
+        settings load up front. Mirrors the Stripe `STRIPE_SECRET_KEY`
+        pattern in this file.
+        """
+        # `info.data` carries the already-validated sibling fields.
+        # `RESEND_ENABLED` is validated before `RESEND_API_KEY` because
+        # it appears first in the class body, so it is safe to read.
+        enabled = bool(info.data.get("RESEND_ENABLED"))
+        if enabled and (value is None or not value.get_secret_value().strip()):
+            raise ValueError(
+                "RESEND_ENABLED=true but RESEND_API_KEY is empty. "
+                "Set RESEND_API_KEY to a valid Resend API key, "
+                "or flip RESEND_ENABLED=false to fall back to SMTP / dev-log."
+            )
+        return value
+
     # ------------------------------------------------------------------
     # Derived properties
     # ------------------------------------------------------------------
@@ -231,13 +410,116 @@ class Settings(BaseSettings):
         return self.APP_ENV == "test"
 
     @property
+    def effective_cors_origins(self) -> list[str]:
+        """CORS allow-list used by the HTTP middleware.
+
+        Render deployments may already have an older `CORS_ORIGINS`
+        variable set, which overrides the defaults. Keep the known
+        production Vercel frontends allowed even when that env var is
+        stale, while preserving any explicitly configured origins.
+        """
+        merged = [*self.CORS_ORIGINS, *DEPLOYED_CORS_ORIGINS]
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in merged:
+            origin = item.strip().rstrip("/")
+            if origin and origin not in seen:
+                normalized.append(origin)
+                seen.add(origin)
+        return normalized
+
+    @property
     def effective_database_url(self) -> str:
-        """Pool URL for app runtime, direct URL for Alembic."""
-        return (
+        """Pool URL for app runtime, direct URL for Alembic.
+
+        Automatically prepends `+asyncpg` to the scheme if it's missing,
+        so deployments that set `DATABASE_URL=postgresql://...` (without
+        the driver suffix) still work. Without the explicit driver,
+        SQLAlchemy defaults to psycopg2 which isn't installed — causing
+        a `ModuleNotFoundError` at engine-creation time on Python 3.14.
+        """
+        url = (
             self.DATABASE_POOL_URL.get_secret_value()
             if self.DATABASE_POOL_URL is not None
             else self.DATABASE_URL.get_secret_value()
         )
+        # Normalize scheme to asyncpg variant for the async runtime.
+        # Alembic reads DATABASE_URL separately and swaps its own
+        # scheme (asyncpg → psycopg) for sync migrations.
+        if url.startswith("postgresql://"):
+            url = "postgresql+asyncpg://" + url[len("postgresql://") :]
+        # asyncpg refuses the psycopg-only `pgbouncer=true` knob — drop it
+        # from the async runtime URL. Supabase's transaction-mode pooler
+        # works fine over asyncpg without that flag.
+        if "pgbouncer=true" in url:
+            from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+            parts = urlsplit(url)
+            q = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "pgbouncer"]
+            url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(q), parts.fragment))
+        return url
+
+    @property
+    def storage_presigned_url_ttl_seconds(self) -> int:
+        """Canonical signed-URL TTL, shared by every storage backend.
+
+        Prefers `STORAGE_PRESIGNED_URL_TTL_SECONDS`. Falls back to the
+        deprecated `S3_PRESIGNED_URL_TTL_SECONDS` alias so deployments
+        that still set the old name keep working after the rename.
+        """
+        if self.S3_PRESIGNED_URL_TTL_SECONDS is not None:
+            return self.S3_PRESIGNED_URL_TTL_SECONDS
+        return self.STORAGE_PRESIGNED_URL_TTL_SECONDS
+
+    @property
+    def stripe_price_id_for(self) -> dict[str, str | None]:
+        """Map AgencySubscriptionPlan.value → Stripe Price ID.
+
+        Returning None for any unmapped plan lets callers raise
+        ServiceUnavailableError("Stripe price not configured") at request
+        time rather than crashing at startup over a missing env var.
+        """
+        from src.shared.domain.enums import AgencySubscriptionPlan
+
+        return {
+            AgencySubscriptionPlan.BASIC.value: self.STRIPE_PRICE_BASIC,
+            AgencySubscriptionPlan.PROFESSIONAL.value: self.STRIPE_PRICE_PROFESSIONAL,
+            AgencySubscriptionPlan.ENTERPRISE.value: self.STRIPE_PRICE_ENTERPRISE,
+        }
+
+    @property
+    def stripe_configured(self) -> bool:
+        """True iff billing can talk to Stripe — key + at least one price set.
+
+        The webhook secret is checked separately (the key alone lets us
+        create checkout sessions; the secret lets us receive webhooks).
+
+        Both ``None`` and an empty ``SecretStr`` count as "not configured"
+        so a deploy that forgets to populate the env var still gets a
+        503 rather than a request that crashes mid-flight.
+        """
+        secret = self.STRIPE_SECRET_KEY
+        secret_ok = secret is not None and bool(secret.get_secret_value().strip())
+        prices_ok = bool(
+            (self.STRIPE_PRICE_BASIC or "")
+            or (self.STRIPE_PRICE_PROFESSIONAL or "")
+            or (self.STRIPE_PRICE_ENTERPRISE or "")
+        )
+        return secret_ok and prices_ok
+
+    @property
+    def claude_configured(self) -> bool:
+        """True iff Claude narrative generation is ready to serve.
+
+        Both the feature flag and the API key must be on — a present
+        key alone doesn't mean we should call Claude (e.g. ops may have
+        disabled the feature for cost reasons). Mirrors
+        `stripe_configured`.
+        """
+        if not self.FEATURE_REPORTS_AI_NARRATIVE:
+            return False
+        key = self.CLAUDE_API_KEY
+        return key is not None and bool(key.get_secret_value().strip())
 
 
 @lru_cache(maxsize=1)

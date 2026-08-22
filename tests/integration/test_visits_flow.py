@@ -226,8 +226,6 @@ async def test_create_visit_with_gps_and_seeded_items(admin_session) -> None:
                 "check_in_lng": "-93.2650",
                 "check_in_accuracy_m": "5.0",
                 "check_in_device_id": "iphone-15-test",
-                "check_in_address_match": True,
-                "check_in_distance_from_location_m": "12.5",
             },
             headers=auth,
         )
@@ -236,7 +234,6 @@ async def test_create_visit_with_gps_and_seeded_items(admin_session) -> None:
         assert body["status"] == "CHECKED_IN"
         assert body["appointment_id"] == appt_id
         assert body["check_in_lat"] == "44.977800"
-        assert body["check_in_address_match"] is True
         assert body["check_in_time"] is not None
         # seeded visit_service_items from the appointment
         assert body["service_items"] is not None

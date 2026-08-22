@@ -16,7 +16,6 @@ These tests do NOT touch the network. They:
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -67,16 +66,38 @@ class FakeStorageAdapter:
         raise AssertionError("list_objects() should not be called by build_download_url")
 
 
+class _PatchedSettings:
+    """Stand-in for `settings` that mirrors the real one's
+    `storage_presigned_url_ttl_seconds` property (it resolves the
+    canonical setting, falling back to the deprecated alias)."""
+
+    def __init__(self, **attrs: object) -> None:
+        self._attrs = dict(attrs)
+
+    def __getattr__(self, name: str) -> object:
+        if name == "storage_presigned_url_ttl_seconds":
+            canonical = self._attrs.get("STORAGE_PRESIGNED_URL_TTL_SECONDS", 900)
+            deprecated = self._attrs.get("S3_PRESIGNED_URL_TTL_SECONDS")
+            return deprecated if deprecated is not None else canonical
+        return self._attrs[name]
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_attrs":
+            super().__setattr__(name, value)
+        else:
+            self._attrs[name] = value
+
+
 def _patched_settings(**overrides):
     """Return a `settings` stand-in with the given overrides applied
     on top of the real singleton."""
     from src.core.config import settings as real
 
-    base = SimpleNamespace(
+    base = _PatchedSettings(
         STORAGE_BACKEND=real.STORAGE_BACKEND,
         S3_BUCKET_QUALIFICATIONS=real.S3_BUCKET_QUALIFICATIONS,
         SUPABASE_STORAGE_BUCKET_QUALIFICATIONS=real.SUPABASE_STORAGE_BUCKET_QUALIFICATIONS,
-        S3_PRESIGNED_URL_TTL_SECONDS=real.S3_PRESIGNED_URL_TTL_SECONDS,
+        STORAGE_PRESIGNED_URL_TTL_SECONDS=real.STORAGE_PRESIGNED_URL_TTL_SECONDS,
     )
     for k, v in overrides.items():
         setattr(base, k, v)
@@ -176,9 +197,7 @@ class TestSupabasePresignedUrlPassThrough:
         )
 
         assert url == "https://supabase.example/signed/x?token=abc"
-        fake_bucket.create_signed_url.assert_called_once_with(
-            "cpr/alice.pdf", 1800
-        )
+        fake_bucket.create_signed_url.assert_called_once_with("cpr/alice.pdf", 1800)
 
 
 # ---------------------------------------------------------------------------
@@ -192,15 +211,17 @@ class TestBuildDownloadUrl:
         fake = FakeStorageAdapter()
         with (
             patch.object(staff_service, "get_storage", return_value=fake),
-            patch.object(staff_service, "settings", _patched_settings(
-                STORAGE_BACKEND="s3",
-                S3_PRESIGNED_URL_TTL_SECONDS=900,
-                S3_BUCKET_QUALIFICATIONS="agency-quals",
-            )),
+            patch.object(
+                staff_service,
+                "settings",
+                _patched_settings(
+                    STORAGE_BACKEND="s3",
+                    STORAGE_PRESIGNED_URL_TTL_SECONDS=900,
+                    S3_BUCKET_QUALIFICATIONS="agency-quals",
+                ),
+            ),
         ):
-            url, expires_at = await staff_service.build_download_url(
-                storage_key="cpr/alice.pdf"
-            )
+            url, expires_at = await staff_service.build_download_url(storage_key="cpr/alice.pdf")
 
         assert fake.calls == [
             {
@@ -221,15 +242,17 @@ class TestBuildDownloadUrl:
         fake = FakeStorageAdapter()
         with (
             patch.object(staff_service, "get_storage", return_value=fake),
-            patch.object(staff_service, "settings", _patched_settings(
-                STORAGE_BACKEND="supabase",
-                SUPABASE_STORAGE_BUCKET_QUALIFICATIONS="sb-quals",
-                S3_PRESIGNED_URL_TTL_SECONDS=1800,
-            )),
+            patch.object(
+                staff_service,
+                "settings",
+                _patched_settings(
+                    STORAGE_BACKEND="supabase",
+                    SUPABASE_STORAGE_BUCKET_QUALIFICATIONS="sb-quals",
+                    STORAGE_PRESIGNED_URL_TTL_SECONDS=1800,
+                ),
+            ),
         ):
-            url, _ = await staff_service.build_download_url(
-                storage_key="cpr/bob.pdf"
-            )
+            url, _ = await staff_service.build_download_url(storage_key="cpr/bob.pdf")
 
         assert fake.calls[0]["bucket"] == "sb-quals"
         assert fake.calls[0]["expires_in"] == 1800
@@ -258,9 +281,13 @@ class TestBuildDownloadUrl:
         fake = FakeStorageAdapter()
         with (
             patch.object(staff_service, "get_storage", return_value=fake),
-            patch.object(staff_service, "settings", _patched_settings(
-                S3_PRESIGNED_URL_TTL_SECONDS=3600,
-            )),
+            patch.object(
+                staff_service,
+                "settings",
+                _patched_settings(
+                    STORAGE_PRESIGNED_URL_TTL_SECONDS=3600,
+                ),
+            ),
         ):
             await staff_service.build_download_url(storage_key="x.pdf")
 

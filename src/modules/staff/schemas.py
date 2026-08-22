@@ -19,6 +19,7 @@ out" pre-fills with sensible values.
 from __future__ import annotations
 
 from datetime import date, datetime, time
+from decimal import Decimal
 from typing import Annotated
 from uuid import UUID
 
@@ -29,6 +30,7 @@ from src.shared.domain.enums import (
     QualificationStatus,
     QualificationType,
     UserStatus,
+    VisitStatus,
 )
 
 # --------------------------------------------------------------------------
@@ -151,6 +153,9 @@ class StaffProfileResponse(BaseModel):
                     "id": "7c2e9b51-4a8d-4f5e-9c1a-2b3d4e5f6a7b",
                     "agency_id": "8a3f12d0-7b5e-4a23-9c8e-1b2c3d4e5f6a",
                     "user_id": "5f3a7b1c-1d0a-4a23-9c8e-1b2c3d4e5f6a",
+                    "full_name": "Jenna Lopez",
+                    "email": "jenna.lopez@careagency.com",
+                    "phone": "+1-612-555-0142",
                     "staff_code": "STAFF-0042",
                     "status": "ACTIVE",
                     "hired_at": "2026-06-01",
@@ -166,6 +171,21 @@ class StaffProfileResponse(BaseModel):
     agency_id: UUID = Field(description="Owning agency UUID.")
     user_id: UUID = Field(
         description="Underlying user account UUID (link to `/auth/me`).",
+    )
+    # Joined from the User row (`StaffProfile.user`). All three are
+    # nullable on the response side because a soft-deleted user
+    # could leave them unset — we'd rather surface a null than 500.
+    full_name: str | None = Field(
+        default=None,
+        description="Joined from the underlying User row. `null` if unset.",
+    )
+    email: EmailStr | None = Field(
+        default=None,
+        description="Joined from the underlying User row.",
+    )
+    phone: str | None = Field(
+        default=None,
+        description="Joined from the underlying User row. E.164 preferred.",
     )
     staff_code: str = Field(description="Agency-scoped identifier.")
     status: UserStatus = Field(
@@ -198,6 +218,9 @@ class StaffProfileSummaryResponse(BaseModel):
                     "id": "7c2e9b51-4a8d-4f5e-9c1a-2b3d4e5f6a7b",
                     "agency_id": "8a3f12d0-7b5e-4a23-9c8e-1b2c3d4e5f6a",
                     "user_id": "5f3a7b1c-1d0a-4a23-9c8e-1b2c3d4e5f6a",
+                    "full_name": "Jenna Lopez",
+                    "email": "jenna.lopez@careagency.com",
+                    "phone": "+1-612-555-0142",
                     "staff_code": "STAFF-0042",
                     "status": "ACTIVE",
                     "hired_at": "2026-06-01",
@@ -212,12 +235,155 @@ class StaffProfileSummaryResponse(BaseModel):
     id: UUID = Field(description="Staff profile UUID.")
     agency_id: UUID = Field(description="Owning agency UUID.")
     user_id: UUID = Field(description="Underlying user account UUID.")
+    full_name: str | None = Field(
+        default=None,
+        description="Joined from the underlying User row.",
+    )
+    email: EmailStr | None = Field(
+        default=None,
+        description="Joined from the underlying User row.",
+    )
+    phone: str | None = Field(
+        default=None,
+        description="Joined from the underlying User row.",
+    )
     staff_code: str = Field(description="Agency-scoped identifier.")
     status: UserStatus = Field(description="Lifecycle status.")
     hired_at: date | None = Field(description="Start date.")
     terminated_at: date | None = Field(description="Termination date, or null.")
     created_at: datetime = Field(description="UTC ISO-8601 of row creation.")
     updated_at: datetime = Field(description="UTC ISO-8601 of last mutation.")
+
+
+# --------------------------------------------------------------------------
+# Live staff location (Agency Admin EVV Live Monitor)
+# --------------------------------------------------------------------------
+class LiveStaffLocationEntry(BaseModel):
+    """One row of the staff-level live-locations list.
+
+    Returned by `GET /staff/live-locations`. Aggregates the staff
+    profile's last-known GPS (see migration 0021) with the staff
+    member's display name (joined from `users.full_name`) and, when
+    the last ping came from a visit context, the visit's status so
+    the admin can tell "still in a visit" from "lingering after
+    check-out".
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "staff_id": "7c2e9b51-4a8d-4f5e-9c1a-2b3d4e5f6a7b",
+                    "full_name": "Sarah Johnson",
+                    "staff_code": "STAFF-0042",
+                    "status": "ACTIVE",
+                    "last_known_lat": "40.694300",
+                    "last_known_lng": "-73.990300",
+                    "last_known_ping_at": "2026-08-19T18:42:13Z",
+                    "last_known_accuracy_m": "18.50",
+                    "last_known_visit_id": "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+                    "last_visit_status": "IN_PROGRESS",
+                }
+            ]
+        },
+    )
+
+    staff_id: UUID = Field(description="Staff profile UUID.")
+    full_name: str = Field(
+        description=(
+            "Display name joined from the underlying `users.full_name`. "
+            "Empty string if the user is soft-deleted."
+        ),
+    )
+    staff_code: str = Field(description="Agency-scoped staff identifier.")
+    status: UserStatus = Field(description="Staff lifecycle status.")
+    # Last-known GPS. `None` when the staff member has never pinged.
+    last_known_lat: Decimal | None = Field(
+        default=None,
+        description="WGS84 latitude (-90..90) from the most recent ping.",
+    )
+    last_known_lng: Decimal | None = Field(
+        default=None,
+        description="WGS84 longitude (-180..180) from the most recent ping.",
+    )
+    last_known_ping_at: datetime | None = Field(
+        default=None,
+        description="UTC timestamp of the most recent ping.",
+    )
+    last_known_accuracy_m: Decimal | None = Field(
+        default=None,
+        description="GPS accuracy in metres from the most recent ping.",
+    )
+    last_known_visit_id: UUID | None = Field(
+        default=None,
+        description=(
+            "Visit that produced the most recent ping. `None` when the "
+            "ping was synthetic (e.g. the start-location-sharing "
+            "seed) or when the visit was deleted."
+        ),
+    )
+    last_visit_status: VisitStatus | None = Field(
+        default=None,
+        description=(
+            "Status of the visit at last ping. `None` if there is no "
+            "linked visit (admin seed or visit deleted)."
+        ),
+    )
+
+
+class LiveStaffLocationsResponse(BaseModel):
+    """Top-level response of `GET /staff/live-locations`.
+
+    Wraps a small list — the live monitor doesn't paginate. We cap the
+    result set at 500 entries server-side; if any agency legitimately
+    needs more, we add pagination then.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "freshness_minutes": 30,
+                    "server_time": "2026-08-19T18:42:30Z",
+                    "entries": [
+                        {
+                            "staff_id": "7c2e9b51-4a8d-4f5e-9c1a-2b3d4e5f6a7b",
+                            "full_name": "Sarah Johnson",
+                            "staff_code": "STAFF-0042",
+                            "status": "ACTIVE",
+                            "last_known_lat": "40.694300",
+                            "last_known_lng": "-73.990300",
+                            "last_known_ping_at": "2026-08-19T18:42:13Z",
+                            "last_known_accuracy_m": "18.50",
+                            "last_known_visit_id": "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+                            "last_visit_status": "IN_PROGRESS",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    freshness_minutes: int = Field(
+        description=(
+            "Echoed back so the client can render a 'last seen < N min' "
+            "tooltip without re-parsing its own query string."
+        ),
+    )
+    server_time: datetime = Field(
+        description=(
+            "UTC timestamp the server stamped on this response. The "
+            "client uses this to compute 'last seen X seconds ago' "
+            "without trusting device clocks."
+        ),
+    )
+    entries: list[LiveStaffLocationEntry] = Field(
+        description=(
+            "Up to 500 entries, ordered most-recently-seen first. "
+            "Staff who haven't pinged inside the freshness window "
+            "are filtered out."
+        ),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -356,10 +522,10 @@ class StaffQualificationResponse(BaseModel):
         description=(
             "Short-lived signed URL for the uploaded document. "
             "`null` until `document_storage_key` is set. URL lifetime is "
-            "`settings.S3_PRESIGNED_URL_TTL_SECONDS`."
+            "`settings.storage_presigned_url_ttl_seconds`."
         ),
     )
-    # Storage key TTL in seconds (matches `settings.S3_PRESIGNED_URL_TTL_SECONDS`).
+    # Storage key TTL in seconds (matches `settings.storage_presigned_url_ttl_seconds`).
     # `None` when `download_url` is None. Surfaced so the client can
     # show "expires in N minutes" or schedule a refresh.
     expires_in: int | None = Field(
@@ -592,6 +758,8 @@ class StaffAvailabilityResponse(BaseModel):
 StaffProfileResponse.model_rebuild()
 
 __all__ = [
+    "LiveStaffLocationEntry",
+    "LiveStaffLocationsResponse",
     "StaffAvailabilityCreateRequest",
     "StaffAvailabilityResponse",
     "StaffAvailabilityUpdateRequest",

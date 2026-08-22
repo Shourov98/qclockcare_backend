@@ -2,12 +2,13 @@
 
 Manual exploration + CI smoke testing for the QlockCare backend.
 
-The collection covers every route across 15 folders (auth, staff, patients,
-appointments, visits, portal, notifications, locations, audit-logs, agencies,
-change-password, admin-tickets, admin-compliance, admin-admins, health).
-Each request has standard test scripts (status code, envelope shape,
-X-Request-ID round-trip) and the requests that produce IDs auto-extract them
-into the active environment, so chained requests (create → read → update →
+The collection covers **all 112 routes** across 12 modules (including the
+3 live-GPS endpoints: start-location-sharing / location-ping /
+stop-location-sharing on `/visits/{id}`, plus the cross-tenant
+`/admin/people/{staff,patients}` SUPER_ADMIN views). Each request
+has standard test scripts (status code, envelope shape, X-Request-ID
+round-trip) and the requests that produce IDs auto-extract them into
+the active environment, so chained requests (create → read → update →
 delete) work without copy-pasting UUIDs.
 
 ---
@@ -68,32 +69,46 @@ collection-level auth helper.
 
 ---
 
-## Folder layout (organized by user role)
+## Folder layout (organized by role)
 
-| Folder | Auth | Role required |
-|---|---|---|
-| `auth` | none | public — login, refresh, logout, OTP, password reset, accept-invitation |
-| `health` | none | public — `/health`, `/ready` |
-| `staff` | bearer | AGENCY_ADMIN |
-| `patients` | bearer | AGENCY_ADMIN |
-| `appointments` | bearer | AGENCY_ADMIN (create/transition), PATIENT (confirm, request-reschedule) |
-| `visits` | bearer | STAFF (check-in/out), PATIENT (verify, dispute, report-issue) |
-| `portal` | bearer | **PATIENT** — these will 403 with AGENCY_ADMIN |
-| `notifications` | bearer | any authenticated user (broadcast is AGENCY_ADMIN) |
-| `locations` | bearer | AGENCY_ADMIN |
-| `audit-logs` | bearer | SUPER_ADMIN or PLATFORM_ADMIN(SUPPORT) |
-| `agencies` | bearer | SUPER_ADMIN (write); SUPER_ADMIN + PLATFORM_ADMIN(AGENCIES) (read) |
-| `change-password` | bearer | any authenticated user |
-| `admin-tickets` | bearer | SUPER_ADMIN or PLATFORM_ADMIN(SUPPORT) |
-| `admin-compliance` | bearer | SUPER_ADMIN or PLATFORM_ADMIN(AGENCIES) |
-| `admin-admins` | bearer | SUPER_ADMIN (write); SUPER_ADMIN + PLATFORM_ADMIN (read) |
+The folders are organized so a frontend dev can open **one folder and
+see every API that role can call**. The same endpoint shows up in
+every folder where it's reachable — the redundancy is intentional and
+helps you find "what can a Staff user actually do?" at a glance.
 
-The `portal/` folder is the one place you'll need to switch roles:
+| # | Folder | Role | What lives here |
+|---|---|---|---|
+| 1 | `auth` | public | login, refresh, logout, me, OTP, forgot/reset, accept-invitation |
+| 2 | `Admin` | SUPER_ADMIN | tenant setup, orphan admin, agency programs, audit logs, locations, broadcast |
+| 3 | `Agency Admin` | AGENCY_ADMIN | staff CRUD + qualifications + availability, patients + guardians, appointments, visits, locations, notifications, audit |
+| 4 | `Staff` | STAFF | own profile + qualifications + availability, assigned appointments + visits, check-in / check-out, notes, services |
+| 5 | `Patient` | PATIENT | own profile, appointment confirm / reschedule / cancel, visit verify / dispute / report-issue, `/portal/*` |
+| 6 | `Guardian` | GUARDIAN | linked patients, ward's appointment lifecycle, visit verify / dispute / report-issue, `/portal/*` |
+| 7 | `health` | public | `/health`, `/ready` |
 
-1. Open `auth > Login`.
-2. Change the email to `patient@qlockcare.dev` / `PatientDevPass123!`.
-3. Send. The env's `user_role` becomes `PATIENT`.
-4. Open `portal > List my visits` — it now works.
+**Total: 7 folders, 230 requests** (112 unique routes, intentionally
+duplicated across roles). The collection was regenerated against the
+live `require_role(...)` decorators on every router, so the role
+boundaries match the code exactly.
+
+**Smoke-test order for a brand-new tenant:**
+
+```
+auth > Login (as super@)  →  Admin > Create agency
+                          →  Agency Admin > Create staff
+                          →  Agency Admin > Create patient
+                          →  share the invite link from the terminal
+                             logs (look for `auth.email.dev_invitation_for_test_only`)
+```
+
+**Role switch:** when switching folders, re-run `auth > Login` with
+the appropriate seeded credentials. The collection pre-request script
+auto-refreshes expired tokens, so you only need to re-login on role
+change.
+
+The `Patient/` and `Guardian/` folders will 403 with an admin
+account. Switch to `patient@qlockcare.dev` / `PatientDevPass123!`
+to unlock them.
 
 ---
 
@@ -175,10 +190,11 @@ The env's `access_token` is empty or stale. Either:
 You probably hit `Archive staff (DELETE)` or `Delete patient` first.
 Click `Create staff` again to get a fresh `staff_id`.
 
-### `403 FORBIDDEN` in the `portal/` folder
+### `403 FORBIDDEN` in the `Patient/` or `Guardian/` folder
 
-You're logged in as AGENCY_ADMIN. Switch to the seeded PATIENT
-credentials.
+You're logged in as AGENCY_ADMIN or SUPER_ADMIN. Switch to the seeded
+PATIENT credentials (`patient@qlockcare.dev` / `PatientDevPass123!`)
+to unlock the Patient folder.
 
 ### `409 DUPLICATE_RESOURCE` on `Create patient — duplicate code`
 

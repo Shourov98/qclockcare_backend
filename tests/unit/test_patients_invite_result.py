@@ -1,23 +1,23 @@
 """Unit tests for `patients_service.create_patient`,
 `patients_service.create_guardian`, and
-`patients_service.add_patient_guardian` returning
-`*InviteResult` dataclasses with fresh invitation tokens.
+`patients_service.add_patient_guardian` returning `*InviteResult`
+dataclasses with fresh invitation OTPs.
 
 These tests verify the contracts the patient / guardian routers
 rely on:
 
 1. `create_patient` returns a `PatientInviteResult` whose
-   `invitation_token` matches what `issue_invitation_token` issued
+   `invitation_otp` matches what `issue_otp` issued
    (mirrors `test_staff_invite_result.py`).
 2. `create_guardian` returns a `GuardianInviteResult`.
 3. `add_patient_guardian` returns `AddPatientGuardianResult` with
    `new_guardian` set iff the caller supplied `new_guardian` (not
    `guardian_id`).
-4. `auth_service.issue_invitation_token` is called exactly once
-   per `create_*` invocation, with the right `user_id`.
+4. `otp_service.issue_otp` is called exactly once per `create_*`
+   invocation, with the right `user`.
 5. Audit row uses `AuthAuditEventType.INVITATION_SENT`.
 6. When the unique constraint fires, `DuplicateResourceError` is
-   raised and no token is issued.
+   raised and no OTP is issued.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from dataclasses import FrozenInstanceError
 from datetime import date
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -98,10 +98,6 @@ class _FakeSession:
             raise exc
 
 
-# Need MagicMock import for `_add` side_effect.
-from unittest.mock import MagicMock  # noqa: E402
-
-
 def _agency_row(agency_id: uuid.UUID) -> SimpleNamespace:
     return SimpleNamespace(
         id=agency_id, status=SimpleNamespace(value="ACTIVE")
@@ -125,6 +121,18 @@ def _patient_row(patient_id: uuid.UUID, user_id: uuid.UUID, agency_id: uuid.UUID
         id=patient_id,
         agency_id=agency_id,
         user_id=user_id,
+    )
+
+
+def _issued_otp(otp: str = "482915", email: str = "alex@example.com") -> Any:
+    from src.modules.identity.otp_service import OtpIssueResult
+
+    return OtpIssueResult(
+        user_id=uuid.uuid4(),
+        email=email,
+        full_name="Alex",
+        otp=otp,
+        expires_at=None,
     )
 
 
@@ -185,7 +193,7 @@ def _relationship_payload(*, guardian_id: uuid.UUID | None = None) -> Any:
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 class TestCreatePatientInviteResult:
-    async def test_returns_patient_invite_result_with_invitation_token(self) -> None:
+    async def test_returns_patient_invite_result_with_invitation_otp(self) -> None:
         from src.modules.patients import service as patients_service
 
         user_id = uuid.uuid4()
@@ -197,11 +205,11 @@ class TestCreatePatientInviteResult:
             agency=_agency_row(agency_id),
         )
 
-        fake_token = "inv-token-patient-1"
+        fake_otp = "482915"
 
-        with patch.object(patients_service, "auth_service") as mock_auth_service:
-            mock_auth_service.issue_invitation_token = AsyncMock(
-                return_value=(fake_token, "jti-patient-1")
+        with patch.object(patients_service, "otp_service") as mock_otp_service:
+            mock_otp_service.issue_otp = AsyncMock(
+                return_value=_issued_otp(fake_otp)
             )
             result = await patients_service.create_patient(
                 session,
@@ -211,20 +219,18 @@ class TestCreatePatientInviteResult:
             )
 
         assert isinstance(result, patients_service.PatientInviteResult)
-        assert result.invitation_token == fake_token
+        assert result.invitation_otp == fake_otp
         assert result.email == "alex@example.com"
         assert result.full_name == "Alex Patient"
         assert result.user_id == user_id
         assert result.profile is not None
         assert result.profile.agency_id == agency_id
 
-        # Token was issued exactly once with the right user_id.
-        mock_auth_service.issue_invitation_token.assert_called_once_with(
-            session, user_id=user_id
-        )
+        # OTP was issued exactly once with the right user.
+        mock_otp_service.issue_otp.assert_called_once()
+        assert mock_otp_service.issue_otp.call_args.kwargs["user"] is existing_user
 
     async def test_audit_event_type_is_invitation_sent(self) -> None:
-        from src.modules.identity import auth_service
         from src.modules.patients import service as patients_service
         from src.shared.domain.enums import AuthAuditEventType
 
@@ -246,12 +252,11 @@ class TestCreatePatientInviteResult:
             agency=_agency_row(agency_id),
         )
 
-        with patch.object(patients_service, "auth_service") as mock_auth_service:
-            mock_auth_service.issue_invitation_token = AsyncMock(
-                return_value=("tok", "jti")
-            )
-            with patch.object(
-                auth_service, "_record_audit", _capture_record_audit
+        with patch.object(patients_service, "otp_service") as mock_otp_service:
+            mock_otp_service.issue_otp = AsyncMock(return_value=_issued_otp())
+            with patch(
+                "src.modules.identity.auth_service._record_audit",
+                _capture_record_audit,
             ):
                 await patients_service.create_patient(
                     session,
@@ -264,7 +269,7 @@ class TestCreatePatientInviteResult:
         assert "admitted_by" in captured["metadata"]
         assert "patient_profile_id" in captured["metadata"]
 
-    async def test_duplicate_resource_error_skips_token_issue(self) -> None:
+    async def test_duplicate_resource_error_skips_otp_issue(self) -> None:
         from src.modules.patients import service as patients_service
 
         agency_id = uuid.uuid4()
@@ -281,10 +286,8 @@ class TestCreatePatientInviteResult:
             flush_exc=flush_exc,
         )
 
-        with patch.object(patients_service, "auth_service") as mock_auth_service:
-            mock_auth_service.issue_invitation_token = AsyncMock(
-                return_value=("tok", "jti")
-            )
+        with patch.object(patients_service, "otp_service") as mock_otp_service:
+            mock_otp_service.issue_otp = AsyncMock(return_value=_issued_otp())
             with pytest.raises(DuplicateResourceError):
                 await patients_service.create_patient(
                     session,
@@ -293,7 +296,7 @@ class TestCreatePatientInviteResult:
                     admitted_by_user_id=uuid.uuid4(),
                 )
 
-        mock_auth_service.issue_invitation_token.assert_not_called()
+        mock_otp_service.issue_otp.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +304,7 @@ class TestCreatePatientInviteResult:
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 class TestCreateGuardianInviteResult:
-    async def test_returns_guardian_invite_result_with_invitation_token(self) -> None:
+    async def test_returns_guardian_invite_result_with_invitation_otp(self) -> None:
         from src.modules.patients import service as patients_service
 
         user_id = uuid.uuid4()
@@ -313,11 +316,11 @@ class TestCreateGuardianInviteResult:
             agency=_agency_row(agency_id),
         )
 
-        fake_token = "inv-token-guardian-1"
+        fake_otp = "654321"
 
-        with patch.object(patients_service, "auth_service") as mock_auth_service:
-            mock_auth_service.issue_invitation_token = AsyncMock(
-                return_value=(fake_token, "jti-guardian-1")
+        with patch.object(patients_service, "otp_service") as mock_otp_service:
+            mock_otp_service.issue_otp = AsyncMock(
+                return_value=_issued_otp(fake_otp)
             )
             result = await patients_service.create_guardian(
                 session,
@@ -327,18 +330,17 @@ class TestCreateGuardianInviteResult:
             )
 
         assert isinstance(result, patients_service.GuardianInviteResult)
-        assert result.invitation_token == fake_token
+        assert result.invitation_otp == fake_otp
         assert result.email == "guard@example.com"
         assert result.full_name == "Sam Guardian"
         assert result.user_id == user_id
         assert result.profile is not None
         assert result.profile.agency_id == agency_id
 
-        mock_auth_service.issue_invitation_token.assert_called_once_with(
-            session, user_id=user_id
-        )
+        mock_otp_service.issue_otp.assert_called_once()
+        assert mock_otp_service.issue_otp.call_args.kwargs["user"] is existing_user
 
-    async def test_duplicate_resource_error_skips_token_issue(self) -> None:
+    async def test_duplicate_resource_error_skips_otp_issue(self) -> None:
         from src.modules.patients import service as patients_service
 
         agency_id = uuid.uuid4()
@@ -355,10 +357,8 @@ class TestCreateGuardianInviteResult:
             flush_exc=flush_exc,
         )
 
-        with patch.object(patients_service, "auth_service") as mock_auth_service:
-            mock_auth_service.issue_invitation_token = AsyncMock(
-                return_value=("tok", "jti")
-            )
+        with patch.object(patients_service, "otp_service") as mock_otp_service:
+            mock_otp_service.issue_otp = AsyncMock(return_value=_issued_otp())
             with pytest.raises(DuplicateResourceError):
                 await patients_service.create_guardian(
                     session,
@@ -367,7 +367,7 @@ class TestCreateGuardianInviteResult:
                     invited_by_user_id=uuid.uuid4(),
                 )
 
-        mock_auth_service.issue_invitation_token.assert_not_called()
+        mock_otp_service.issue_otp.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -396,10 +396,8 @@ class TestAddPatientGuardianPropagation:
             agency=_agency_row(agency_id),
         )
 
-        with patch.object(patients_service, "auth_service") as mock_auth_service:
-            mock_auth_service.issue_invitation_token = AsyncMock(
-                return_value=("tok", "jti")
-            )
+        with patch.object(patients_service, "otp_service") as mock_otp_service:
+            mock_otp_service.issue_otp = AsyncMock(return_value=_issued_otp())
             result = await patients_service.add_patient_guardian(
                 session,
                 patient_id=patient_id,
@@ -412,8 +410,8 @@ class TestAddPatientGuardianPropagation:
         assert result.new_guardian is None
         # Relationship is populated.
         assert result.relationship is not None
-        # No token was issued (the existing guardian already has a login path).
-        mock_auth_service.issue_invitation_token.assert_not_called()
+        # No OTP was issued (the existing guardian already has a login path).
+        mock_otp_service.issue_otp.assert_not_called()
 
     async def test_new_guardian_path_propagates_invite_result(self) -> None:
         """When the caller passes `new_guardian=…`, a fresh guardian
@@ -436,11 +434,11 @@ class TestAddPatientGuardianPropagation:
             agency=_agency_row(agency_id),
         )
 
-        fake_token = "inv-token-new-guard-1"
+        fake_otp = "111111"
 
-        with patch.object(patients_service, "auth_service") as mock_auth_service:
-            mock_auth_service.issue_invitation_token = AsyncMock(
-                return_value=(fake_token, "jti-new-guard-1")
+        with patch.object(patients_service, "otp_service") as mock_otp_service:
+            mock_otp_service.issue_otp = AsyncMock(
+                return_value=_issued_otp(fake_otp, email="newguard@example.com")
             )
             result = await patients_service.add_patient_guardian(
                 session,
@@ -455,12 +453,12 @@ class TestAddPatientGuardianPropagation:
         assert isinstance(
             result.new_guardian, patients_service.GuardianInviteResult
         )
-        assert result.new_guardian.invitation_token == fake_token
+        assert result.new_guardian.invitation_otp == fake_otp
         assert result.new_guardian.email == "newguard@example.com"
         assert result.new_guardian.full_name == "New Guardian"
         assert result.new_guardian.profile is not None
-        # Token was issued exactly once (for the new guardian).
-        mock_auth_service.issue_invitation_token.assert_called_once()
+        # OTP was issued exactly once (for the new guardian).
+        mock_otp_service.issue_otp.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +473,7 @@ class TestPatientInviteResultShape:
             user_id=uuid.uuid4(),
             email="a@example.com",
             full_name="A",
-            invitation_token="t",
+            invitation_otp="482915",
         )
         with pytest.raises(FrozenInstanceError):
             result.email = "b@example.com"  # type: ignore[misc]
@@ -488,7 +486,7 @@ class TestPatientInviteResultShape:
             user_id=uuid.uuid4(),
             email="g@example.com",
             full_name="G",
-            invitation_token="t",
+            invitation_otp="654321",
         )
         with pytest.raises(FrozenInstanceError):
             result.email = "b@example.com"  # type: ignore[misc]
@@ -523,7 +521,7 @@ class TestPatientInviteResultShape:
             user_id=uuid.uuid4(),
             email="g@example.com",
             full_name="G",
-            invitation_token="t",
+            invitation_otp="482915",
         )
         r2 = AddPatientGuardianResult(
             relationship=SimpleNamespace(id=uuid.uuid4()),

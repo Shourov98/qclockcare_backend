@@ -28,6 +28,10 @@ Endpoints:
   GET    /visits/{id}/issues                         — list
   POST   /visits/{id}/issues                         — file
   PATCH  /visits/{id}/issues/{issue_id}/resolve      — mark resolved
+
+  POST   /visits/{id}/start-location-sharing         — opt-in: live GPS
+  POST   /visits/{id}/location-ping                  — staff device ping
+  POST   /visits/{id}/stop-location-sharing          — opt-out: stop live GPS
 """
 
 from __future__ import annotations
@@ -65,12 +69,14 @@ from src.modules.visits.schemas import (
     VisitIssueCreateRequest,
     VisitIssueResolveRequest,
     VisitIssueResponse,
+    VisitLocationPingRequest,
     VisitNoteCreateRequest,
     VisitNoteResponse,
     VisitResponse,
     VisitServiceItemCreateRequest,
     VisitServiceItemResponse,
     VisitServiceItemUpdateRequest,
+    VisitStartLocationSharingRequest,
     VisitStatusTransitionRequest,
     VisitSummaryResponse,
 )
@@ -122,6 +128,23 @@ def _to_response(
     *,
     with_relations: bool = False,
 ) -> VisitResponse:
+    # Hydrate `staff_name` from the joined `visit.staff.user.full_name`
+    # when the relationship is loaded. `_get_visit_or_404` doesn't
+    # pre-load `staff`; only `GET /visits/{id}/with-items` and a few
+    # list paths do (see the service layer). The `getattr(..., None)`
+    # chain means an unloaded relationship simply yields `None` instead
+    # of raising — mirrors the existing `service_items` / `notes`
+    # pattern below.
+    staff_name: str | None = None
+    try:
+        staff = getattr(visit, "staff", None)
+        if staff is not None:
+            user = getattr(staff, "user", None)
+            if user is not None:
+                staff_name = getattr(user, "full_name", None)
+    except Exception:
+        staff_name = None
+
     data: dict = {
         "id": visit.id,
         "appointment_id": visit.appointment_id,
@@ -133,15 +156,19 @@ def _to_response(
         "check_in_lng": visit.check_in_lng,
         "check_in_accuracy_m": visit.check_in_accuracy_m,
         "check_in_device_id": visit.check_in_device_id,
-        "check_in_address_match": visit.check_in_address_match,
-        "check_in_distance_from_location_m": visit.check_in_distance_from_location_m,
         "check_out_time": visit.check_out_time,
         "check_out_lat": visit.check_out_lat,
         "check_out_lng": visit.check_out_lng,
         "check_out_accuracy_m": visit.check_out_accuracy_m,
         "duration_seconds": visit.duration_seconds,
+        "live_lat": getattr(visit, "live_lat", None),
+        "live_lng": getattr(visit, "live_lng", None),
+        "live_ping_at": getattr(visit, "live_ping_at", None),
+        "live_accuracy_m": getattr(visit, "live_accuracy_m", None),
+        "sharing_location": getattr(visit, "sharing_location", False),
         "created_at": visit.created_at,
         "updated_at": visit.updated_at,
+        "staff_name": staff_name,
     }
     if with_relations:
         try:
@@ -240,14 +267,18 @@ async def list_visits_endpoint(
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
     appointment_id: uuid.UUID | None = Query(default=None),
     staff_id: uuid.UUID | None = Query(default=None),
+    patient_id: uuid.UUID | None = Query(default=None),
     status_filter: VisitStatus | None = Query(default=None, alias="status"),
+    sharing_only: bool = Query(default=False),
     page: int = Query(default=1, ge=1, le=10000),
     page_size: int = Query(default=20, ge=1, le=100),
 ) -> dict:
     """Paginated list of visits at the caller's agency.
 
-    Filters narrow by appointment, staff, and/or status. RLS restricts
-    PATIENT/GUARDIAN rows to their own visits automatically.
+    Filters narrow by appointment, staff, patient, and/or status. The
+    `sharing_only` flag is used by the EVV Live Monitor to drop visits
+    that aren't currently streaming GPS without burning extra queries.
+    RLS restricts PATIENT/GUARDIAN rows to their own visits automatically.
     """
     agency_id = _require_agency(ctx)
     rows, total = await visits_service.list_visits(
@@ -255,7 +286,9 @@ async def list_visits_endpoint(
         agency_id=agency_id,
         appointment_id=appointment_id,
         staff_id=staff_id,
+        patient_id=patient_id,
         status_filter=status_filter,
+        sharing_only=sharing_only,
         page=page,
         page_size=page_size,
     )
@@ -391,6 +424,91 @@ async def transition_visit_endpoint(
     agency_id = _require_agency(ctx)
     visit = await visits_service.transition_visit_status(
         session, visit_id=visit_id, agency_id=agency_id, payload=payload
+    )
+    await session.commit()
+    await session.refresh(visit)
+    return _to_response(visit)
+
+
+# --------------------------------------------------------------------------
+# Live location sharing (EVV)
+# --------------------------------------------------------------------------
+@router.post(
+    "/{visit_id}/start-location-sharing",
+    response_model=VisitResponse,
+    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN, UserRole.STAFF))],
+)
+async def start_location_sharing_endpoint(
+    visit_id: uuid.UUID,
+    payload: VisitStartLocationSharingRequest,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> VisitResponse:
+    """Opt in to live GPS sharing for an active visit.
+
+    Called by the staff mobile app when sharing starts. The request may
+    include the device's current position to seed the first EVV marker.
+    """
+    agency_id = _require_agency(ctx)
+    visit = await visits_service.start_location_sharing(
+        session,
+        visit_id=visit_id,
+        agency_id=agency_id,
+        initial_lat=payload.initial_lat,
+        initial_lng=payload.initial_lng,
+        initial_accuracy_m=payload.initial_accuracy_m,
+    )
+    await session.commit()
+    await session.refresh(visit)
+    return _to_response(visit)
+
+
+@router.post(
+    "/{visit_id}/location-ping",
+    response_model=VisitResponse,
+    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN, UserRole.STAFF))],
+)
+async def record_location_ping_endpoint(
+    visit_id: uuid.UUID,
+    payload: VisitLocationPingRequest,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> VisitResponse:
+    """Persist the most recent GPS ping for an actively sharing visit.
+
+    Staff apps should call this approximately every 15 seconds. The
+    endpoint intentionally stores only the latest coordinate, not a
+    location history. Pings received after sharing stops or the visit
+    ends are accepted as idempotent no-ops.
+    """
+    agency_id = _require_agency(ctx)
+    visit = await visits_service.record_location_ping(
+        session,
+        visit_id=visit_id,
+        agency_id=agency_id,
+        payload=payload,
+    )
+    await session.commit()
+    await session.refresh(visit)
+    return _to_response(visit)
+
+
+@router.post(
+    "/{visit_id}/stop-location-sharing",
+    response_model=VisitResponse,
+    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN, UserRole.STAFF))],
+)
+async def stop_location_sharing_endpoint(
+    visit_id: uuid.UUID,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> VisitResponse:
+    """Opt out of live GPS sharing while retaining the last known position."""
+    agency_id = _require_agency(ctx)
+    visit = await visits_service.stop_location_sharing(
+        session,
+        visit_id=visit_id,
+        agency_id=agency_id,
     )
     await session.commit()
     await session.refresh(visit)

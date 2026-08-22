@@ -104,10 +104,6 @@ class Visit(IdMixin, TimestampedMixin, Base):
         Numeric(6, 2), nullable=True
     )
     check_in_device_id: Mapped[str | None] = mapped_column(Text, nullable=True)
-    check_in_address_match: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    check_in_distance_from_location_m: Mapped[Decimal | None] = mapped_column(
-        Numeric(8, 2), nullable=True
-    )
 
     # ---- check-out ----
     check_out_time: Mapped[datetime | None] = mapped_column(
@@ -120,12 +116,38 @@ class Visit(IdMixin, TimestampedMixin, Base):
     )
     duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # ---- live location (staff opt-in while CHECKED_IN) ----
+    # Updated by `POST /visits/{id}/location-ping`. Used by the EVV
+    # Live Monitor to render a moving marker per visit.
+    # `sharing_location` is the user's opt-in flag — when False the
+    # pings are ignored even if the device sends them.
+    live_lat: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), nullable=True)
+    live_lng: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), nullable=True)
+    live_ping_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    live_accuracy_m: Mapped[Decimal | None] = mapped_column(
+        Numeric(6, 2), nullable=True
+    )
+    sharing_location: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+
     # Relationships
     appointment: Mapped[Appointment] = relationship(
         "Appointment", back_populates="visit"
     )
     agency: Mapped[Agency] = relationship("Agency")  # no back-ref needed
-    staff: Mapped[StaffProfile] = relationship("StaffProfile")
+    staff: Mapped[StaffProfile] = relationship(
+        "StaffProfile",
+        # Two FKs exist between `visits` and `staff_profiles`:
+        #  - `visits.staff_id`           -> `staff_profiles.id`  (assigned staff)
+        #  - `staff_profiles.last_known_visit_id` -> `visits.id`  (last visit)
+        # Disambiguate `Visit.staff` to the first FK so the mapper doesn't
+        # raise AmbiguousForeignKeysError during configuration (which would
+        # break every login via `.options(selectinload(User.roles))`).
+        foreign_keys=[staff_id],
+    )
     service_items: Mapped[list[VisitServiceItem]] = relationship(
         back_populates="visit",
         cascade="all, delete-orphan",
@@ -160,6 +182,12 @@ class Visit(IdMixin, TimestampedMixin, Base):
             "idx_visits_status",
             "status",
             postgresql_where=text("status <> 'COMPLETED'"),
+        ),
+        Index(
+            "idx_visits_live_ping",
+            "agency_id",
+            text("live_ping_at DESC"),
+            postgresql_where=text("sharing_location = true"),
         ),
         CheckConstraint(
             "(check_out_time IS NULL) OR (check_in_time IS NULL) OR "

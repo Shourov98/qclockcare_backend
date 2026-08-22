@@ -1,0 +1,93 @@
+// Agencies module — Flow 4: List + filters + pagination
+// GET /agencies?page=&page_size=&include_deleted=&status_filter=
+//
+// Render:   dot -Tpng agencies_flow_list.dot -o agencies_flow_list.png
+//           dot -Tsvg agencies_flow_list.dot -o agencies_flow_list.svg
+
+digraph agencies_list_flow {
+    rankdir=TB;
+    splines=true;
+    nodesep=0.45;
+    ranksep=0.7;
+    bgcolor="#0f1115";
+    fontname="Helvetica";
+    fontcolor="#e6e6e6";
+    label=<<B>agencies / list + filter flow</B><BR/>
+           <FONT POINT-SIZE="11" COLOR="#9aa3b2">paginated · include_deleted · status_filter</FONT>>;
+    labelloc="t";
+
+    node [shape=box, style="rounded,filled", fontname="Helvetica",
+          color="#3a4252", penwidth=1.2, fontcolor="#e6e6e6",
+          fillcolor="#1a1f29"];
+
+    edge [fontname="Helvetica", fontsize=10, color="#7e8aa3",
+          fontcolor="#9aa3b2", arrowsize=0.8];
+
+    start  [shape=circle, label="START", fillcolor="#0d6e3a",
+            fontcolor="#ffffff", width=0.7, fixedsize=true];
+    end    [shape=doublecircle, label="END", fillcolor="#7a1f2b",
+            fontcolor="#ffffff", width=0.7, fixedsize=true];
+
+    // ---- request ----
+    req [label="GET /agencies?page=1&page_size=20&include_deleted=false&status_filter=null\nQuery params (FastAPI validation):\n  page: int ≥ 1, ≤ 10000  (default 1)\n  page_size: int ≥ 1, ≤ 100 (default 20)\n  include_deleted: bool  (default false)\n  status_filter: str | None\n    ∈ {ACTIVE, TRIAL, SUSPENDED, CHURNED}",
+          fillcolor="#1c2540"];
+
+    val [label="422 VALIDATION_ERROR\n(page=0, page_size=999, status_filter='BOGUS')",
+         fillcolor="#7a1f2b", fontcolor="#ffffff"];
+
+    svc [label="list_agencies(session,\n  page, page_size,\n  include_deleted=False,\n  status_filter=None)",
+         fillcolor="#1a3a2a"];
+
+    // ---- filter chain ----
+    filt_active [label="filter 1 — soft-delete\nif not include_deleted:\n  base = base.where(deleted_at IS NULL)",
+                  shape=note, fillcolor="#22273a"];
+
+    filt_status [label="filter 2 — status\nif status_filter is not None:\n  base = base.where(status == status_filter)",
+                  shape=note, fillcolor="#22273a"];
+
+    // ---- count + page ----
+    count [label="total = SELECT count(*) FROM (base) sub\n  → int (bypasses ORDER BY for speed)",
+            fillcolor="#1a3a2a"];
+
+    page [label="offset = (page - 1) * page_size\nrows = base\n  .order_by(name, id)\n  .offset(offset)\n  .limit(page_size)\n  .all()",
+          fillcolor="#1a3a2a"];
+
+    // ---- RLS note ----
+    rls_note [label="RLS bypass\nlist_agencies runs as SUPER_ADMIN\n→ app.current_user_id = SUPER_ADMIN user\n→ app.current_agency_id is irrelevant\n→ RLS policies permit full table scan\n(per the agencies table policy)",
+               shape=note, fillcolor="#22273a"];
+
+    // ---- shape + return ----
+    shape [label="data = [AgencyResponse.model_validate(r) for r in rows]\nbody = build_offset_response(data, total, page, page_size)\n→ returns:\n  {\n    data: [...],\n    pagination: {\n      page, page_size, total,\n      total_pages\n    }\n  }",
+            fillcolor="#1a3a2a"];
+
+    resp [label="200 OK\n{\n  data: [\n    AgencyResponse, AgencyResponse, ...\n  ],\n  pagination: {\n    page: 1, page_size: 20,\n    total: 47, total_pages: 3\n  }\n}",
+          fillcolor="#0d6e3a", fontcolor="#ffffff"];
+
+    // ---- filter matrix on the right ----
+    matrix [label="Filter matrix (output)\n\ninclude_deleted=false, status_filter=null\n  → all ACTIVE/TRIAL/CHURNED rows, not deleted\n\ninclude_deleted=false, status_filter=SUSPENDED\n  → SUSPENDED rows only, not deleted\n\ninclude_deleted=true,  status_filter=null\n  → all rows incl. deleted (deleted_at NOT NULL)\n\ninclude_deleted=true,  status_filter=CHURNED\n  → CHURNED rows incl. soft-deleted ones\n\nValid status_filter values:\n  ACTIVE | TRIAL | SUSPENDED | CHURNED",
+              shape=note, fillcolor="#22273a"];
+
+    {rank=same; req; svc;}
+    {rank=same; filt_active; filt_status; rls_note;}
+    {rank=same; count; page; matrix;}
+    {rank=same; shape; resp; val;}
+
+    // ---- edges ----
+    start -> req;
+    req -> val  [label="any param invalid", color="#c95a5a"];
+    req -> svc  [label="Pydantic OK", color="#5fa86f"];
+
+    svc -> filt_active;
+    svc -> filt_status;
+    svc -> rls_note;
+
+    filt_active -> count [style=dotted, color="#7e8aa3"];
+    filt_status -> count [style=dotted, color="#7e8aa3"];
+
+    count -> page [label="with filtered base", color="#5fa86f"];
+    page -> shape  [label="(rows, total)", color="#5fa86f"];
+    shape -> resp  [label="serialise", color="#5fa86f"];
+    resp -> end;
+
+    matrix -> page [style=invis];
+}

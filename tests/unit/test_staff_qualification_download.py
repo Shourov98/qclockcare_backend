@@ -6,7 +6,7 @@ These tests focus on what's testable without spinning up a DB session
 or TestClient:
 
 1. The `QualificationDownloadResponse` schema enforces the
-   `expires_in` bounds (60..86400) declared by `S3_PRESIGNED_URL_TTL_SECONDS`.
+   `expires_in` bounds (60..86400) declared by `STORAGE_PRESIGNED_URL_TTL_SECONDS`.
 2. `StaffQualificationResponse.download_url` / `expires_in` are
    `Optional` and default to `None`, matching the no-document case.
 3. The router-level `_qualification_to_response` helper builds a
@@ -161,7 +161,8 @@ class TestQualificationToResponse:
             ),
             patch.object(staff_router, "settings") as mock_settings,
         ):
-            mock_settings.S3_PRESIGNED_URL_TTL_SECONDS = 900
+            mock_settings.STORAGE_PRESIGNED_URL_TTL_SECONDS = 900
+            mock_settings.storage_presigned_url_ttl_seconds = 900
             resp = await staff_router._qualification_to_response(qual)
 
         assert resp.download_url == fake_url

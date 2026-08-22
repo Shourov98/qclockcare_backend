@@ -295,10 +295,13 @@ class TestSendInBackground:
         assert any(
             "dev_otp" in call.args[0] for call in info_calls
         ), "expected at least one dev_otp log call"
-        # And the structured field carries the plaintext OTP.
+        # And the structured field carries the plaintext OTP. The
+        # email service passes `dev_otp_for_test_only` as a flat
+        # top-level kwarg (structlog renders each kwarg as its own
+        # field), so we read it from `call.kwargs` directly rather
+        # than through `extra={}`.
         assert any(
-            (call.kwargs.get("extra") or {}).get("dev_otp_for_test_only")
-            == "DEV-OTP-12345"
+            call.kwargs.get("dev_otp_for_test_only") == "DEV-OTP-12345"
             for call in info_calls
         )
 

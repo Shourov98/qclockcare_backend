@@ -87,7 +87,7 @@ class S3StorageAdapter(StorageAdapter):
     ) -> str:
         """boto3-backed presigned URL.
 
-        Pass `expires_in` from `settings.S3_PRESIGNED_URL_TTL_SECONDS`
+        Pass `expires_in` from `settings.storage_presigned_url_ttl_seconds`
         at the call site — the 900 s default here is only a safety net
         for direct callers that don't read settings.
         """
