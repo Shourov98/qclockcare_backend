@@ -25,8 +25,10 @@ from src.modules.audit_logs.schemas import AuditLogResponse
 from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
+    require_role,
 )
-from src.shared.domain.enums import AuditAction
+from src.modules.identity.scope_deps import require_any_scope
+from src.shared.domain.enums import AdminScope, AuditAction, UserRole
 from src.shared.schemas.pagination import (
     PaginatedResponse,
     build_offset_response,
@@ -34,8 +36,23 @@ from src.shared.schemas.pagination import (
 
 router = APIRouter(prefix="/audit-logs", tags=["audit-logs"])
 
+# Audit logs are readable by:
+#   - SUPER_ADMIN (full cross-tenant)
+#   - PLATFORM_ADMIN with SUPPORT scope (cross-tenant)
+#   - AGENCY_ADMIN (scoped to their agency via RLS)
+# Other roles are rejected. We use a list of deps so the OR semantics
+# is preserved — either dep suffices.
+_AUDIT_LOG_READERS = [
+    Depends(require_role(UserRole.AGENCY_ADMIN)),
+    Depends(require_any_scope(AdminScope.SUPPORT)),
+]
 
-@router.get("", response_model=PaginatedResponse[AuditLogResponse])
+
+@router.get(
+    "",
+    response_model=PaginatedResponse[AuditLogResponse],
+    dependencies=_AUDIT_LOG_READERS,
+)
 async def list_audit_logs_endpoint(
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
@@ -70,7 +87,11 @@ async def list_audit_logs_endpoint(
     )
 
 
-@router.get("/{log_id}", response_model=AuditLogResponse)
+@router.get(
+    "/{log_id}",
+    response_model=AuditLogResponse,
+    dependencies=_AUDIT_LOG_READERS,
+)
 async def get_audit_log_endpoint(
     log_id: uuid.UUID,
     ctx: CurrentAuth,
