@@ -3,8 +3,12 @@
 This script is the single source of truth for the Postman collection. It
 generates `QlockCare_API.postman_collection.json` so that:
 
-  - All 99 routes across 10 modules are represented.
-  - Each request carries consistent bearer auth (except the public auth routes).
+  - All routes across every module are represented (auth, staff, patients,
+    appointments, visits, portal, notifications, locations, audit-logs,
+    agencies, change-password, admin-tickets, admin-compliance,
+    admin-admins, health).
+  - Each request carries consistent bearer auth (except the public auth
+    and health routes).
   - Each request has 3 test scripts: status code range, envelope shape,
     X-Request-ID round-trip.
   - Each request that produces an ID needed by later requests has an
@@ -1084,7 +1088,249 @@ AGENCIES_FOLDER = folder(
 )
 
 # --------------------------------------------------------------------------
-# 11. Health (2 routes)
+# 11. Change Password (1 route — authed)
+# --------------------------------------------------------------------------
+CHANGE_PASSWORD_FOLDER = folder(
+    "change-password",
+    [
+        make_request(
+            name="Change password (authed)",
+            method="POST",
+            path="/auth/change-password",
+            body={
+                "current_password": "OldDevPass123!",
+                "new_password": "NewDevPass456!",
+            },
+        ),
+    ],
+    description=(
+        "Authenticated password rotation. Caller must supply the *current* "
+        "password (re-authentication guard). On success the server revokes ALL "
+        "outstanding refresh tokens, forcing re-login on every other device. "
+        "The current browser continues to work until its access token expires."
+    ),
+)
+
+
+# --------------------------------------------------------------------------
+# 12. Admin — Tickets (9 routes — SUPPORT scope)
+# --------------------------------------------------------------------------
+ADMIN_TICKETS_FOLDER = folder(
+    "admin-tickets",
+    [
+        make_request(
+            name="Ticket stats",
+            method="GET",
+            path="/admin/tickets/stats",
+        ),
+        make_request(
+            name="List tickets (paginated)",
+            method="GET",
+            path="/admin/tickets?page=1&page_size=20",
+        ),
+        make_request(
+            name="Filter tickets by status",
+            method="GET",
+            path="/admin/tickets?page=1&page_size=20&status=OPEN",
+        ),
+        make_request(
+            name="Search tickets",
+            method="GET",
+            path="/admin/tickets?page=1&page_size=20&search=stripe",
+        ),
+        make_request(
+            name="Get ticket by id",
+            method="GET",
+            path="/admin/tickets/{{ticket_id}}",
+        ),
+        make_request(
+            name="Create ticket",
+            method="POST",
+            path="/admin/tickets",
+            body={
+                "title": "Stripe webhook deliveries dropped at 14:32 UTC",
+                "description": "Customer portal stopped receiving invoice.paid events.",
+                "priority": "HIGH",
+                "agency_id": None,
+                "assignee_user_id": None,
+            },
+            extract=[("ticket_id", "id")],
+        ),
+        make_request(
+            name="Update ticket",
+            method="PATCH",
+            path="/admin/tickets/{{ticket_id}}",
+            body={"status": "IN_PROGRESS", "priority": "CRITICAL"},
+        ),
+        make_request(
+            name="Soft-delete ticket",
+            method="DELETE",
+            path="/admin/tickets/{{ticket_id}}",
+        ),
+        make_request(
+            name="Add ticket comment",
+            method="POST",
+            path="/admin/tickets/{{ticket_id}}/comments",
+            body={"body": "Reproduced on staging — opening incident.", "kind": "COMMENT"},
+        ),
+    ],
+    description=(
+        "Internal admin support tickets. SUPER_ADMIN or PLATFORM_ADMIN with "
+        "SUPPORT scope. Not tenant-scoped. Status/priority changes and "
+        "assignee updates auto-log timeline entries via PATCH."
+    ),
+)
+
+
+# --------------------------------------------------------------------------
+# 13. Admin — Compliance (12 routes — AGENCIES scope)
+# --------------------------------------------------------------------------
+ADMIN_COMPLIANCE_FOLDER = folder(
+    "admin-compliance",
+    [
+        make_request(
+            name="Compliance stats",
+            method="GET",
+            path="/admin/compliance/stats",
+        ),
+        make_request(
+            name="List documents (paginated)",
+            method="GET",
+            path="/admin/compliance/documents?page=1&page_size=20",
+        ),
+        make_request(
+            name="List documents by agency",
+            method="GET",
+            path="/admin/compliance/documents?page=1&page_size=20&agency_id={{agency_id}}",
+        ),
+        make_request(
+            name="Missing documents report",
+            method="GET",
+            path="/admin/compliance/documents/missing?page=1&page_size=20",
+        ),
+        make_request(
+            name="Create document",
+            method="POST",
+            path="/admin/compliance/documents",
+            body={
+                "agency_id": "{{agency_id}}",
+                "name": "Annual HIPAA training certificate",
+                "doc_type": "CERTIFICATE",
+                "status": "MISSING",
+                "description": "Required for all staff before patient contact.",
+                "expires_at": None,
+                "file_url": None,
+            },
+            extract=[("document_id", "id")],
+        ),
+        make_request(
+            name="Update document",
+            method="PATCH",
+            path="/admin/compliance/documents/{{document_id}}",
+            body={"status": "VALID", "expires_at": "2027-01-01T00:00:00Z"},
+        ),
+        make_request(
+            name="Soft-delete document",
+            method="DELETE",
+            path="/admin/compliance/documents/{{document_id}}",
+        ),
+        make_request(
+            name="List licenses (paginated)",
+            method="GET",
+            path="/admin/compliance/licenses?page=1&page_size=20",
+        ),
+        make_request(
+            name="Filter licenses by CRITICAL status",
+            method="GET",
+            path="/admin/compliance/licenses?page=1&page_size=20&status=CRITICAL",
+        ),
+        make_request(
+            name="Create license",
+            method="POST",
+            path="/admin/compliance/licenses",
+            body={
+                "agency_id": "{{agency_id}}",
+                "name": "State Operating License",
+                "doc_type": "LICENSE",
+                "status": None,
+                "issued_at": "2025-01-15T00:00:00Z",
+                "expires_at": "2026-09-30T00:00:00Z",
+                "reference_number": "ST-OPL-2025-001",
+                "notes": None,
+            },
+            extract=[("license_id", "id")],
+        ),
+        make_request(
+            name="Update license",
+            method="PATCH",
+            path="/admin/compliance/licenses/{{license_id}}",
+            body={"expires_at": "2027-09-30T00:00:00Z", "reference_number": "ST-OPL-2026-001"},
+        ),
+        make_request(
+            name="Soft-delete license",
+            method="DELETE",
+            path="/admin/compliance/licenses/{{license_id}}",
+        ),
+    ],
+    description=(
+        "Per-agency required documents and expiring licenses. SUPER_ADMIN or "
+        "PLATFORM_ADMIN with AGENCIES scope. Status is auto-derived from "
+        "expires_at when not supplied on create/update."
+    ),
+)
+
+
+# --------------------------------------------------------------------------
+# 14. Admin — Admins (5 routes — SUPER_ADMIN only for write paths)
+# --------------------------------------------------------------------------
+ADMIN_ADMINS_FOLDER = folder(
+    "admin-admins",
+    [
+        make_request(
+            name="List admins",
+            method="GET",
+            path="/admin/admins?page=1&page_size=20",
+        ),
+        make_request(
+            name="Get admin by id",
+            method="GET",
+            path="/admin/admins/{{admin_id}}",
+        ),
+        make_request(
+            name="Create PLATFORM_ADMIN with scopes",
+            method="POST",
+            path="/admin/admins",
+            body={
+                "full_name": "New Platform Admin",
+                "email": "new-admin+{{$randomUUID}}@example.com",
+                "phone": None,
+                "scopes": ["SUPPORT", "AGENCIES"],
+            },
+            extract=[("admin_id", "id")],
+        ),
+        make_request(
+            name="Update admin (rename + replace scopes)",
+            method="PATCH",
+            path="/admin/admins/{{admin_id}}",
+            body={"full_name": "Renamed Admin", "scopes": ["SUPPORT"]},
+        ),
+        make_request(
+            name="Archive admin (DELETE)",
+            method="DELETE",
+            path="/admin/admins/{{admin_id}}",
+        ),
+    ],
+    description=(
+        "Platform admin management. List/get are open to SUPER_ADMIN + "
+        "PLATFORM_ADMIN; create / delete are SUPER_ADMIN only. PLATFORM_ADMIN "
+        "creation requires at least one scope. Updating `scopes` on a "
+        "SUPER_ADMIN is silently ignored."
+    ),
+)
+
+
+# --------------------------------------------------------------------------
+# 15. Health (2 routes)
 # --------------------------------------------------------------------------
 HEALTH_FOLDER = folder(
     "health",
@@ -1603,6 +1849,15 @@ COLLECTION: dict[str, Any] = {
             "1. Import this collection + `environments/Local.postman_environment.json` into Postman.\n"
             "2. Seed a test user: `uv run python scripts/seed_test_user.py`.\n"
             "3. Start the API: `uv run uvicorn src.main:app --port 8001`.\n"
+            "4. Open `auth > Login` and click Send. Tokens auto-populate into the env.\n"
+            "5. Click into any folder — every request is auto-authenticated.\n\n"
+            "**Folders are organized by user role:**\n"
+            "- `auth`, `health` — public.\n"
+            "- `staff`, `patients`, `appointments`, `visits`, `locations`, `audit-logs`, `notifications > broadcast` — AGENCY_ADMIN.\n"
+            "- `agencies` — SUPER_ADMIN or PLATFORM_ADMIN(AGENCIES) for read; SUPER_ADMIN only for write.\n"
+            "- `change-password`, `admin-tickets`, `admin-compliance`, `admin-admins` — admin dashboard.\n"
+            "- `notifications > list/read/badge` — any authenticated user.\n"
+            "- `portal` — PATIENT role only.\n\n"
             "4. Open `Auth > Login` and click Send. Tokens auto-populate into the env.\n"
             "5. Click into any role folder — each request is auto-authenticated.\n\n"
             "**Folders are organized by role**, so a frontend dev can open "
@@ -1632,6 +1887,19 @@ COLLECTION: dict[str, Any] = {
     "item": [
         # 1. Auth — public endpoints (no Bearer required).
         AUTH_FOLDER,
+        STAFF_FOLDER,
+        PATIENTS_FOLDER,
+        APPOINTMENTS_FOLDER,
+        VISITS_FOLDER,
+        PORTAL_FOLDER,
+        NOTIFICATIONS_FOLDER,
+        LOCATIONS_FOLDER,
+        AUDIT_LOGS_FOLDER,
+        AGENCIES_FOLDER,
+        CHANGE_PASSWORD_FOLDER,
+        ADMIN_TICKETS_FOLDER,
+        ADMIN_COMPLIANCE_FOLDER,
+        ADMIN_ADMINS_FOLDER,
         # 2. Admin (SUPER_ADMIN) — cross-tenant ops.
         ADMIN_FOLDER,
         # 3. Agency Admin (AGENCY_ADMIN) — most-used role.
