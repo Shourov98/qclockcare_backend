@@ -146,10 +146,13 @@ class NotificationPreference(Base):
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
     )
-    agency_id: Mapped[uuid.UUID] = mapped_column(
+    # `agency_id` is nullable so cross-tenant admins (SUPER_ADMIN,
+    # PLATFORM_ADMIN) can hold preference rows scoped only to their
+    # user_id. See migration 0023.
+    agency_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("agencies.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
     )
     type: Mapped[NotificationType] = mapped_column(
         Enum(NotificationType, name=pg_name(NotificationType)),

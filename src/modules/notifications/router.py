@@ -137,10 +137,11 @@ async def list_preferences_endpoint(
 
     On the first call for a user, lazy-seeds one row per (type, channel)
     with `opted_in = true` so subsequent calls return the stored state.
+
+    Cross-tenant admins (SUPER_ADMIN, PLATFORM_ADMIN) have
+    `agency_id == None`; `list_my_prefs` writes `agency_id=None` for
+    those rows and they are returned like any other preferences.
     """
-    if ctx.agency_id is None:
-        # SUPER_ADMIN without an agency assignment — no prefs to show.
-        return []
     prefs = await list_my_prefs(
         session, user_id=ctx.user_id, agency_id=ctx.agency_id
     )
@@ -168,14 +169,12 @@ async def update_preference_endpoint(
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> NotificationPreferenceResponse:
-    """Set opt-in/opt-out for one (type, channel) for the caller."""
-    if ctx.agency_id is None:
-        from src.core.exceptions import ValidationError
+    """Set opt-in/opt-out for one (type, channel) for the caller.
 
-        raise ValidationError(
-            "Cannot set preferences without an agency assignment."
-        )
-
+    Cross-tenant admins (SUPER_ADMIN, PLATFORM_ADMIN) have
+    `agency_id == None`; the row is written with `agency_id=None` and
+    identified by the composite key `(user_id, type, channel)`.
+    """
     row = await set_pref(
         session,
         user_id=ctx.user_id,
