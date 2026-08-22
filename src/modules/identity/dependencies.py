@@ -45,6 +45,10 @@ class AuthContext:
     user: CurrentUser
     role: UserRole
     agency_id: uuid.UUID | None
+    # Scopes carry AdminScope values for PLATFORM_ADMIN users. Empty
+    # for everyone else (SUPER_ADMIN bypasses scope checks via role
+    # check; agency-scoped roles don't use scopes).
+    scopes: tuple[str, ...]
     raw_token: str
 
 
@@ -133,6 +137,7 @@ async def get_session_with_auth(
                 user=_to_current_user(user),
                 role=role,
                 agency_id=agency_id,
+                scopes=payload.scopes,
                 raw_token=raw_token,
             )
         yield session

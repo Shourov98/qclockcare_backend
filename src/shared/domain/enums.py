@@ -25,14 +25,31 @@ from enum import StrEnum
 class UserRole(StrEnum):
     """Roles a user can hold within an agency.
 
-    SUPER_ADMIN has `agency_id = NULL` and can hold only SUPER_ADMIN.
+    SUPER_ADMIN has `agency_id = NULL` and has full cross-tenant access.
+    PLATFORM_ADMIN has `agency_id = NULL` and holds one or more scopes
+        from `AdminScope` for granular cross-tenant access.
+    AGENCY_ADMIN is scoped to a single agency.
     """
 
     SUPER_ADMIN = "SUPER_ADMIN"
+    PLATFORM_ADMIN = "PLATFORM_ADMIN"
     AGENCY_ADMIN = "AGENCY_ADMIN"
     STAFF = "STAFF"
     PATIENT = "PATIENT"
     GUARDIAN = "GUARDIAN"
+
+
+class AdminScope(StrEnum):
+    """Scopes a PLATFORM_ADMIN user can hold.
+
+    Scopes are checked at the router level via `require_scope(scope)`.
+    SUPER_ADMIN users always pass scope checks without needing rows
+    in the `admin_scopes` table.
+    """
+
+    AGENCIES = "AGENCIES"   # read + patch all agencies (status, plan)
+    CLINICAL = "CLINICAL"   # read patients/staff across tenants
+    SUPPORT = "SUPPORT"     # read audit logs, cross-tenant notifications
 
 
 class UserStatus(StrEnum):
