@@ -375,7 +375,61 @@ class SingleUseToken(Base):
     user: Mapped[User] = relationship()
 
 
+# --------------------------------------------------------------------------
+# admin_scopes
+# --------------------------------------------------------------------------
+class AdminScope(Base):
+    """One row per (PLATFORM_ADMIN user, AdminScope) the user holds.
+
+    Composite primary key (user_id, scope_name). The CHECK constraint
+    on `scope_name` pins valid values to the AdminScope enum members;
+    we use VARCHAR instead of a Postgres enum so adding new scopes
+    later is a config-only change.
+
+    SUPER_ADMIN users do not need rows here — `require_scope` treats
+    their role as a bypass regardless. AGENCY_ADMIN/STAFF/PATIENT/
+    GUARDIAN users also do not get rows; scopes are a PLATFORM_ADMIN
+    concept.
+
+    `granted_by` records which user issued the scope, for audit. Set
+    to NULL on cascade-delete of the granting user so the grant
+    survives the actor being removed.
+    """
+
+    __tablename__ = "admin_scopes"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    scope_name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    granted_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    granted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default="now()",
+    )
+
+    user: Mapped[User] = relationship(foreign_keys=[user_id])
+    granter: Mapped[User | None] = relationship(foreign_keys=[granted_by])
+
+    __table_args__ = (
+        CheckConstraint(
+            "scope_name IN ('AGENCIES', 'CLINICAL', 'SUPPORT')",
+            name="chk_admin_scopes_scope_name",
+        ),
+        Index("idx_admin_scopes_scope_name", "scope_name"),
+    )
+
+
 __all__ = [
+    "AdminScope",
     "AuthAuditEvent",
     "EmailVerificationOtp",
     "RefreshToken",

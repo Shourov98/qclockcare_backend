@@ -3,7 +3,11 @@
 Covers:
   - DeliveryResult dataclass defaults
   - InAppProvider always succeeds
-  - EmailProvider returns failure when SMTP_ENABLED=false
+  - EmailProvider returns failure when neither Resend nor SMTP is enabled
+  - EmailProvider routes to Resend when RESEND_ENABLED=true with a key
+  - EmailProvider falls back to SMTP when Resend is disabled
+  - EmailProvider prefers Resend over SMTP when both are enabled
+  - EmailProvider handles Resend non-2xx responses
   - SMSProvider returns success in stub mode (SMS_ENABLED=false)
   - SMSProvider raises NotImplementedError when SMS_ENABLED=true and
     Twilio creds are missing
@@ -12,7 +16,7 @@ Covers:
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -67,6 +71,8 @@ class TestEmailProvider:
     async def test_disabled_returns_failure(self) -> None:
         with patch("src.modules.notifications.channels.settings") as mock_settings:
             mock_settings.SMTP_ENABLED = False
+            mock_settings.RESEND_ENABLED = False
+            mock_settings.RESEND_API_KEY = None
             mock_settings.SMTP_FROM_NAME = "QlockCare"
             mock_settings.SMTP_FROM_EMAIL = "noreply@qlockcare.local"
             provider = EmailProvider()
@@ -74,7 +80,163 @@ class TestEmailProvider:
                 to="x@example.com", subject="Hi", body="There"
             )
             assert result.success is False
-            assert "SMTP" in (result.error or "")
+            assert "Email disabled" in (result.error or "")
+
+    async def test_resend_enabled_calls_api(self) -> None:
+        """RESEND_ENABLED=true + key → Resend branch."""
+        from pydantic import SecretStr
+
+        fake_response = MagicMock()
+        fake_response.status_code = 201
+        fake_response.json.return_value = {"id": "abc123"}
+        fake_response.text = '{"id": "abc123"}'
+
+        fake_client = AsyncMock()
+        fake_client.__aenter__.return_value.post = AsyncMock(
+            return_value=fake_response
+        )
+
+        with patch("src.modules.notifications.channels.settings") as mock_settings, \
+             patch("src.modules.notifications.channels.httpx.AsyncClient", return_value=fake_client):
+            mock_settings.SMTP_ENABLED = False
+            mock_settings.RESEND_ENABLED = True
+            mock_settings.RESEND_API_KEY = SecretStr("re_test_key")
+            mock_settings.RESEND_EMAIL = "noreply@qlockcare.com"
+            mock_settings.RESEND_API_TIMEOUT_SECONDS = 10
+            mock_settings.SMTP_FROM_NAME = "QlockCare"
+            mock_settings.SMTP_FROM_EMAIL = "noreply@qlockcare.local"
+            provider = EmailProvider()
+            result = await provider.send(
+                to="x@example.com", subject="Hi", body="There"
+            )
+
+        assert result.success is True
+        assert result.provider_message_id == "resend:abc123"
+        # Confirm the call hit Resend's API with the expected payload.
+        post_call = fake_client.__aenter__.return_value.post.await_args
+        assert post_call.args[0] == "https://api.resend.com/emails"
+        assert post_call.kwargs["headers"]["Authorization"] == "Bearer re_test_key"
+        assert post_call.kwargs["json"]["from"] == "QlockCare <noreply@qlockcare.com>"
+        assert post_call.kwargs["json"]["to"] == ["x@example.com"]
+        assert post_call.kwargs["json"]["subject"] == "Hi"
+        assert post_call.kwargs["json"]["text"] == "There"
+
+    async def test_resend_non_2xx_returns_failure(self) -> None:
+        from pydantic import SecretStr
+
+        fake_response = MagicMock()
+        fake_response.status_code = 422
+        fake_response.text = "validation failed"
+
+        fake_client = AsyncMock()
+        fake_client.__aenter__.return_value.post = AsyncMock(
+            return_value=fake_response
+        )
+
+        with patch("src.modules.notifications.channels.settings") as mock_settings, \
+             patch("src.modules.notifications.channels.httpx.AsyncClient", return_value=fake_client):
+            mock_settings.SMTP_ENABLED = False
+            mock_settings.RESEND_ENABLED = True
+            mock_settings.RESEND_API_KEY = SecretStr("re_test_key")
+            mock_settings.RESEND_EMAIL = "noreply@qlockcare.com"
+            mock_settings.RESEND_API_TIMEOUT_SECONDS = 10
+            mock_settings.SMTP_FROM_NAME = "QlockCare"
+            mock_settings.SMTP_FROM_EMAIL = "noreply@qlockcare.local"
+            provider = EmailProvider()
+            result = await provider.send(
+                to="x@example.com", subject="Hi", body="There"
+            )
+
+        assert result.success is False
+        assert "422" in (result.error or "")
+        assert "validation failed" in (result.error or "")
+
+    async def test_resend_enabled_overrides_smtp(self) -> None:
+        """When both flags are on, Resend wins over SMTP."""
+        from pydantic import SecretStr
+
+        fake_response = MagicMock()
+        fake_response.status_code = 201
+        fake_response.json.return_value = {"id": "id-1"}
+        fake_response.text = "{}"
+
+        fake_client = AsyncMock()
+        fake_client.__aenter__.return_value.post = AsyncMock(
+            return_value=fake_response
+        )
+
+        with patch("src.modules.notifications.channels.settings") as mock_settings, \
+             patch("src.modules.notifications.channels.httpx.AsyncClient", return_value=fake_client), \
+             patch("src.modules.notifications.channels.aiosmtplib.send", new=AsyncMock()) as smtp_send:
+            mock_settings.SMTP_ENABLED = True
+            mock_settings.SMTP_HOST = "localhost"
+            mock_settings.SMTP_PORT = 1025
+            mock_settings.SMTP_USERNAME = ""
+            mock_settings.SMTP_PASSWORD = None
+            mock_settings.SMTP_USE_TLS = False
+            mock_settings.SMTP_TIMEOUT_SECONDS = 10
+            mock_settings.RESEND_ENABLED = True
+            mock_settings.RESEND_API_KEY = SecretStr("re_test_key")
+            mock_settings.RESEND_EMAIL = "noreply@qlockcare.com"
+            mock_settings.RESEND_API_TIMEOUT_SECONDS = 10
+            mock_settings.SMTP_FROM_NAME = "QlockCare"
+            mock_settings.SMTP_FROM_EMAIL = "noreply@qlockcare.local"
+            provider = EmailProvider()
+            result = await provider.send(
+                to="x@example.com", subject="Hi", body="There"
+            )
+
+        assert result.success is True
+        assert result.provider_message_id == "resend:id-1"
+        smtp_send.assert_not_called()
+
+    async def test_resend_disabled_falls_back_to_smtp(self) -> None:
+        """RESEND_ENABLED=false + SMTP_ENABLED=true → SMTP branch."""
+        with patch("src.modules.notifications.channels.settings") as mock_settings, \
+             patch("src.modules.notifications.channels.aiosmtplib.send", new=AsyncMock()) as smtp_send:
+            mock_settings.SMTP_ENABLED = True
+            mock_settings.SMTP_HOST = "localhost"
+            mock_settings.SMTP_PORT = 1025
+            mock_settings.SMTP_USERNAME = ""
+            mock_settings.SMTP_PASSWORD = None
+            mock_settings.SMTP_USE_TLS = False
+            mock_settings.SMTP_TIMEOUT_SECONDS = 10
+            mock_settings.RESEND_ENABLED = False
+            mock_settings.RESEND_API_KEY = None
+            mock_settings.SMTP_FROM_NAME = "QlockCare"
+            mock_settings.SMTP_FROM_EMAIL = "noreply@qlockcare.local"
+            provider = EmailProvider()
+            result = await provider.send(
+                to="x@example.com", subject="Hi", body="There"
+            )
+
+        assert result.success is True
+        smtp_send.assert_awaited_once()
+
+    async def test_resend_network_error_returns_failure(self) -> None:
+        from pydantic import SecretStr
+
+        fake_client = AsyncMock()
+        fake_client.__aenter__.return_value.post = AsyncMock(
+            side_effect=RuntimeError("connection refused")
+        )
+
+        with patch("src.modules.notifications.channels.settings") as mock_settings, \
+             patch("src.modules.notifications.channels.httpx.AsyncClient", return_value=fake_client):
+            mock_settings.SMTP_ENABLED = False
+            mock_settings.RESEND_ENABLED = True
+            mock_settings.RESEND_API_KEY = SecretStr("re_test_key")
+            mock_settings.RESEND_EMAIL = "noreply@qlockcare.com"
+            mock_settings.RESEND_API_TIMEOUT_SECONDS = 10
+            mock_settings.SMTP_FROM_NAME = "QlockCare"
+            mock_settings.SMTP_FROM_EMAIL = "noreply@qlockcare.local"
+            provider = EmailProvider()
+            result = await provider.send(
+                to="x@example.com", subject="Hi", body="There"
+            )
+
+        assert result.success is False
+        assert "connection refused" in (result.error or "")
 
     def test_channel_is_email(self) -> None:
         assert EmailProvider.channel == NotificationChannel.EMAIL
@@ -141,6 +303,8 @@ class TestProviderRegistry:
     def test_email_disabled_returns_none(self) -> None:
         with patch("src.modules.notifications.channels.settings") as mock_settings:
             mock_settings.SMTP_ENABLED = False
+            mock_settings.RESEND_ENABLED = False
+            mock_settings.RESEND_API_KEY = None
             provider = ProviderRegistry.get(NotificationChannel.EMAIL)
             assert provider is None
 
@@ -154,6 +318,17 @@ class TestProviderRegistry:
             mock_settings.SMTP_FROM_NAME = "QlockCare"
             mock_settings.SMTP_FROM_EMAIL = "noreply@qlockcare.local"
             mock_settings.SMTP_USE_TLS = False
+            mock_settings.RESEND_ENABLED = False
+            mock_settings.RESEND_API_KEY = None
+            provider = ProviderRegistry.get(NotificationChannel.EMAIL)
+            assert provider is not None
+            assert provider.channel == NotificationChannel.EMAIL
+
+    def test_email_resend_enabled_returns_provider(self) -> None:
+        with patch("src.modules.notifications.channels.settings") as mock_settings:
+            mock_settings.SMTP_ENABLED = False
+            mock_settings.RESEND_ENABLED = True
+            mock_settings.RESEND_API_KEY = "re_test_key"
             provider = ProviderRegistry.get(NotificationChannel.EMAIL)
             assert provider is not None
             assert provider.channel == NotificationChannel.EMAIL
@@ -165,6 +340,8 @@ class TestProviderRegistry:
     def test_enabled_channels_default_env(self) -> None:
         with patch("src.modules.notifications.channels.settings") as mock_settings:
             mock_settings.SMTP_ENABLED = False
+            mock_settings.RESEND_ENABLED = False
+            mock_settings.RESEND_API_KEY = None
             mock_settings.SMS_ENABLED = False
             # Reset to ensure clean state.
             ProviderRegistry._PROVIDERS = {}

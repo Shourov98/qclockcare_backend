@@ -7,7 +7,7 @@ guardian sources, etc.).
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from uuid import UUID
 
 import pytest
@@ -15,10 +15,13 @@ from pydantic import ValidationError
 
 from src.modules.patients.schemas import (
     GuardianProfileCreateRequest,
+    GuardianProfileResponse,
     GuardianProfileUpdateRequest,
     PatientGuardianRelationshipCreateRequest,
     PatientGuardianRelationshipUpdateRequest,
     PatientProfileCreateRequest,
+    PatientProfileResponse,
+    PatientProfileSummaryResponse,
     PatientProfileUpdateRequest,
 )
 
@@ -195,3 +198,117 @@ class TestPatientGuardianRelationshipUpdateRequest:
                 valid_from=date(2025, 6, 1),
                 valid_until=date(2025, 1, 1),
             )
+
+
+# --------------------------------------------------------------------------
+# Joined user fields on the response shapes — `full_name`, `email`,
+# `phone` are read from the underlying User row by the router helper
+# (`_patient_to_dict` / `_guardian_to_dict`). They must be optional on
+# the response side so a partially-populated user doesn't 500, but
+# they must round-trip when present.
+# --------------------------------------------------------------------------
+class TestPatientProfileResponsesJoinedFields:
+    def test_summary_response_full(self) -> None:
+        resp = PatientProfileSummaryResponse(
+            id=_UUID_A,
+            agency_id=_UUID_A,
+            user_id=_UUID_A,
+            full_name="Maria Alvarez",
+            email="maria.alvarez@qlockcare-demo.com",
+            phone="+1-612-555-0177",
+            patient_code="PT-1024",
+            status="ACTIVE",
+            date_of_birth=date(1948, 3, 14),
+            admitted_at=date(2026, 6, 15),
+            discharged_at=None,
+            created_at=datetime(2026, 6, 15, 10, 0, 0),
+            updated_at=datetime(2026, 6, 20, 14, 30, 0),
+        )
+        assert resp.full_name == "Maria Alvarez"
+        assert str(resp.email) == "maria.alvarez@qlockcare-demo.com"
+        assert resp.phone == "+1-612-555-0177"
+
+    def test_summary_response_nulls_tolerated(self) -> None:
+        resp = PatientProfileSummaryResponse(
+            id=_UUID_A,
+            agency_id=_UUID_A,
+            user_id=_UUID_A,
+            patient_code="PT-1024",
+            status="ACTIVE",
+            date_of_birth=None,
+            admitted_at=None,
+            discharged_at=None,
+            created_at=datetime(2026, 6, 15, 10, 0, 0),
+            updated_at=datetime(2026, 6, 15, 10, 0, 0),
+        )
+        assert resp.full_name is None
+        assert resp.email is None
+        assert resp.phone is None
+
+    def test_detail_response_round_trip(self) -> None:
+        # Detail path includes the joined user fields plus
+        # optional nested `guardian_links` (default None here).
+        resp = PatientProfileResponse(
+            id=_UUID_A,
+            agency_id=_UUID_A,
+            user_id=_UUID_A,
+            full_name="Maria Alvarez",
+            email="maria.alvarez@qlockcare-demo.com",
+            phone=None,
+            patient_code="PT-1024",
+            status="ACTIVE",
+            date_of_birth=date(1948, 3, 14),
+            gender="female",
+            preferred_language="es",
+            care_notes="Allergic to penicillin.",
+            admitted_at=date(2026, 6, 15),
+            discharged_at=None,
+            created_at=datetime(2026, 6, 15, 10, 0, 0),
+            updated_at=datetime(2026, 6, 20, 14, 30, 0),
+        )
+        assert resp.full_name == "Maria Alvarez"
+        assert resp.phone is None
+        assert resp.guardian_links is None
+
+
+class TestGuardianProfileResponseJoinedFields:
+    def test_full(self) -> None:
+        resp = GuardianProfileResponse(
+            id=_UUID_A,
+            agency_id=_UUID_A,
+            user_id=_UUID_A,
+            full_name="Rosa Santos",
+            email="rosa.santos@example.com",
+            phone="+1-612-555-0199",
+            status="ACTIVE",
+            contact_phone="+1-612-555-0177",
+            contact_email="rosa.santos@example.com",
+            notes="Daughter; primary emergency contact.",
+            created_at=datetime(2026, 6, 15, 10, 5, 0),
+            updated_at=datetime(2026, 6, 15, 10, 5, 0),
+        )
+        assert resp.full_name == "Rosa Santos"
+        # account vs. outreach email may legitimately differ — both
+        # must round-trip independently.
+        assert str(resp.email) == "rosa.santos@example.com"
+        assert str(resp.contact_email) == "rosa.santos@example.com"
+        assert resp.phone == "+1-612-555-0199"
+        assert resp.contact_phone == "+1-612-555-0177"
+
+    def test_nulls_tolerated(self) -> None:
+        resp = GuardianProfileResponse(
+            id=_UUID_A,
+            agency_id=_UUID_A,
+            user_id=_UUID_A,
+            status="INVITED",
+            contact_phone=None,
+            contact_email=None,
+            notes=None,
+            created_at=datetime(2026, 6, 15, 10, 5, 0),
+            updated_at=datetime(2026, 6, 15, 10, 5, 0),
+        )
+        assert resp.full_name is None
+        assert resp.email is None
+        assert resp.phone is None
+        assert resp.contact_email is None
+        assert resp.notes is None

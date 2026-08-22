@@ -26,7 +26,7 @@ from src.core.exceptions import (
     ValidationError,
 )
 from src.modules.agencies.models import Agency
-from src.modules.identity import auth_service
+from src.modules.identity import otp_service
 from src.modules.identity.models import User, UserRoleAssignment
 from src.modules.patients.models import (
     GuardianProfile,
@@ -81,9 +81,16 @@ async def _get_guardian_or_404(
     guardian_id: uuid.UUID,
     agency_id: uuid.UUID,
 ) -> GuardianProfile:
-    stmt = select(GuardianProfile).where(
-        GuardianProfile.id == guardian_id,
-        GuardianProfile.agency_id == agency_id,
+    # Always selectinload the User row — the GuardianProfileResponse
+    # joins `full_name` / `email` / `phone` from it. Lazy-loading from
+    # inside an awaited Pydantic serializer would race.
+    stmt = (
+        select(GuardianProfile)
+        .where(
+            GuardianProfile.id == guardian_id,
+            GuardianProfile.agency_id == agency_id,
+        )
+        .options(selectinload(GuardianProfile.user))
     )
     g = (await session.execute(stmt)).scalar_one_or_none()
     if g is None:
@@ -131,14 +138,14 @@ class PatientInviteResult:
 
     The router schedules an invitation email via
     `auth.email_service.send_invitation_email(...)` using the
-    plaintext token + recipient fields.
+    plaintext OTP + recipient fields.
     """
 
     profile: PatientProfile
     user_id: uuid.UUID
     email: str
     full_name: str | None
-    invitation_token: str
+    invitation_otp: str
 
 
 async def create_patient(
@@ -159,8 +166,9 @@ async def create_patient(
     create the profile + role assignment. The unique constraint on
     `(agency_id, user_id)` will surface duplicates via IntegrityError.
 
-    Issues a fresh `SingleUseToken(purpose="invitation")` and returns
-    its plaintext so the caller can schedule the invitation email.
+    Issues a fresh email-verification OTP via `otp_service.issue_otp`
+    and returns its plaintext so the caller can schedule the
+    invitation email.
     """
     await _assert_agency_active(session, agency_id)
 
@@ -238,10 +246,11 @@ async def create_patient(
         },
     )
 
-    # Issue a fresh invitation token + return everything the router
+    # Issue a fresh invitation OTP + return everything the router
     # needs to schedule the email.
-    invitation_token, _jti = await auth_service.issue_invitation_token(
-        session, user_id=user.id
+    issued = await otp_service.issue_otp(
+        session,
+        user=user,
     )
 
     return PatientInviteResult(
@@ -249,7 +258,7 @@ async def create_patient(
         user_id=user.id,
         email=user.email,
         full_name=user.full_name,
-        invitation_token=invitation_token,
+        invitation_otp=issued.otp,
     )
 
 
@@ -260,8 +269,13 @@ async def get_patient(
     agency_id: uuid.UUID,
     with_relationships: bool = False,
 ) -> PatientProfile:
-    stmt = select(PatientProfile).where(
-        PatientProfile.id == patient_id, PatientProfile.agency_id == agency_id
+    # Always selectinload the User row — the response shapes join
+    # `full_name` / `email` / `phone` from it. Lazy-loading from inside
+    # an awaited Pydantic serializer would race.
+    stmt = (
+        select(PatientProfile)
+        .where(PatientProfile.id == patient_id, PatientProfile.agency_id == agency_id)
+        .options(selectinload(PatientProfile.user))
     )
     if with_relationships:
         stmt = stmt.options(selectinload(PatientProfile.guardian_links))
@@ -295,7 +309,8 @@ async def list_patients(
         count_base = count_base.where(PatientProfile.status == status_filter)
 
     base = (
-        base.order_by(PatientProfile.created_at.desc(), PatientProfile.id)
+        base.options(selectinload(PatientProfile.user))
+        .order_by(PatientProfile.created_at.desc(), PatientProfile.id)
         .limit(page_size)
         .offset((page - 1) * page_size)
     )
@@ -390,7 +405,7 @@ class GuardianInviteResult:
     user_id: uuid.UUID
     email: str
     full_name: str | None
-    invitation_token: str
+    invitation_otp: str
 
 
 async def create_guardian(
@@ -470,10 +485,11 @@ async def create_guardian(
         },
     )
 
-    # Issue a fresh invitation token + return everything the router
+    # Issue a fresh invitation OTP + return everything the router
     # needs to schedule the email.
-    invitation_token, _jti = await auth_service.issue_invitation_token(
-        session, user_id=user.id
+    issued = await otp_service.issue_otp(
+        session,
+        user=user,
     )
 
     return GuardianInviteResult(
@@ -481,7 +497,7 @@ async def create_guardian(
         user_id=user.id,
         email=user.email,
         full_name=user.full_name,
-        invitation_token=invitation_token,
+        invitation_otp=issued.otp,
     )
 
 
@@ -508,6 +524,7 @@ async def list_guardians(
     base = (
         select(GuardianProfile)
         .where(GuardianProfile.agency_id == agency_id)
+        .options(selectinload(GuardianProfile.user))
         .order_by(GuardianProfile.created_at.desc(), GuardianProfile.id)
         .limit(page_size)
         .offset((page - 1) * page_size)

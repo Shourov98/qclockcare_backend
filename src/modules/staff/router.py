@@ -9,6 +9,7 @@ just passes the auth context through).
 Endpoints:
   POST   /staff                                       — invite staff
   GET    /staff                                       — list (paginated)
+  GET    /staff/live-locations                        — last-known GPS per active staff
   GET    /staff/{id}                                  — fetch (summary)
   GET    /staff/{id}/with-details                     — fetch + qual + avail
   PATCH  /staff/{id}                                  — update
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import contextlib
 import uuid
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, Response, status
@@ -47,6 +49,8 @@ from src.modules.identity.dependencies import (
 )
 from src.modules.staff import service as staff_service
 from src.modules.staff.schemas import (
+    LiveStaffLocationEntry,
+    LiveStaffLocationsResponse,
     QualificationDownloadResponse,
     StaffAvailabilityCreateRequest,
     StaffAvailabilityResponse,
@@ -96,6 +100,33 @@ def _ensure_can_view(ctx: CurrentAuth, staff_user_id: uuid.UUID) -> None:
         raise CrossAgencyAccessDeniedError()
 
 
+def _staff_to_dict(staff: object) -> dict[str, object]:
+    """Build a flat dict from a StaffProfile ORM row.
+
+    Reads the joined user fields eagerly (`full_name` / `email` /
+    `phone`) — `StaffProfile.user` is selectinloaded by `list_staff`
+    and `get_staff` so this never triggers a lazy load inside a sync
+    serializer. Used by both `_to_response` (detail path) and the
+    list endpoint (summary path) so the user fields are populated
+    consistently.
+    """
+    user = getattr(staff, "user", None)
+    return {
+        "id": staff.id,
+        "agency_id": staff.agency_id,
+        "user_id": staff.user_id,
+        "full_name": getattr(user, "full_name", None) if user is not None else None,
+        "email": getattr(user, "email", None) if user is not None else None,
+        "phone": getattr(user, "phone", None) if user is not None else None,
+        "staff_code": staff.staff_code,
+        "status": staff.status,
+        "hired_at": staff.hired_at,
+        "terminated_at": staff.terminated_at,
+        "created_at": staff.created_at,
+        "updated_at": staff.updated_at,
+    }
+
+
 def _to_response(
     staff: object,
     *,
@@ -105,22 +136,12 @@ def _to_response(
 
     `StaffProfile.qualifications` and `.availability` are lazy-loaded
     relationships — calling `model_validate(staff)` would trigger async
-    IO outside an awaited context. We build the dict explicitly and only
-    include the nested children when explicitly requested (i.e. when
-    `with_details=True` and the collections are already loaded).
+    IO outside an awaited context. We build the dict explicitly via
+    `_staff_to_dict` and only include the nested children when
+    explicitly requested (i.e. when `with_details=True` and the
+    collections are already loaded).
     """
-    # `from_attributes=True` lets us build a dict-like input from the ORM row.
-    data: dict = {
-        "id": staff.id,
-        "agency_id": staff.agency_id,
-        "user_id": staff.user_id,
-        "staff_code": staff.staff_code,
-        "status": staff.status,
-        "hired_at": staff.hired_at,
-        "terminated_at": staff.terminated_at,
-        "created_at": staff.created_at,
-        "updated_at": staff.updated_at,
-    }
+    data: dict = _staff_to_dict(staff)
     if with_details:
         # The collections were eager-loaded by the service; safe to read.
         try:
@@ -229,8 +250,8 @@ async def create_staff_endpoint(
         background_tasks,
         to_email=result.email,
         to_name=result.full_name,
-        invitation_token=result.invitation_token,
-        expires_in_days=settings.INVITATION_TOKEN_EXPIRY_DAYS,
+        otp=result.invitation_otp,
+        expires_in_minutes=settings.OTP_EXPIRY_MINUTES,
         recipient_user_id=result.user_id,
     )
     return _to_response(result.profile, with_details=False)
@@ -265,12 +286,54 @@ async def list_staff_endpoint(
         page=page,
         page_size=page_size,
     )
-    data = [StaffProfileSummaryResponse.model_validate(r) for r in rows]
+    # Build dicts explicitly so the joined user fields
+    # (`full_name`, `email`, `phone`) — which live on the User row,
+    # not on the StaffProfile column — are populated reliably.
+    data = [
+        StaffProfileSummaryResponse.model_validate(_staff_to_dict(r))
+        for r in rows
+    ]
     return build_offset_response(
         data,
         total=total,
         page=page,
         page_size=page_size,
+    )
+
+
+@router.get(
+    "/live-locations",
+    response_model=LiveStaffLocationsResponse,
+    responses=standard_responses(include=[401, 403, 422]),
+    summary="Live staff GPS (last-known ping per active staff)",
+    description=(
+        "Returns one entry per `ACTIVE` staff member in the caller's "
+        "agency who has a `last_known_ping_at` within the freshness "
+        "window (`freshness_minutes`, default 30). Hydrates "
+        "`full_name` from `users.full_name` and surfaces the staff's "
+        "last visit status (if any). Backs the staff-level pin layer "
+        "on the EVV Live Monitor; visit pins still come from "
+        "`GET /visits?sharing_only=true`. AGENCY_ADMIN only — staff "
+        "GPS isn't surfaced to non-admin users."
+    ),
+    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+)
+async def list_live_staff_locations_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+    freshness_minutes: int = Query(default=30, ge=1, le=1440),
+) -> LiveStaffLocationsResponse:
+    """Live staff GPS for the caller's agency."""
+    agency_id = _require_agency(ctx)
+    rows = await staff_service.list_live_staff_locations(
+        session,
+        agency_id=agency_id,
+        freshness_minutes=freshness_minutes,
+    )
+    return LiveStaffLocationsResponse(
+        freshness_minutes=freshness_minutes,
+        server_time=datetime.now(UTC),
+        entries=[LiveStaffLocationEntry.model_validate(r) for r in rows],
     )
 
 

@@ -38,6 +38,7 @@ from src.core.exceptions import CrossAgencyAccessDeniedError, ForbiddenError
 from src.core.logging import get_logger
 from src.modules.audit_logs import service as audit_logs_service
 from src.modules.auth import email_service as auth_email
+from src.modules.identity.cookies import csrf_protect
 from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
@@ -100,15 +101,24 @@ def _ensure_can_view_guardian(ctx: CurrentAuth, guardian_user_id: uuid.UUID) -> 
     raise CrossAgencyAccessDeniedError()
 
 
-def _to_patient_response(
-    patient: object,
-    *,
-    with_relationships: bool = False,
-) -> PatientProfileResponse:
-    data: dict = {
+def _patient_to_dict(patient: object) -> dict[str, object]:
+    """Build a flat dict from a PatientProfile ORM row.
+
+    Reads the joined user fields eagerly (`full_name` / `email` /
+    `phone`) — `PatientProfile.user` is selectinloaded by
+    `list_patients` / `get_patient` so this never triggers a lazy load
+    inside an awaited serializer. Used by both `_to_patient_response`
+    (detail path) and the list endpoint (summary path) so the user
+    fields are populated consistently.
+    """
+    user = getattr(patient, "user", None)
+    return {
         "id": patient.id,
         "agency_id": patient.agency_id,
         "user_id": patient.user_id,
+        "full_name": getattr(user, "full_name", None) if user is not None else None,
+        "email": getattr(user, "email", None) if user is not None else None,
+        "phone": getattr(user, "phone", None) if user is not None else None,
         "patient_code": patient.patient_code,
         "status": patient.status,
         "date_of_birth": patient.date_of_birth,
@@ -120,6 +130,40 @@ def _to_patient_response(
         "created_at": patient.created_at,
         "updated_at": patient.updated_at,
     }
+
+
+def _guardian_to_dict(guardian: object) -> dict[str, object]:
+    """Build a flat dict from a GuardianProfile ORM row.
+
+    Mirrors `_patient_to_dict` — reads the joined user fields
+    (`full_name` / `email` / `phone`) eagerly. Guardian-specific
+    `contact_email` / `contact_phone` / `notes` come from the
+    GuardianProfile row directly and may legitimately differ from
+    the user account's `email` / `phone`.
+    """
+    user = getattr(guardian, "user", None)
+    return {
+        "id": guardian.id,
+        "agency_id": guardian.agency_id,
+        "user_id": guardian.user_id,
+        "full_name": getattr(user, "full_name", None) if user is not None else None,
+        "email": getattr(user, "email", None) if user is not None else None,
+        "phone": getattr(user, "phone", None) if user is not None else None,
+        "status": guardian.status,
+        "contact_phone": guardian.contact_phone,
+        "contact_email": guardian.contact_email,
+        "notes": guardian.notes,
+        "created_at": guardian.created_at,
+        "updated_at": guardian.updated_at,
+    }
+
+
+def _to_patient_response(
+    patient: object,
+    *,
+    with_relationships: bool = False,
+) -> PatientProfileResponse:
+    data: dict = _patient_to_dict(patient)
     if with_relationships:
         try:
             data["guardian_links"] = list(patient.guardian_links)
@@ -130,6 +174,10 @@ def _to_patient_response(
     return PatientProfileResponse.model_validate(data)
 
 
+def _to_guardian_response(guardian: object) -> GuardianProfileResponse:
+    return GuardianProfileResponse.model_validate(_guardian_to_dict(guardian))
+
+
 # --------------------------------------------------------------------------
 # Patient profiles
 # --------------------------------------------------------------------------
@@ -137,7 +185,10 @@ def _to_patient_response(
     "/patients",
     response_model=PatientProfileResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 409, 422]),
     summary="Admit a new patient at the caller's agency",
     description=(
@@ -162,7 +213,9 @@ async def create_patient_endpoint(
         admitted_by_user_id=ctx.user_id,
     )
     await session.commit()
-    await session.refresh(result.profile)
+    # Refresh + eagerly load the user row so the response can read
+    # `full_name` / `email` / `phone` without triggering a lazy load.
+    await session.refresh(result.profile, attribute_names=["user"])
     # Best-effort audit log.
     with contextlib.suppress(Exception):
         ip, ua = audit_logs_service.request_ip_ua(request)
@@ -186,8 +239,8 @@ async def create_patient_endpoint(
         background_tasks,
         to_email=result.email,
         to_name=result.full_name,
-        invitation_token=result.invitation_token,
-        expires_in_days=settings.INVITATION_TOKEN_EXPIRY_DAYS,
+        otp=result.invitation_otp,
+        expires_in_minutes=settings.OTP_EXPIRY_MINUTES,
         recipient_user_id=result.user_id,
     )
     return _to_patient_response(result.profile)
@@ -221,7 +274,13 @@ async def list_patients_endpoint(
         page=page,
         page_size=page_size,
     )
-    data = [PatientProfileSummaryResponse.model_validate(r) for r in rows]
+    # Build dicts explicitly so the joined user fields
+    # (`full_name`, `email`, `phone`) — which live on the User row,
+    # not on the PatientProfile column — are populated reliably.
+    data = [
+        PatientProfileSummaryResponse.model_validate(_patient_to_dict(r))
+        for r in rows
+    ]
     return build_offset_response(data, total=total, page=page, page_size=page_size)
 
 
@@ -277,7 +336,10 @@ async def get_patient_with_relationships_endpoint(
 @router.patch(
     "/patients/{patient_id}",
     response_model=PatientProfileResponse,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 404, 422]),
     summary="Update a patient profile",
     description=(
@@ -298,7 +360,7 @@ async def update_patient_endpoint(
         session, patient_id=patient_id, agency_id=agency_id, payload=payload
     )
     await session.commit()
-    await session.refresh(patient)
+    await session.refresh(patient, attribute_names=["user"])
     # Best-effort audit log.
     try:
         ip, ua = audit_logs_service.request_ip_ua(request)
@@ -322,7 +384,10 @@ async def update_patient_endpoint(
 @router.delete(
     "/patients/{patient_id}",
     response_model=PatientProfileResponse,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 404]),
     summary="Archive (discharge) a patient",
     description=(
@@ -343,7 +408,7 @@ async def archive_patient_endpoint(
         session, patient_id=patient_id, agency_id=agency_id
     )
     await session.commit()
-    await session.refresh(patient)
+    await session.refresh(patient, attribute_names=["user"])
     # Best-effort audit log.
     try:
         ip, ua = audit_logs_service.request_ip_ua(request)
@@ -398,7 +463,10 @@ async def list_patient_guardians_endpoint(
     "/patients/{patient_id}/guardians",
     response_model=PatientGuardianRelationshipResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 404, 409, 422]),
     summary="Link a guardian to a patient",
     description=(
@@ -452,8 +520,8 @@ async def add_patient_guardian_endpoint(
             background_tasks,
             to_email=result.new_guardian.email,
             to_name=result.new_guardian.full_name,
-            invitation_token=result.new_guardian.invitation_token,
-            expires_in_days=settings.INVITATION_TOKEN_EXPIRY_DAYS,
+            otp=result.new_guardian.invitation_otp,
+            expires_in_minutes=settings.OTP_EXPIRY_MINUTES,
             recipient_user_id=result.new_guardian.user_id,
         )
     return PatientGuardianRelationshipResponse.model_validate(result.relationship)
@@ -466,7 +534,10 @@ async def add_patient_guardian_endpoint(
     "/guardians",
     response_model=GuardianProfileResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 409, 422]),
     summary="Add a standalone guardian profile",
     description=(
@@ -491,7 +562,7 @@ async def create_guardian_endpoint(
         invited_by_user_id=ctx.user_id,
     )
     await session.commit()
-    await session.refresh(result.profile)
+    await session.refresh(result.profile, attribute_names=["user"])
     # Best-effort audit log.
     with contextlib.suppress(Exception):
         ip, ua = audit_logs_service.request_ip_ua(request)
@@ -512,11 +583,11 @@ async def create_guardian_endpoint(
         background_tasks,
         to_email=result.email,
         to_name=result.full_name,
-        invitation_token=result.invitation_token,
-        expires_in_days=settings.INVITATION_TOKEN_EXPIRY_DAYS,
+        otp=result.invitation_otp,
+        expires_in_minutes=settings.OTP_EXPIRY_MINUTES,
         recipient_user_id=result.user_id,
     )
-    return GuardianProfileResponse.model_validate(result.profile)
+    return _to_guardian_response(result.profile)
 
 
 @router.get(
@@ -541,7 +612,13 @@ async def list_guardians_endpoint(
     rows, total = await patients_service.list_guardians(
         session, agency_id=agency_id, page=page, page_size=page_size
     )
-    data = [GuardianProfileResponse.model_validate(r) for r in rows]
+    # Build dicts explicitly so the joined user fields
+    # (`full_name`, `email`, `phone`) — which live on the User row,
+    # not on the GuardianProfile column — are populated reliably.
+    data = [
+        GuardianProfileResponse.model_validate(_guardian_to_dict(r))
+        for r in rows
+    ]
     return build_offset_response(data, total=total, page=page, page_size=page_size)
 
 
@@ -566,13 +643,16 @@ async def get_guardian_endpoint(
         session, guardian_id=guardian_id, agency_id=agency_id
     )
     _ensure_can_view_guardian(ctx, guardian.user_id)
-    return GuardianProfileResponse.model_validate(guardian)
+    return _to_guardian_response(guardian)
 
 
 @router.patch(
     "/guardians/{guardian_id}",
     response_model=GuardianProfileResponse,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 404, 422]),
     summary="Update a guardian profile",
     description=(
@@ -593,7 +673,7 @@ async def update_guardian_endpoint(
         session, guardian_id=guardian_id, agency_id=agency_id, payload=payload
     )
     await session.commit()
-    await session.refresh(guardian)
+    await session.refresh(guardian, attribute_names=["user"])
     # Best-effort audit log.
     try:
         ip, ua = audit_logs_service.request_ip_ua(request)
@@ -611,13 +691,16 @@ async def update_guardian_endpoint(
         await session.commit()
     except Exception:
         pass
-    return GuardianProfileResponse.model_validate(guardian)
+    return _to_guardian_response(guardian)
 
 
 @router.delete(
     "/guardians/{guardian_id}",
     response_model=GuardianProfileResponse,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 404]),
     summary="Archive a guardian profile",
     description=(
@@ -637,7 +720,7 @@ async def archive_guardian_endpoint(
         session, guardian_id=guardian_id, agency_id=agency_id
     )
     await session.commit()
-    await session.refresh(guardian)
+    await session.refresh(guardian, attribute_names=["user"])
     # Best-effort audit log.
     try:
         ip, ua = audit_logs_service.request_ip_ua(request)
@@ -655,7 +738,7 @@ async def archive_guardian_endpoint(
         await session.commit()
     except Exception:
         pass
-    return GuardianProfileResponse.model_validate(guardian)
+    return _to_guardian_response(guardian)
 
 
 # --------------------------------------------------------------------------
@@ -664,7 +747,10 @@ async def archive_guardian_endpoint(
 @router.patch(
     "/patient-guardian-relationships/{relationship_id}",
     response_model=PatientGuardianRelationshipResponse,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 404, 422]),
     summary="Edit a patient<->guardian relationship",
     description=(
@@ -713,7 +799,10 @@ async def update_patient_guardian_endpoint(
 @router.delete(
     "/patient-guardian-relationships/{relationship_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    dependencies=[
+        Depends(csrf_protect),
+        Depends(require_role(UserRole.AGENCY_ADMIN)),
+    ],
     responses=standard_responses(include=[401, 403, 404]),
     summary="Remove a patient<->guardian relationship",
     description=(

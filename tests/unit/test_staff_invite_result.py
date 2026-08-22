@@ -1,23 +1,23 @@
 """Unit tests for `staff_service.create_staff` returning a
-`StaffInviteResult` with a fresh invitation token.
+`StaffInviteResult` with a fresh invitation OTP.
 
 These tests verify the contract that the staff router relies on:
 
 1. `create_staff` returns a `StaffInviteResult` (not a bare
-   `StaffProfile`) so the router can hand `invitation_token` +
+   `StaffProfile`) so the router can hand `invitation_otp` +
    `email` + `full_name` + `user_id` to `auth.email_service
    .send_invitation_email`.
-2. `auth_service.issue_invitation_token` is called exactly once,
-   with the right `user_id`, after the audit row is written.
+2. `otp_service.issue_otp` is called exactly once, with the right
+   `user`, after the audit row is written.
 3. When the email matches an existing `User`, the service still
-   issues a fresh token (re-invite is intentional — admins should
+   issues a fresh OTP (re-invite is intentional — admins should
    be able to re-send invitations).
 4. When the role assignment already exists, we don't add a
-   duplicate, but we still issue a fresh token + write the
+   duplicate, but we still issue a fresh OTP + write the
    INVITATION_SENT audit row.
 5. When the (agency_id, user_id) or (agency_id, staff_code)
    unique constraint fires, `DuplicateResourceError` is raised —
-   but no token is issued (the request is rejected).
+   but no OTP is issued (the request is rejected).
 
 Mirrors `test_patients_invite_result.py` for the new shape.
 """
@@ -35,8 +35,6 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from src.core.exceptions import DuplicateResourceError
-from src.modules.appointments import models as _appt_models  # noqa: F401
-from src.modules.locations import models as _locations_models  # noqa: F401
 
 # IMPORTANT: import the full mapper graph BEFORE any test runs so
 # that all relationship strings resolve. Several ORM mappers
@@ -139,15 +137,26 @@ def _payload(*, email: str = "alex@example.com") -> Any:
     )
 
 
+def _issued_otp(otp: str = "482915") -> Any:
+    from src.modules.identity.otp_service import OtpIssueResult
+
+    return OtpIssueResult(
+        user_id=uuid.uuid4(),
+        email="alex@example.com",
+        full_name="Alex",
+        otp=otp,
+        expires_at=None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Happy path — user already exists (so user_id is observable)
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 class TestCreateStaffInviteResultHappyPath:
-    async def test_returns_staff_invite_result_with_invitation_token(self) -> None:
+    async def test_returns_staff_invite_result_with_invitation_otp(self) -> None:
         """`create_staff` returns a `StaffInviteResult` whose
-        `invitation_token` matches what `issue_invitation_token`
-        issued.
+        `invitation_otp` matches what `issue_otp` issued.
 
         We use the existing-user branch (a User row is returned by
         the first `session.execute`) so the `user_id` we receive is
@@ -164,11 +173,11 @@ class TestCreateStaffInviteResultHappyPath:
             agency=_agency_row(agency_id),
         )
 
-        fake_token = "inv-token-staff-1"
+        fake_otp = "482915"
 
-        with patch.object(staff_service, "auth_service") as mock_auth_service:
-            mock_auth_service.issue_invitation_token = AsyncMock(
-                return_value=(fake_token, "jti-staff-1")
+        with patch.object(staff_service, "otp_service") as mock_otp_service:
+            mock_otp_service.issue_otp = AsyncMock(
+                return_value=_issued_otp(fake_otp)
             )
             result = await staff_service.create_staff(
                 session,
@@ -179,26 +188,23 @@ class TestCreateStaffInviteResultHappyPath:
 
         # Returned dataclass — the router needs these fields.
         assert isinstance(result, staff_service.StaffInviteResult)
-        assert result.invitation_token == fake_token
+        assert result.invitation_otp == fake_otp
         assert result.email == "alex@example.com"
         assert result.full_name == "Alex New"
         assert result.user_id == user_id
         assert result.profile is not None
         assert result.profile.agency_id == agency_id
 
-        # `issue_invitation_token` was called exactly once with the
-        # right user_id.
-        mock_auth_service.issue_invitation_token.assert_called_once()
-        called_kwargs = mock_auth_service.issue_invitation_token.call_args.kwargs
-        assert called_kwargs["user_id"] == user_id
-        # session arg is the same fake session.
-        assert mock_auth_service.issue_invitation_token.call_args.args[0] is session
+        # `issue_otp` was called exactly once.
+        mock_otp_service.issue_otp.assert_called_once()
+        call_kwargs = mock_otp_service.issue_otp.call_args.kwargs
+        assert call_kwargs["user"] is existing_user
 
     async def test_user_id_round_trips_to_router_facing_fields(self) -> None:
-        """The `user_id` we hand to `issue_invitation_token` must be
-        the same `user_id` we return in `StaffInviteResult`. The
-        router uses both — token is for the JWT; user_id is the
-        recipient on the background task."""
+        """The `user` we hand to `issue_otp` must have the same
+        `id` we return in `StaffInviteResult`. The router uses both
+        — the OTP is the secret; user_id is the recipient on the
+        background task."""
         from src.modules.staff import service as staff_service
 
         user_id = uuid.uuid4()
@@ -212,13 +218,13 @@ class TestCreateStaffInviteResultHappyPath:
 
         captured: dict[str, Any] = {}
 
-        async def _fake_issue(session_arg: Any, *, user_id: uuid.UUID) -> tuple[str, str]:
-            captured["user_id"] = user_id
+        async def _fake_issue(session_arg: Any, *, user: Any) -> Any:
+            captured["user_id"] = user.id
             captured["session"] = session_arg
-            return ("tok", "jti")
+            return _issued_otp()
 
-        with patch.object(staff_service, "auth_service") as mock_auth_service:
-            mock_auth_service.issue_invitation_token = _fake_issue
+        with patch.object(staff_service, "otp_service") as mock_otp_service:
+            mock_otp_service.issue_otp = _fake_issue
             result = await staff_service.create_staff(
                 session,
                 agency_id=agency_id,
@@ -235,11 +241,11 @@ class TestCreateStaffInviteResultHappyPath:
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 class TestCreateStaffReInviteExistingUser:
-    async def test_existing_user_still_gets_fresh_invitation_token(self) -> None:
+    async def test_existing_user_still_gets_fresh_invitation_otp(self) -> None:
         """When a User row already exists for the email, we re-use
-        the User, refresh name/phone, and STILL issue a fresh
-        invitation token. The recipient needs a fresh link each
-        time the admin clicks 'invite'."""
+        the User, refresh name/phone, and STILL issue a fresh OTP.
+        The recipient needs a fresh code each time the admin clicks
+        'invite'."""
         from src.modules.staff import service as staff_service
 
         user_id = uuid.uuid4()
@@ -251,10 +257,8 @@ class TestCreateStaffReInviteExistingUser:
             agency=_agency_row(agency_id),
         )
 
-        with patch.object(staff_service, "auth_service") as mock_auth_service:
-            mock_auth_service.issue_invitation_token = AsyncMock(
-                return_value=("new-tok", "new-jti")
-            )
+        with patch.object(staff_service, "otp_service") as mock_otp_service:
+            mock_otp_service.issue_otp = AsyncMock(return_value=_issued_otp("654321"))
             result = await staff_service.create_staff(
                 session,
                 agency_id=agency_id,
@@ -262,19 +266,17 @@ class TestCreateStaffReInviteExistingUser:
                 invited_by_user_id=uuid.uuid4(),
             )
 
-        # The token came from our mocked issue_invitation_token.
-        assert result.invitation_token == "new-tok"
-        # The user_id we passed to issue_invitation_token matches
-        # the existing user's id.
-        mock_auth_service.issue_invitation_token.assert_called_once_with(
-            session, user_id=user_id
-        )
+        # The OTP came from our mocked issue_otp.
+        assert result.invitation_otp == "654321"
+        # The user we passed to issue_otp is the existing user.
+        mock_otp_service.issue_otp.assert_called_once()
+        assert mock_otp_service.issue_otp.call_args.kwargs["user"] is existing_user
         # The dataclass returns the existing user's email.
         assert result.email == "alex@example.com"
 
-    async def test_existing_role_does_not_block_token_issue(self) -> None:
+    async def test_existing_role_does_not_block_otp_issue(self) -> None:
         """If the role assignment already exists, we skip adding a
-        duplicate — but we still issue a fresh token + audit row."""
+        duplicate — but we still issue a fresh OTP + audit row."""
         from src.modules.staff import service as staff_service
 
         user_id = uuid.uuid4()
@@ -289,10 +291,8 @@ class TestCreateStaffReInviteExistingUser:
             agency=_agency_row(agency_id),
         )
 
-        with patch.object(staff_service, "auth_service") as mock_auth_service:
-            mock_auth_service.issue_invitation_token = AsyncMock(
-                return_value=("tok", "jti")
-            )
+        with patch.object(staff_service, "otp_service") as mock_otp_service:
+            mock_otp_service.issue_otp = AsyncMock(return_value=_issued_otp("111111"))
             result = await staff_service.create_staff(
                 session,
                 agency_id=agency_id,
@@ -300,8 +300,8 @@ class TestCreateStaffReInviteExistingUser:
                 invited_by_user_id=uuid.uuid4(),
             )
 
-        # Token was issued.
-        assert result.invitation_token == "tok"
+        # OTP was issued.
+        assert result.invitation_otp == "111111"
         # The user_id we returned came from the existing user.
         assert result.user_id == user_id
 
@@ -311,11 +311,11 @@ class TestCreateStaffReInviteExistingUser:
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 class TestCreateStaffAuditOrder:
-    async def test_invitation_token_issued_after_audit_row_added(self) -> None:
+    async def test_invitation_otp_issued_after_audit_row_added(self) -> None:
         """The INVITATION_SENT audit row is added to the session
-        BEFORE `issue_invitation_token` is called. The order
-        matters: if the token issue raises, the audit row is still
-        queued (rolled back with the rest of the session)."""
+        BEFORE `issue_otp` is called. The order matters: if the OTP
+        issue raises, the audit row is still queued (rolled back
+        with the rest of the session)."""
         from src.modules.staff import service as staff_service
 
         agency_id = uuid.uuid4()
@@ -329,17 +329,17 @@ class TestCreateStaffAuditOrder:
 
         call_order: list[str] = []
 
-        async def _fake_issue(session_arg: Any, *, user_id: uuid.UUID) -> tuple[str, str]:
-            call_order.append("issue_invitation_token")
-            return ("tok", "jti")
+        async def _fake_issue(session_arg: Any, *, user: Any) -> Any:
+            call_order.append("issue_otp")
+            return _issued_otp()
 
         # Patch the `_record_audit` import inside the service module.
         async def _fake_record_audit(*args: Any, **kwargs: Any) -> None:
             call_order.append("record_audit")
             session.add(SimpleNamespace(name="audit_event"))
 
-        with patch.object(staff_service, "auth_service") as mock_auth_service:
-            mock_auth_service.issue_invitation_token = _fake_issue
+        with patch.object(staff_service, "otp_service") as mock_otp_service:
+            mock_otp_service.issue_otp = _fake_issue
             with patch(
                 "src.modules.identity.auth_service._record_audit",
                 _fake_record_audit,
@@ -351,7 +351,7 @@ class TestCreateStaffAuditOrder:
                     invited_by_user_id=uuid.uuid4(),
                 )
 
-        assert call_order == ["record_audit", "issue_invitation_token"]
+        assert call_order == ["record_audit", "issue_otp"]
         # The audit row was queued onto the session.
         audit_added = any(
             getattr(obj, "name", None) == "audit_event" for obj in session.added
@@ -361,7 +361,6 @@ class TestCreateStaffAuditOrder:
     async def test_audit_event_type_is_invitation_sent(self) -> None:
         """The audit row uses `AuthAuditEventType.INVITATION_SENT`
         (not `PASSWORD_RESET_REQUESTED` or `EMAIL_VERIFICATION_REQUESTED`)."""
-        from src.modules.identity import auth_service
         from src.modules.staff import service as staff_service
         from src.shared.domain.enums import AuthAuditEventType
 
@@ -383,11 +382,12 @@ class TestCreateStaffAuditOrder:
             agency=_agency_row(agency_id),
         )
 
-        with patch.object(staff_service, "auth_service") as mock_auth_service:
-            mock_auth_service.issue_invitation_token = AsyncMock(
-                return_value=("tok", "jti")
-            )
-            with patch.object(auth_service, "_record_audit", _capture_record_audit):
+        with patch.object(staff_service, "otp_service") as mock_otp_service:
+            mock_otp_service.issue_otp = AsyncMock(return_value=_issued_otp())
+            with patch(
+                "src.modules.identity.auth_service._record_audit",
+                _capture_record_audit,
+            ):
                 await staff_service.create_staff(
                     session,
                     agency_id=agency_id,
@@ -405,11 +405,11 @@ class TestCreateStaffAuditOrder:
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 class TestCreateStaffConflictPath:
-    async def test_duplicate_resource_error_skips_token_issue(self) -> None:
+    async def test_duplicate_resource_error_skips_otp_issue(self) -> None:
         """If the (agency_id, user_id) or (agency_id, staff_code)
         unique constraint fires on the second flush, we raise
-        `DuplicateResourceError` — and crucially, we DO NOT issue a
-        token. A failed invitation must not result in a dangling
+        `DuplicateResourceError` — and crucially, we DO NOT issue
+        an OTP. A failed invitation must not result in a dangling
         email.
 
         We use the existing-user branch (scalars[0] is a user row) so
@@ -433,10 +433,8 @@ class TestCreateStaffConflictPath:
             flush_exc=flush_exc,
         )
 
-        with patch.object(staff_service, "auth_service") as mock_auth_service:
-            mock_auth_service.issue_invitation_token = AsyncMock(
-                return_value=("tok", "jti")
-            )
+        with patch.object(staff_service, "otp_service") as mock_otp_service:
+            mock_otp_service.issue_otp = AsyncMock(return_value=_issued_otp())
             with pytest.raises(DuplicateResourceError):
                 await staff_service.create_staff(
                     session,
@@ -445,7 +443,7 @@ class TestCreateStaffConflictPath:
                     invited_by_user_id=uuid.uuid4(),
                 )
 
-        mock_auth_service.issue_invitation_token.assert_not_called()
+        mock_otp_service.issue_otp.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -462,14 +460,14 @@ class TestStaffInviteResultShape:
             user_id=uuid.uuid4(),
             email="alex@example.com",
             full_name="Alex",
-            invitation_token="tok",
+            invitation_otp="482915",
         )
         with pytest.raises(FrozenInstanceError):
             result.email = "other@example.com"  # type: ignore[misc]
 
     def test_holds_all_routing_fields(self) -> None:
         """The router needs `user_id`, `email`, `full_name`, and
-        `invitation_token` from this dataclass — verify they're all
+        `invitation_otp` from this dataclass — verify they're all
         present and typed correctly."""
         from src.modules.staff.service import StaffInviteResult
 
@@ -480,14 +478,14 @@ class TestStaffInviteResultShape:
             user_id=user_id,
             email="alex@example.com",
             full_name="Alex",
-            invitation_token="tok-xyz",
+            invitation_otp="482915",
         )
 
         assert result.profile is profile
         assert result.user_id == user_id
         assert result.email == "alex@example.com"
         assert result.full_name == "Alex"
-        assert result.invitation_token == "tok-xyz"
+        assert result.invitation_otp == "482915"
 
 
 __all__ = [

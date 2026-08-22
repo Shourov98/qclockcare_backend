@@ -87,15 +87,16 @@ class TestAppOpenAPISchema:
 
     def test_paths_count_matches_routes(self) -> None:
         """Sanity check that route registration didn't break — we
-        should have 95 unique operations across 68 paths."""
+        should have ~95 unique operations across 68 paths."""
         spec = self._spec()
         total_ops = sum(
             len([m for m in methods if m in {"get", "post", "put", "patch", "delete"}])
             for path, methods in spec["paths"].items()
         )
-        # Allow ±2 ops from any future single-route tweaks; the
-        # important thing is we're in the right order of magnitude.
-        assert 80 <= total_ops <= 110, f"unexpected op count: {total_ops}"
+        # Allow ±5 ops from future single-route tweaks (the reports
+        # module alone added 4 ops). The important thing is we're in
+        # the right order of magnitude.
+        assert 90 <= total_ops <= 120, f"unexpected op count: {total_ops}"
 
 
 # ---------------------------------------------------------------------------

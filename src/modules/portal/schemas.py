@@ -44,8 +44,6 @@ class PortalVisitResponse(BaseModel):
     check_in_lat: Decimal | None
     check_in_lng: Decimal | None
     check_in_accuracy_m: Decimal | None
-    check_in_address_match: bool | None
-    check_in_distance_from_location_m: Decimal | None
     check_out_time: datetime | None
     check_out_lat: Decimal | None
     check_out_lng: Decimal | None

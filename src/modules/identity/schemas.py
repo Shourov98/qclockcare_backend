@@ -182,35 +182,53 @@ class CurrentUser(BaseModel):
 # Refresh
 # --------------------------------------------------------------------------
 class RefreshRequest(BaseModel):
-    """POST /auth/refresh body."""
+    """POST /auth/refresh body.
+
+    The refresh token is optional in the body because cookie-auth
+    clients have it set as `qc_refresh`. If omitted we read it from
+    the request cookie; if neither is present we raise 401.
+    """
 
     model_config = ConfigDict(
         extra="forbid",
         json_schema_extra={
             "examples": [
-                {"refresh_token": "rt_5f3a7b1c1d0a4a239c8e1b2c3d4e5f6a"}
+                {"refresh_token": "rt_5f3a7b1c1d0a4a239c8e1b2c3d4e5f6a"},
+                {"refresh_token": None},
+                {},
             ]
         },
     )
 
-    refresh_token: str = Field(
+    refresh_token: str | None = Field(
+        default=None,
         min_length=10,
         description=(
             "Refresh token issued by `POST /auth/login` (or by a previous "
-            "refresh). Rotated on every successful refresh — store the new "
-            "value and discard the old one."
+            "refresh). Optional when the client uses cookie auth — the "
+            "server will read `qc_refresh` instead. Rotated on every "
+            "successful refresh — store the new value and discard the old one."
         ),
     )
 
 
 # --------------------------------------------------------------------------
-# Accept invitation (step 1 of onboarding)
+# Accept invitation (single-step onboarding — OTP + new password)
 # --------------------------------------------------------------------------
 class AcceptInvitationRequest(BaseModel):
     """POST /auth/accept-invitation body.
 
-    `invitation_token` is the signed token emailed to the new user; we hash
-    it server-side before lookup, so the plaintext never lives in the DB.
+    The invitation email carries a deep link of the shape
+    `/accept-invitation?email=<user_email>` plus the 6-digit verification
+    code in the body. On success the server marks the email verified,
+    activates the user, sets their password, and returns a fresh
+    token pair — the client is logged in immediately (no separate
+    `/auth/verify-email` round-trip).
+
+    We deliberately moved away from a JWT-in-URL design: URL params get
+    stripped or mangled by some email gateways and link-preprocessors,
+    which surfaced as `TOKEN_INVALID` on the backend. The OTP is the
+    actual secret — it lives in the email body, not the URL.
     """
 
     model_config = ConfigDict(
@@ -218,20 +236,28 @@ class AcceptInvitationRequest(BaseModel):
         json_schema_extra={
             "examples": [
                 {
-                    "invitation_token": "inv_5f3a7b1c1d0a4a239c8e1b2c3d4e5f6a",
+                    "email": "alex.rivera@careagency.com",
+                    "otp": "482915",
                     "password": "CorrectHorseBattery!42",
                 }
             ]
         },
     )
 
-    invitation_token: str = Field(
-        min_length=20,
-        max_length=512,
+    email: EmailStr = Field(
         description=(
-            "Token from the invitation email's deep link "
-            "(`/accept-invitation?token=...`). Single-use; expires after "
-            "`settings.INVITATION_TOKEN_EXPIRY_DAYS` days."
+            "Email address from the invitation deep link "
+            "(`/accept-invitation?email=...`). Case-insensitive."
+        ),
+    )
+    otp: str = Field(
+        min_length=4,
+        max_length=8,
+        pattern=r"^\d+$",
+        description=(
+            "Verification code from the invitation email body. "
+            "Expires after `settings.OTP_EXPIRY_MINUTES` minutes; "
+            "max 5 attempts before the account is locked."
         ),
     )
     password: str = Field(
@@ -438,6 +464,55 @@ class ResetPasswordRequest(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Change password (authenticated)
+# --------------------------------------------------------------------------
+class ChangePasswordRequest(BaseModel):
+    """POST /auth/change-password body.
+
+    Authenticated callers (any role) rotate their own password while
+    signed in. We require the *current* password to prevent a stolen
+    access token alone from being able to lock out the legitimate
+    user. On success the server revokes all outstanding refresh
+    tokens — the user will be signed out everywhere except the
+    browser that initiated the change (whose access token is still
+    valid until expiry, then /auth/refresh returns 401).
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "current_password": "OldHorseBattery!42",
+                    "new_password": "CorrectHorseBattery!42",
+                }
+            ]
+        },
+    )
+
+    current_password: str = Field(
+        min_length=1,
+        max_length=128,
+        description=(
+            "The user's existing password. Required for re-authentication."
+        ),
+    )
+    new_password: str = Field(
+        min_length=_PASSWORD_MIN_LENGTH,
+        max_length=128,
+        description=(
+            "The new password. Must satisfy the project password "
+            "policy (12-128 chars, mixed case + digit + symbol)."
+        ),
+    )
+
+    @field_validator("new_password")
+    @classmethod
+    def _pw_policy(cls, v: str) -> str:
+        return _validate_password(v)
+
+
+# --------------------------------------------------------------------------
 # Logout
 # --------------------------------------------------------------------------
 class LogoutRequest(BaseModel):
@@ -526,6 +601,7 @@ TokenPair.model_rebuild()
 
 __all__ = [
     "AcceptInvitationRequest",
+    "ChangePasswordRequest",
     "CurrentUser",
     "ForgotPasswordRequest",
     "ForgotPasswordResponse",

@@ -19,26 +19,32 @@ import uuid
 from builtins import type as _type
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import settings
 from src.core.logging import get_logger
 from src.modules.agencies import service as agencies_service
 from src.modules.agencies.schemas import (
+    AgencyAdminInviteRequest,
     AgencyCreateRequest,
     AgencyListResponse,
     AgencyProgramListResponse,
     AgencyProgramResponse,
     AgencyResponse,
+    AgencySubscriptionPackageListResponse,
+    AgencySubscriptionPackageResponse,
     AgencyUpdateRequest,
 )
 from src.modules.audit_logs import service as audit_logs_service
+from src.modules.auth import email_service as auth_email
 from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
     require_role,
 )
-from src.shared.domain.enums import AuditAction, UserRole
+from src.modules.identity.scope_deps import require_scope
+from src.shared.domain.enums import AdminScope, AuditAction, UserRole
 from src.shared.schemas.docs import standard_responses
 from src.shared.schemas.pagination import build_offset_response
 
@@ -48,6 +54,27 @@ router = APIRouter(prefix="/agencies", tags=["agencies"])
 
 # All agencies routes require SUPER_ADMIN.
 _SUPER_ADMIN_ONLY = [Depends(require_role(UserRole.SUPER_ADMIN))]
+# Read-only or scoped-mutation endpoints that PLATFORM_ADMIN with
+# AGENCIES scope can also reach. POST/DELETE stay SUPER_ADMIN-only
+# because they change the agency hierarchy fundamentally.
+_AGENCIES_SCOPE = [Depends(require_scope(AdminScope.AGENCIES))]
+
+
+# --------------------------------------------------------------------------
+# Subscription package catalog
+# --------------------------------------------------------------------------
+@router.get(
+    "/subscription-packages",
+    response_model=AgencySubscriptionPackageListResponse,
+    responses=standard_responses(include=[]),
+)
+async def list_subscription_packages_endpoint() -> AgencySubscriptionPackageListResponse:
+    """List available agency subscription packages."""
+    data = [
+        AgencySubscriptionPackageResponse.model_validate(package)
+        for package in agencies_service.list_subscription_packages()
+    ]
+    return AgencySubscriptionPackageListResponse(data=data)
 
 
 # --------------------------------------------------------------------------
@@ -56,6 +83,7 @@ _SUPER_ADMIN_ONLY = [Depends(require_role(UserRole.SUPER_ADMIN))]
 @router.get(
     "",
     response_model=AgencyListResponse,
+    dependencies=_AGENCIES_SCOPE,
     responses=standard_responses(include=[401, 403]),
 )
 async def list_agencies_endpoint(
@@ -68,14 +96,24 @@ async def list_agencies_endpoint(
         str | None,
         Query(description="Narrow to one AgencyStatus (ACTIVE | TRIAL | SUSPENDED | CHURNED)"),
     ] = None,
+    plan_filter: Annotated[
+        str | None,
+        Query(description="Narrow to one AgencySubscriptionPlan"),
+    ] = None,
+    search: Annotated[
+        str | None,
+        Query(max_length=255, description="Case-insensitive name search"),
+    ] = None,
 ) -> AgencyListResponse:
-    """List all agencies (SUPER_ADMIN only, paginated)."""
+    """List all agencies (SUPER_ADMIN or PLATFORM_ADMIN w/ AGENCIES, paginated)."""
     rows, total = await agencies_service.list_agencies(
         session,
         page=page,
         page_size=page_size,
         include_deleted=include_deleted,
         status_filter=status_filter,
+        plan_filter=plan_filter,
+        search=search,
     )
     data = [AgencyResponse.model_validate(r) for r in rows]
     body = build_offset_response(data, total=total, page=page, page_size=page_size)
@@ -92,19 +130,28 @@ async def list_agencies_endpoint(
 async def create_agency_endpoint(
     payload: AgencyCreateRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> AgencyResponse:
-    """Create a new agency (and optionally attach programs)."""
-    agency = await agencies_service.create_agency(session, payload=payload)
-    await session.flush()
+    """Create a new agency together with a bound AGENCY_ADMIN.
+
+    The `admin` block is required (see `AgencyCreateRequest`). The
+    agency row and the `AGENCY_ADMIN` user are inserted in a single
+    transaction. If the admin branch raises (e.g. duplicate email),
+    the agency row is rolled back too — no orphan agencies are
+    possible.
+    """
+    agency, admin_bind_result = await agencies_service.create_agency(
+        session, payload=payload
+    )
 
     # Best-effort audit hook — never breaks the write.
     ip, ua = audit_logs_service.request_ip_ua(request)
     try:
         await audit_logs_service.audit_log(
             session,
-            agency_id=None,  # agency-level audit, no agency context yet
+            agency_id=agency.id,  # now the agency row exists
             actor_user_id=ctx.user_id,
             action=AuditAction.CREATE,
             entity_type="AGENCY",
@@ -113,7 +160,27 @@ async def create_agency_endpoint(
                 "name": agency.name,
                 "timezone": agency.timezone,
                 "status": agency.status.value,
+                "subscription_plan": agency.subscription_plan.value,
+                "subscription_price_cents": agency.subscription_price_cents,
+                "subscription_billing_cycle": agency.subscription_billing_cycle,
                 "initial_program_codes": payload.initial_program_codes,
+                "admin_bound": True,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        # `admin` is required at the schema layer, so
+        # `admin_bind_result` is always populated on the success path.
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency.id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.CREATE,
+            entity_type="AGENCY_ADMIN",
+            entity_id=admin_bind_result.user_id,
+            new_data={
+                "email": admin_bind_result.email,
+                "status": admin_bind_result.status.value,
             },
             ip_address=ip,
             user_agent=ua,
@@ -124,8 +191,97 @@ async def create_agency_endpoint(
             error=_type(exc).__name__,
         )
 
+    # Schedule the invitation email AFTER commit (deferred network
+    # call, same pattern as staff/router.py:228-235). `admin` is
+    # required at the schema layer, so `admin_bind_result` is always
+    # present; the `invitation_otp` is only set on the INVITED branch
+    # (ACTIVE / existing-user paths skip the email).
+    if admin_bind_result.invitation_otp is not None:
+        auth_email.send_invitation_email(
+            background_tasks,
+            to_email=admin_bind_result.email,
+            to_name=admin_bind_result.full_name,
+            otp=admin_bind_result.invitation_otp,
+            expires_in_minutes=settings.OTP_EXPIRY_MINUTES,
+            recipient_user_id=admin_bind_result.user_id,
+        )
+
     await session.commit()
     return AgencyResponse.model_validate(agency)
+
+
+@router.post(
+    "/{agency_id}/admins",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=_SUPER_ADMIN_ONLY,
+    responses=standard_responses(include=[401, 403, 404, 409, 422]),
+    summary="Bind an AGENCY_ADMIN to an existing agency",
+    description=(
+        "Use this endpoint to attach an AGENCY_ADMIN to an existing "
+        "agency (orphan-remediation, adding a second admin, or "
+        "promoting an existing user). Same atomic transaction as "
+        "`POST /agencies` — if the admin branch raises, the agency "
+        "is unaffected."
+    ),
+)
+async def add_agency_admin_endpoint(
+    agency_id: uuid.UUID,
+    payload: AgencyAdminInviteRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> Response:
+    """Attach an AGENCY_ADMIN to an existing agency."""
+    bind_result = await agencies_service.add_agency_admin(
+        session,
+        agency_id=agency_id,
+        payload=payload,
+    )
+
+    ip, ua = audit_logs_service.request_ip_ua(request)
+    try:
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.CREATE,
+            entity_type="AGENCY_ADMIN",
+            entity_id=bind_result.user_id,
+            new_data={
+                "email": bind_result.email,
+                "status": bind_result.status.value,
+                "source": "add_agency_admin_endpoint",
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+    except Exception as exc:
+        log.warning(
+            "agencies.add_admin_audit_failed",
+            error=_type(exc).__name__,
+        )
+
+    if bind_result.invitation_otp is not None:
+        auth_email.send_invitation_email(
+            background_tasks,
+            to_email=bind_result.email,
+            to_name=bind_result.full_name,
+            otp=bind_result.invitation_otp,
+            expires_in_minutes=settings.OTP_EXPIRY_MINUTES,
+            recipient_user_id=bind_result.user_id,
+        )
+
+    await session.commit()
+    return Response(
+        status_code=status.HTTP_201_CREATED,
+        content=(
+            f'{{"user_id":"{bind_result.user_id}",'
+            f'"email":"{bind_result.email}",'
+            f'"status":"{bind_result.status.value}"}}'
+        ),
+        media_type="application/json",
+    )
 
 
 # --------------------------------------------------------------------------
@@ -134,7 +290,7 @@ async def create_agency_endpoint(
 @router.get(
     "/{agency_id}",
     response_model=AgencyResponse,
-    dependencies=_SUPER_ADMIN_ONLY,
+    dependencies=_AGENCIES_SCOPE,
     responses=standard_responses(include=[401, 403, 404]),
 )
 async def get_agency_endpoint(
@@ -158,7 +314,7 @@ async def get_agency_endpoint(
 @router.patch(
     "/{agency_id}",
     response_model=AgencyResponse,
-    dependencies=_SUPER_ADMIN_ONLY,
+    dependencies=_AGENCIES_SCOPE,
     responses=standard_responses(include=[401, 403, 404, 409, 422]),
 )
 async def update_agency_endpoint(
@@ -255,7 +411,7 @@ async def delete_agency_endpoint(
 @router.get(
     "/{agency_id}/programs",
     response_model=AgencyProgramListResponse,
-    dependencies=_SUPER_ADMIN_ONLY,
+    dependencies=_AGENCIES_SCOPE,
     responses=standard_responses(include=[401, 403, 404]),
 )
 async def list_agency_programs_endpoint(

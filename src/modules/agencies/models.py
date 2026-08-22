@@ -11,13 +11,16 @@ See `13_DATABASE_SCHEMA_COMPLETE.md` §5.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import (
     Boolean,
+    DateTime,
     Enum,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
     UniqueConstraint,
@@ -28,16 +31,16 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.shared.domain.base_entity import Base, IdMixin, SoftDeleteMixin, TimestampedMixin
 from src.shared.domain.enum_mapping import pg_name
-from src.shared.domain.enums import AgencyStatus, ProgramType
+from src.shared.domain.enums import AgencyStatus, AgencySubscriptionPlan, ProgramType
 
 if TYPE_CHECKING:
+    from src.modules.appointments.models import Appointment
     from src.modules.identity.models import UserRoleAssignment
-    from src.modules.staff.models import StaffProfile
     from src.modules.patients.models import (
         GuardianProfile,
         PatientProfile,
     )
-    from src.modules.appointments.models import Appointment
+    from src.modules.staff.models import StaffProfile
 
 
 # --------------------------------------------------------------------------
@@ -64,6 +67,66 @@ class Agency(IdMixin, TimestampedMixin, SoftDeleteMixin, Base):
         default="America/Chicago",
         server_default="America/Chicago",
     )
+    subscription_plan: Mapped[AgencySubscriptionPlan] = mapped_column(
+        Enum(AgencySubscriptionPlan, name=pg_name(AgencySubscriptionPlan)),
+        nullable=False,
+        default=AgencySubscriptionPlan.BASIC,
+        server_default=AgencySubscriptionPlan.BASIC.value,
+    )
+    subscription_price_cents: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=2900,
+        server_default="2900",
+    )
+    subscription_billing_cycle: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="MONTHLY",
+        server_default="MONTHLY",
+    )
+    trial_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    trial_ends_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    # ----- Stripe / Billing mirrors (ADR-0021) -----
+    # Populated by webhook handlers — never by client code. Nullable
+    # because every agency works without Stripe until they go through
+    # Checkout.
+    stripe_customer_id: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    stripe_subscription_id: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    stripe_price_id: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    current_period_start: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    current_period_end: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    cancel_at_period_end: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+    )
+    subscription_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     settings: Mapped[dict[str, Any]] = mapped_column(
         JSONB(), nullable=False, default=dict, server_default="{}"
     )
@@ -76,16 +139,16 @@ class Agency(IdMixin, TimestampedMixin, SoftDeleteMixin, Base):
         back_populates="agency",
         cascade="all, delete-orphan",
     )
-    staff_profiles: Mapped[list["StaffProfile"]] = relationship(  # noqa: F821
+    staff_profiles: Mapped[list[StaffProfile]] = relationship(
         "StaffProfile", back_populates="agency", cascade="all, delete-orphan"
     )
-    patient_profiles: Mapped[list["PatientProfile"]] = relationship(  # noqa: F821
+    patient_profiles: Mapped[list[PatientProfile]] = relationship(
         "PatientProfile", back_populates="agency", cascade="all, delete-orphan"
     )
-    guardian_profiles: Mapped[list["GuardianProfile"]] = relationship(  # noqa: F821
+    guardian_profiles: Mapped[list[GuardianProfile]] = relationship(
         "GuardianProfile", back_populates="agency", cascade="all, delete-orphan"
     )
-    appointments: Mapped[list["Appointment"]] = relationship(  # noqa: F821
+    appointments: Mapped[list[Appointment]] = relationship(
         "Appointment", back_populates="agency", cascade="all, delete-orphan"
     )
 

@@ -38,7 +38,7 @@ async def get_or_create_prefs(
     session: AsyncSession,
     *,
     user_id: uuid.UUID,
-    agency_id: uuid.UUID,
+    agency_id: uuid.UUID | None,
     type: NotificationType,
     channel: NotificationChannel,
 ) -> NotificationPreference:
@@ -81,7 +81,7 @@ async def set_pref(
     session: AsyncSession,
     *,
     user_id: uuid.UUID,
-    agency_id: uuid.UUID,
+    agency_id: uuid.UUID | None,
     type: NotificationType,
     channel: NotificationChannel,
     opted_in: bool,
@@ -150,7 +150,7 @@ async def list_my_prefs(
     session: AsyncSession,
     *,
     user_id: uuid.UUID,
-    agency_id: uuid.UUID,
+    agency_id: uuid.UUID | None,
 ) -> list[NotificationPreference]:
     """Materialise one row per (type, channel) for the user.
 

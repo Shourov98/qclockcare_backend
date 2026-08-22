@@ -35,6 +35,8 @@ from src.core.middleware import RequestContextMiddleware
 # the registry.
 from src.modules.agencies.models import Agency as _Agency  # noqa: F401
 from src.modules.agencies.router import router as agencies_router
+from src.modules.compliance.models import AgencyDocument, AgencyLicense  # noqa: F401
+from src.modules.compliance.router import router as compliance_router
 from src.modules.appointments.models import (  # noqa: F401
     Appointment,
     AppointmentServiceItem,
@@ -42,6 +44,14 @@ from src.modules.appointments.models import (  # noqa: F401
 from src.modules.appointments.router import router as appointments_router
 from src.modules.audit_logs.models import AuditLog  # noqa: F401
 from src.modules.audit_logs.router import router as audit_logs_router
+from src.modules.billing.models import StripeWebhookEvent  # noqa: F401
+from src.modules.billing.router import (
+    agencies_billing_router,
+)
+from src.modules.billing.router import (
+    webhook_router as billing_webhook_router,
+)
+from src.modules.identity.admin_router import router as identity_admin_router
 from src.modules.identity.models import (  # noqa: F401
     AuthAuditEvent,
     EmailVerificationOtp,
@@ -50,6 +60,7 @@ from src.modules.identity.models import (  # noqa: F401
     User,
     UserRoleAssignment,
 )
+from src.modules.identity.platform_router import router as identity_platform_router
 from src.modules.identity.router import router as auth_router
 from src.modules.locations.models import Location  # noqa: F401
 from src.modules.locations.router import router as locations_router
@@ -62,12 +73,16 @@ from src.modules.patients.models import (  # noqa: F401
 )
 from src.modules.patients.router import router as patients_router
 from src.modules.portal.router import router as portal_router
+from src.modules.reports.models import ReportRun  # noqa: F401
+from src.modules.reports.router import router as reports_router
 from src.modules.staff.models import (  # noqa: F401
     StaffAvailability,
     StaffProfile,
     StaffQualification,
 )
 from src.modules.staff.router import router as staff_router
+from src.modules.tickets.models import Ticket, TicketComment  # noqa: F401
+from src.modules.tickets.router import router as tickets_router
 from src.modules.visits.models import (  # noqa: F401
     ServiceVerification,
     Visit,
@@ -165,10 +180,10 @@ QlockCare backend API.
 All endpoints except the public auth flows (`POST /auth/login`,
 `POST /auth/refresh`, `POST /auth/forgot-password`,
 `POST /auth/reset-password`, `POST /auth/accept-invitation`,
-`POST /auth/verify-email`, `POST /auth/resend-otp`) require a Bearer
-JWT in the `Authorization` header. Use the **Authorize** button at
-the top of `/docs` to paste your access token once for the whole
-session.
+`POST /auth/verify-email`, `POST /auth/resend-otp`) and the Stripe
+webhook receiver (`POST /billing/webhook`) require a Bearer JWT in
+the `Authorization` header. Use the **Authorize** button at the top
+of `/docs` to paste your access token once for the whole session.
 
 The token has a short lifetime (default 15 minutes); refresh it via
 `POST /auth/refresh` with your current refresh token.
@@ -307,21 +322,21 @@ def create_app() -> FastAPI:
     register_exception_handlers(app)
 
     # ---- CORS ----
-    if settings.CORS_ORIGINS:
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=settings.CORS_ORIGINS,
-            allow_credentials=True,
-            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-            allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
-            expose_headers=[
-                "X-Request-ID",
-                "X-RateLimit-Limit",
-                "X-RateLimit-Remaining",
-            ],
-        )
-    else:
-        logger.warning("cors.disabled", reason="CORS_ORIGINS is empty")
+    # IMPORTANT: CORS middleware MUST be the outermost layer so it can
+    # answer OPTIONS preflight requests before any other middleware
+    # touches the request. Otherwise `RequestContextMiddleware` (a
+    # `BaseHTTPMiddleware`) wraps the response and strips the CORS
+    # headers on the way back, manifesting as the browser-side
+    # error: "No 'Access-Control-Allow-Origin' header is present on
+    # the requested resource." — even though the route itself never
+    # ran. See https://github.com/encode/starlette/issues/1438 for
+    # the underlying BaseHTTPMiddleware buffering behaviour.
+    #
+    # We register CORS FIRST in source code but Starlette runs
+    # middleware outside-in by registration order, so to make CORS
+    # outermost we have to add it LAST. We therefore register all
+    # other middleware first, then add CORS last.
+    pass  # placeholder — CORS is added below, after every other middleware
 
     # ---- Trusted hosts (production only) ----
     if settings.is_production:
@@ -335,11 +350,29 @@ def create_app() -> FastAPI:
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.add_middleware(SlowAPIMiddleware)
 
-    # ---- Request context (added last so it runs FIRST in the middleware chain) ----
-    # NOTE: Starlette executes middleware in reverse order of registration.
-    # Registering RequestContextMiddleware last ensures it wraps everything else
-    # and produces a request_id before any other middleware logs.
+    # ---- Request context (wraps everything so request_id is available everywhere) ----
     app.add_middleware(RequestContextMiddleware)
+
+    # ---- CORS — registered LAST so it becomes the OUTERMOST middleware ----
+    # See the long comment above for why this can't live next to the
+    # other middleware registration.
+    cors_origins = settings.effective_cors_origins
+    if cors_origins:
+        logger.info("cors.enabled", origins=cors_origins)
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_origins,
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            allow_headers=["*"],
+            expose_headers=[
+                "X-Request-ID",
+                "X-RateLimit-Limit",
+                "X-RateLimit-Remaining",
+            ],
+        )
+    else:
+        logger.warning("cors.disabled", reason="CORS_ORIGINS is empty")
 
     # ---- Routers ----
     # Health is always exposed (k8s probes never auth).
@@ -347,6 +380,10 @@ def create_app() -> FastAPI:
 
     # Auth — register with no extra prefix (router already uses /auth).
     app.include_router(auth_router)
+
+    # Platform admin management — SUPER_ADMIN-only users for global dashboard.
+    app.include_router(identity_admin_router)
+    app.include_router(identity_platform_router)
 
     # Staff — agency-scoped staff profiles, qualifications, availability.
     app.include_router(staff_router)
@@ -372,8 +409,36 @@ def create_app() -> FastAPI:
     # Audit logs — admin-facing list/get endpoints.
     app.include_router(audit_logs_router)
 
+    # Reports — Claude narrative generation + PDF/CSV/XLSX export.
+    # Per-request gates in the router handle the FEATURE_REPORTS_AI_NARRATIVE
+    # + CLAUDE_API_KEY flags; the read endpoints stay live even when AI is
+    # disabled so the UI can still show history.
+    app.include_router(reports_router)
+
     # Agencies — SUPER_ADMIN-only management of agency tenants.
     app.include_router(agencies_router)
+
+    # Admin cross-tenant people read endpoints (SUPER_ADMIN-only).
+    # Mounted under `/admin/people` so the URL space stays grouped.
+    from src.modules.admin_people.router import router as admin_people_router
+    app.include_router(admin_people_router)
+
+    # Tickets — internal admin support tickets. Not tenant-scoped.
+    # Guarded by `require_scope(SUPPORT)` so SUPER_ADMIN and PLATFORM_ADMIN
+    # with SUPPORT scope can both access.
+    app.include_router(tickets_router)
+
+    # Compliance — agency documents + expiring licenses.
+    # Guarded by `require_scope(AGENCIES)` so admins who can manage
+    # agencies can also track their document/license status.
+    app.include_router(compliance_router)
+
+    # Billing — Stripe checkout + portal (per-agency) + webhook receiver.
+    # Routes are mounted unconditionally but each handler short-circuits
+    # with 503 when FEATURE_BILLING_ENABLED=False, so the OpenAPI schema
+    # still advertises the surface across environments.
+    app.include_router(agencies_billing_router)
+    app.include_router(billing_webhook_router)
 
     # NOTE: feature routers get registered here as modules land, e.g.
     #   app.include_router(staff_router, prefix="/staff", tags=["staff"])
