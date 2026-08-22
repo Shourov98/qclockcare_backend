@@ -11,6 +11,7 @@ Each public function corresponds to one HTTP endpoint:
   - resend_otp             → POST /auth/resend-otp
   - forgot_password        → POST /auth/forgot-password
   - reset_password         → POST /auth/reset-password
+  - change_password        → POST /auth/change-password   (authed)
 
 All functions take an `AsyncSession` so the caller controls the transaction
 boundary (the FastAPI dependency `get_session` handles commit/rollback).
@@ -833,9 +834,141 @@ async def me(session: AsyncSession, *, user_id: uuid.UUID) -> CurrentUser:
     return _to_current_user(user)
 
 
+# --------------------------------------------------------------------------
+# Change password (authenticated)
+# --------------------------------------------------------------------------
+async def change_password(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    current_password: str,
+    new_password: str,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> None:
+    """Rotate the caller's password while they are already authenticated.
+
+    Use case: the user is signed in (e.g. on the Security tab of the
+    settings page) and wants to change their password without going
+    through the email-reset flow. We require the current password for
+    re-authentication — a stolen access token alone cannot pivot into
+    a long-lived credential change.
+
+    On success we revoke ALL outstanding refresh tokens for the user,
+    forcing re-login on every other device. This matches the
+    `reset_password` behaviour and is the right default — password
+    rotation is a security event and silently leaving the other
+    browser sessions authenticated would defeat most of the threat
+    model.
+
+    Raises:
+      InvalidCredentialsError — current password is wrong, OR the
+        caller has no password set yet (still in INVITED state). The
+        generic message deliberately conflates the two so we don't
+        leak account state.
+      AccountDisabledError / AccountLockedError — caller is in a
+        terminal state (matches `login()`).
+    """
+    user = await _load_user_with_roles(session, user_id)
+
+    # Account-state check — refuse to touch locked/inactive/archived.
+    # `login()` does the same gate so we don't let an attacker
+    # rotate credentials on a frozen account.
+    if user.status in {
+        UserStatus.INACTIVE,
+        UserStatus.ARCHIVED,
+    }:
+        raise AccountDisabledError()
+    if user.status == UserStatus.LOCKED:
+        # Same auto-unlock path as `login()` — if the lock window has
+        # elapsed, accept the change; otherwise refuse.
+        now = datetime.now(tz=UTC)
+        if user.locked_until is not None and user.locked_until > now:
+            raise AccountLockedError(
+                details={"locked_until": user.locked_until.isoformat()}
+            )
+        user.status = UserStatus.ACTIVE
+        user.locked_until = None
+        user.failed_login_attempts = 0
+
+    # No password yet (still in INVITED state) — refuse rather than
+    # silently setting one. The right path is `accept_invitation`.
+    if user.password_hash is None:
+        # Hash to keep timing similar to the verify branch below.
+        hash_password(current_password)
+        raise InvalidCredentialsError(
+            message="Cannot change password until the invitation is accepted.",
+        )
+
+    # Verify the supplied current password. We treat a wrong guess
+    # the same way `login()` does: bump the failed counter, lock if
+    # the threshold is hit, and audit.
+    if not verify_password(current_password, user.password_hash):
+        user.failed_login_attempts += 1
+        now = datetime.now(tz=UTC)
+        if user.failed_login_attempts >= settings.ACCOUNT_LOCKOUT_THRESHOLD:
+            user.locked_until = now + timedelta(
+                minutes=settings.ACCOUNT_LOCKOUT_DURATION_MINUTES
+            )
+            user.status = UserStatus.LOCKED
+            await _record_audit(
+                session,
+                user_id=user.id,
+                event_type=AuthAuditEventType.ACCOUNT_LOCKED,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                metadata={"via": "change_password"},
+            )
+        else:
+            await _record_audit(
+                session,
+                user_id=user.id,
+                event_type=AuthAuditEventType.LOGIN_FAILED,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                metadata={
+                    "via": "change_password",
+                    "failed_attempts": user.failed_login_attempts,
+                },
+            )
+        raise InvalidCredentialsError()
+
+    now = datetime.now(tz=UTC)
+    user.password_hash = hash_password(new_password)
+    user.last_password_change_at = now
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    # Once the user has voluntarily rotated, clear the system-imposed
+    # flag — they've already proven they can pick a strong password.
+    user.must_change_password = False
+
+    # Revoke all outstanding refresh tokens. The caller will continue
+    # to work until their access token expires, then /auth/refresh
+    # will return 401 and they'll be bounced to /sign-in. This is the
+    # same UX as the email-reset flow.
+    await session.execute(
+        update(RefreshToken)
+        .where(
+            RefreshToken.user_id == user.id,
+            RefreshToken.revoked_at.is_(None),
+        )
+        .values(revoked_at=now, revoked_reason="password_changed")
+    )
+
+    await _record_audit(
+        session,
+        user_id=user.id,
+        event_type=AuthAuditEventType.PASSWORD_CHANGED,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        metadata={"via": "change_password"},
+    )
+
+
 __all__ = [
     "IssuedTokens",
     "accept_invitation",
+    "change_password",
     "forgot_password",
     "login",
     "logout",

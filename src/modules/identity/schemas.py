@@ -464,6 +464,55 @@ class ResetPasswordRequest(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Change password (authenticated)
+# --------------------------------------------------------------------------
+class ChangePasswordRequest(BaseModel):
+    """POST /auth/change-password body.
+
+    Authenticated callers (any role) rotate their own password while
+    signed in. We require the *current* password to prevent a stolen
+    access token alone from being able to lock out the legitimate
+    user. On success the server revokes all outstanding refresh
+    tokens — the user will be signed out everywhere except the
+    browser that initiated the change (whose access token is still
+    valid until expiry, then /auth/refresh returns 401).
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "current_password": "OldHorseBattery!42",
+                    "new_password": "CorrectHorseBattery!42",
+                }
+            ]
+        },
+    )
+
+    current_password: str = Field(
+        min_length=1,
+        max_length=128,
+        description=(
+            "The user's existing password. Required for re-authentication."
+        ),
+    )
+    new_password: str = Field(
+        min_length=_PASSWORD_MIN_LENGTH,
+        max_length=128,
+        description=(
+            "The new password. Must satisfy the project password "
+            "policy (12-128 chars, mixed case + digit + symbol)."
+        ),
+    )
+
+    @field_validator("new_password")
+    @classmethod
+    def _pw_policy(cls, v: str) -> str:
+        return _validate_password(v)
+
+
+# --------------------------------------------------------------------------
 # Logout
 # --------------------------------------------------------------------------
 class LogoutRequest(BaseModel):
@@ -552,6 +601,7 @@ TokenPair.model_rebuild()
 
 __all__ = [
     "AcceptInvitationRequest",
+    "ChangePasswordRequest",
     "CurrentUser",
     "ForgotPasswordRequest",
     "ForgotPasswordResponse",

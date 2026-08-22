@@ -255,6 +255,99 @@ class AuditAction(StrEnum):
     SERVICE_DISPUTED = "SERVICE_DISPUTED"
 
 
+# --------------------------------------------------------------------------
+# Support tickets (admin dashboard `/support`)
+# --------------------------------------------------------------------------
+class TicketStatus(StrEnum):
+    """Lifecycle of an internal admin support ticket.
+
+    Status transitions are unrestricted on the backend (the UI hides
+    illegal transitions) — we keep it simple because the volume is
+    low and over-engineering the state machine hasn't been worth it.
+    """
+
+    OPEN = "OPEN"
+    IN_PROGRESS = "IN_PROGRESS"
+    PENDING = "PENDING"          # waiting on someone outside the team
+    RESOLVED = "RESOLVED"
+    CLOSED = "CLOSED"
+
+
+class TicketPriority(StrEnum):
+    """Used by the dashboard to colour-code + sort the table."""
+
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+
+
+class TicketCommentKind(StrEnum):
+    """What kind of timeline entry a ticket comment represents.
+
+    Lives in `enums.py` (rather than `tickets/models.py`) so the Postgres
+    ENUM mapping in `enum_mapping.py` can register it alongside the other
+    cross-cutting StrEnums.
+
+    `COMMENT` — a regular reply.
+    `STATUS_CHANGE` — auto-logged when ticket.status transitions.
+    `ASSIGNMENT` — auto-logged when ticket.assignee_user_id changes.
+    `ATTACHMENT` — placeholder for future file-upload support.
+    """
+
+    COMMENT = "COMMENT"
+    STATUS_CHANGE = "STATUS_CHANGE"
+    ASSIGNMENT = "ASSIGNMENT"
+    ATTACHMENT = "ATTACHMENT"
+
+
+# --------------------------------------------------------------------------
+# Compliance — agency documents & licenses
+# --------------------------------------------------------------------------
+class DocumentType(StrEnum):
+    """Top-level classification of a per-agency required document."""
+
+    LICENSE = "LICENSE"            # operating / state license
+    CERTIFICATE = "CERTIFICATE"    # HIPAA / OSHA / CPR etc.
+    DOCUMENT = "DOCUMENT"          # catch-all (insurance, audit, manual)
+    PERMIT = "PERMIT"              # facility / construction / occupancy
+    POLICY = "POLICY"              # handbook / privacy / safety plan
+    REPORT = "REPORT"              # annual audit / financial report
+
+
+class DocumentStatus(StrEnum):
+    """Lifecycle of an `agency_document` row.
+
+    `MISSING`  — required by policy but not yet uploaded.
+    `PENDING`  — uploaded; awaiting admin review.
+    `VALID`    — uploaded + verified; not yet near expiry.
+    `EXPIRING` — within `EXPIRING_SOON_DAYS` of `expires_at`.
+    `EXPIRED`  — past `expires_at`.
+    `REJECTED` — uploaded but rejected (e.g. wrong document type).
+    """
+
+    MISSING = "MISSING"
+    PENDING = "PENDING"
+    VALID = "VALID"
+    EXPIRING = "EXPIRING"
+    EXPIRED = "EXPIRED"
+    REJECTED = "REJECTED"
+
+
+class LicenseStatus(StrEnum):
+    """Derived status for `agency_license` rows based on `expires_at`.
+
+    Mirrors `DocumentStatus` for the licence subset. The FE shows these
+    as Critical / Warning / Upcoming buckets in `ExpiringLicensesTable`.
+    """
+
+    VALID = "VALID"        # > 60 days until expiry
+    UPCOMING = "UPCOMING"  # 30–60 days
+    WARNING = "WARNING"    # 14–30 days
+    CRITICAL = "CRITICAL"  # < 14 days OR past expiry
+    EXPIRED = "EXPIRED"    # past expiry
+
+
 class AuthAuditEventType(StrEnum):
     """Events specific to authentication flows (ADR-0016)."""
 
@@ -333,6 +426,9 @@ __all__ = [
     "AuthAuditEventType",
     "ConfirmationStatus",
     "DisputeReasonCode",
+    "DocumentStatus",
+    "DocumentType",
+    "LicenseStatus",
     "NotificationChannel",
     "NotificationStatus",
     "NotificationType",
@@ -342,6 +438,9 @@ __all__ = [
     "RelationshipType",
     "ServiceItemStatus",
     "ServiceType",
+    "TicketCommentKind",
+    "TicketPriority",
+    "TicketStatus",
     "UserRole",
     "UserStatus",
     "VerificationStatus",

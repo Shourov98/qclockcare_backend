@@ -9,6 +9,7 @@ Endpoints:
   POST /auth/resend-otp             → {sent, cooldown_seconds_remaining}
   POST /auth/forgot-password        → {sent: true}
   POST /auth/reset-password         → 204
+  POST /auth/change-password        → 204         (authenticated)
   GET  /auth/me                     → {user}
 
 All routes use the public `get_session` dependency (no auth required).
@@ -50,6 +51,7 @@ from src.modules.identity.dependencies import (
 )
 from src.modules.identity.schemas import (
     AcceptInvitationRequest,
+    ChangePasswordRequest,
     ForgotPasswordRequest,
     ForgotPasswordResponse,
     LoginRequest,
@@ -447,6 +449,49 @@ async def me_endpoint(
     # set RLS GUCs. We just need to return the user.
     user = await auth_service.me(session, user_id=ctx.user_id)
     return MeResponse(user=user)
+
+
+# --------------------------------------------------------------------------
+# Change password (authenticated)
+# --------------------------------------------------------------------------
+@router.post(
+    "/change-password",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses=standard_responses(include=[401, 422]),
+    summary="Change the caller's password while signed in",
+    description=(
+        "Authenticated callers (any role) rotate their own password "
+        "by supplying the *current* password plus a new one that "
+        "satisfies the project password policy. On success the "
+        "server revokes ALL outstanding refresh tokens for the user, "
+        "forcing re-login on every other device. The current browser "
+        "continues to work until its access token expires, then "
+        "`/auth/refresh` returns 401 and the user is bounced to "
+        "`/sign-in`.\n\n"
+        "Failed attempts count toward the account lockout threshold "
+        "(`settings.ACCOUNT_LOCKOUT_THRESHOLD`) — same behaviour "
+        "as `/auth/login`. For password resets by users who *can't* "
+        "log in, use `/auth/forgot-password` + `/auth/reset-password` "
+        "instead."
+    ),
+)
+async def change_password_endpoint(
+    payload: ChangePasswordRequest,
+    request: Request,
+    ctx: CurrentAuth,
+    session: AsyncSession = Depends(get_session_with_auth),
+) -> Response:
+    await auth_service.change_password(
+        session,
+        user_id=ctx.user_id,
+        current_password=payload.current_password,
+        new_password=payload.new_password,
+        ip_address=_client_ip(request),
+        user_agent=_user_agent(request),
+    )
+    # No body. Refresh-token revocation is a side effect; the client
+    # will discover it on its next refresh attempt.
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 __all__ = ["router"]

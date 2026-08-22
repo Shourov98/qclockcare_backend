@@ -35,6 +35,8 @@ from src.core.middleware import RequestContextMiddleware
 # the registry.
 from src.modules.agencies.models import Agency as _Agency  # noqa: F401
 from src.modules.agencies.router import router as agencies_router
+from src.modules.compliance.models import AgencyDocument, AgencyLicense  # noqa: F401
+from src.modules.compliance.router import router as compliance_router
 from src.modules.appointments.models import (  # noqa: F401
     Appointment,
     AppointmentServiceItem,
@@ -79,6 +81,8 @@ from src.modules.staff.models import (  # noqa: F401
     StaffQualification,
 )
 from src.modules.staff.router import router as staff_router
+from src.modules.tickets.models import Ticket, TicketComment  # noqa: F401
+from src.modules.tickets.router import router as tickets_router
 from src.modules.visits.models import (  # noqa: F401
     ServiceVerification,
     Visit,
@@ -418,6 +422,16 @@ def create_app() -> FastAPI:
     # Mounted under `/admin/people` so the URL space stays grouped.
     from src.modules.admin_people.router import router as admin_people_router
     app.include_router(admin_people_router)
+
+    # Tickets — internal admin support tickets. Not tenant-scoped.
+    # Guarded by `require_scope(SUPPORT)` so SUPER_ADMIN and PLATFORM_ADMIN
+    # with SUPPORT scope can both access.
+    app.include_router(tickets_router)
+
+    # Compliance — agency documents + expiring licenses.
+    # Guarded by `require_scope(AGENCIES)` so admins who can manage
+    # agencies can also track their document/license status.
+    app.include_router(compliance_router)
 
     # Billing — Stripe checkout + portal (per-agency) + webhook receiver.
     # Routes are mounted unconditionally but each handler short-circuits
