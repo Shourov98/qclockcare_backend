@@ -83,8 +83,14 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: Literal["HS256", "RS256"] = "HS256"
     JWT_PRIVATE_KEY: SecretStr | None = None  # RS256 only
     JWT_PUBLIC_KEY: SecretStr | None = None  # RS256 only
-    JWT_ACCESS_TOKEN_TTL_MINUTES: int = Field(default=15, ge=1, le=60)
-    JWT_REFRESH_TOKEN_TTL_DAYS: int = Field(default=7, ge=1, le=30)
+    # Access tokens are short-lived (60 min). The FE silently refreshes
+    # them in the background using the long-lived refresh cookie, so a
+    # user feels continuously logged in for the full refresh-token TTL
+    # without us putting a 7-day window on a leaked access token.
+    JWT_ACCESS_TOKEN_TTL_MINUTES: int = Field(default=60, ge=1, le=60)
+    # Refresh tokens live for 30 days. Capped at 30 by the validator
+    # below; bump `le=` if you ever need longer.
+    JWT_REFRESH_TOKEN_TTL_DAYS: int = Field(default=30, ge=1, le=30)
     JWT_ISSUER: str = "qlockcare"
     JWT_AUDIENCE: str = "qlockcare-api"
 

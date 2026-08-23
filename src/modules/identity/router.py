@@ -89,10 +89,13 @@ def _user_agent(request: Request) -> str | None:
     description=(
         "Authenticates a user with email + password and returns an "
         "access/refresh token pair. The access token is short-lived "
-        "(default 15 minutes); the refresh token is long-lived "
-        "(default 30 days). 5 consecutive failures lock the account "
-        "for `settings.ACCOUNT_LOCKOUT_MINUTES` minutes. Sets the "
-        "`qc_access` / `qc_refresh` / `qc_csrf` cookies."
+        "(default 60 minutes — `settings.JWT_ACCESS_TOKEN_TTL_MINUTES`); "
+        "the refresh token is long-lived (default 30 days — "
+        "`settings.JWT_REFRESH_TOKEN_TTL_DAYS`). The FE silently refreshes "
+        "the access token in the background, so users stay logged in for "
+        "the full refresh window without interruption. 5 consecutive "
+        "failures lock the account for `settings.ACCOUNT_LOCKOUT_MINUTES` "
+        "minutes. Sets the `qc_access` / `qc_refresh` / `qc_csrf` cookies."
     ),
 )
 async def login_endpoint(
