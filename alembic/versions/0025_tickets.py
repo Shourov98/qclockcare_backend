@@ -148,13 +148,27 @@ def upgrade() -> None:
     )
     # Cast the bare-string columns to the ENUM types so Postgres
     # enforces the same constraints as the ORM.
+    #
+    # The columns were created with VARCHAR + a literal string default
+    # (`'OPEN'`, `'MEDIUM'`). Postgres won't auto-cast that literal to
+    # the enum type, so we DROP DEFAULT, run the cast, then SET DEFAULT
+    # back with an explicit `::ticket_status` cast on the literal.
+    op.execute("ALTER TABLE tickets ALTER COLUMN status DROP DEFAULT")
     op.execute(
         "ALTER TABLE tickets ALTER COLUMN status TYPE ticket_status "
         "USING status::ticket_status"
     )
     op.execute(
+        "ALTER TABLE tickets ALTER COLUMN status SET DEFAULT 'OPEN'::ticket_status"
+    )
+
+    op.execute("ALTER TABLE tickets ALTER COLUMN priority DROP DEFAULT")
+    op.execute(
         "ALTER TABLE tickets ALTER COLUMN priority TYPE ticket_priority "
         "USING priority::ticket_priority"
+    )
+    op.execute(
+        "ALTER TABLE tickets ALTER COLUMN priority SET DEFAULT 'MEDIUM'::ticket_priority"
     )
     op.create_index(
         "ix_tickets_status", "tickets", ["status"], unique=False
@@ -250,9 +264,13 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id", name="pk_ticket_comments"),
     )
+    op.execute("ALTER TABLE ticket_comments ALTER COLUMN kind DROP DEFAULT")
     op.execute(
         "ALTER TABLE ticket_comments ALTER COLUMN kind TYPE ticket_comment_kind "
         "USING kind::ticket_comment_kind"
+    )
+    op.execute(
+        "ALTER TABLE ticket_comments ALTER COLUMN kind SET DEFAULT 'COMMENT'::ticket_comment_kind"
     )
     op.create_index(
         "ix_ticket_comments_ticket_id",

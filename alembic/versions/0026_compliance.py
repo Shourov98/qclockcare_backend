@@ -107,13 +107,27 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id", name="pk_agency_documents"),
     )
+    # Cast VARCHAR columns to ENUM types. The columns were created with a
+    # literal string default ('DOCUMENT', 'MISSING'), so we DROP DEFAULT,
+    # cast the column type, then re-attach the default with an explicit
+    # `::document_type` / `::document_status` cast so Postgres accepts it.
+    op.execute("ALTER TABLE agency_documents ALTER COLUMN doc_type DROP DEFAULT")
     op.execute(
         "ALTER TABLE agency_documents ALTER COLUMN doc_type TYPE document_type "
         "USING doc_type::document_type"
     )
     op.execute(
+        "ALTER TABLE agency_documents ALTER COLUMN doc_type "
+        "SET DEFAULT 'DOCUMENT'::document_type"
+    )
+    op.execute("ALTER TABLE agency_documents ALTER COLUMN status DROP DEFAULT")
+    op.execute(
         "ALTER TABLE agency_documents ALTER COLUMN status TYPE document_status "
         "USING status::document_status"
+    )
+    op.execute(
+        "ALTER TABLE agency_documents ALTER COLUMN status "
+        "SET DEFAULT 'MISSING'::document_status"
     )
     op.create_index(
         "ix_agency_documents_agency_id", "agency_documents", ["agency_id"], unique=False
@@ -183,13 +197,25 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id", name="pk_agency_licenses"),
     )
+    # Same DROP DEFAULT → cast → SET DEFAULT pattern as agency_documents
+    # above (see the comment block there for the rationale).
+    op.execute("ALTER TABLE agency_licenses ALTER COLUMN doc_type DROP DEFAULT")
     op.execute(
         "ALTER TABLE agency_licenses ALTER COLUMN doc_type TYPE document_type "
         "USING doc_type::document_type"
     )
     op.execute(
+        "ALTER TABLE agency_licenses ALTER COLUMN doc_type "
+        "SET DEFAULT 'LICENSE'::document_type"
+    )
+    op.execute("ALTER TABLE agency_licenses ALTER COLUMN status DROP DEFAULT")
+    op.execute(
         "ALTER TABLE agency_licenses ALTER COLUMN status TYPE license_status "
         "USING status::license_status"
+    )
+    op.execute(
+        "ALTER TABLE agency_licenses ALTER COLUMN status "
+        "SET DEFAULT 'VALID'::license_status"
     )
     op.create_index(
         "ix_agency_licenses_agency_id", "agency_licenses", ["agency_id"], unique=False
