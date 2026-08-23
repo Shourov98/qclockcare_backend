@@ -523,14 +523,29 @@ async def list_appointments(
 ) -> tuple[Sequence[Appointment], int]:
     """Paginated list of appointments at the caller's agency.
 
-    Optional filters narrow by patient, staff, and/or status. Sorted by
-    `scheduled_start DESC` (newest first) so the calendar view can page
-    backwards through history.
+    Eagerly joins the caregiver (`staff.user`), staff profile, and
+    service items so the patient mobile app can render a fully populated
+    card from a single round trip.
+
+    Sorted by `scheduled_start DESC` (newest first) so the calendar view
+    can page backwards through history.
     """
     page = max(1, page)
     page_size = max(1, min(100, page_size))
 
-    base = select(Appointment).where(Appointment.agency_id == agency_id)
+    base = (
+        select(Appointment)
+        .where(Appointment.agency_id == agency_id)
+        .options(
+            # Caregiver display name + phone live on the User; staff_code
+            # lives on the StaffProfile. selectinload keeps the join
+            # batched (1 + N queries for N appointments, not N+1).
+            selectinload(Appointment.staff).selectinload(StaffProfile.user),
+            # Service items so we can read the first service_type for the
+            # "CFSS — Personal Care" label on the patient card.
+            selectinload(Appointment.service_items),
+        )
+    )
     count_base = (
         select(func.count())
         .select_from(Appointment)
@@ -1272,6 +1287,81 @@ async def get_latest_confirmation(
             )
         )
     ).scalar_one_or_none()
+
+
+# --------------------------------------------------------------------------
+# Summary serialization helpers
+# --------------------------------------------------------------------------
+def _humanize_enum(value: object) -> str | None:
+    """Render a StrEnum (e.g. `ServiceType.PERSONAL_CARE`) as a human
+    label ("Personal Care"). Returns None for None.
+
+    Uses the enum's `.value` so the wire format of the underlying
+    constants stays the source of truth (no separate label table).
+    """
+    if value is None:
+        return None
+    raw = getattr(value, "value", str(value))
+    # Title-case each underscore-separated segment ("PERSONAL_CARE" →
+    # "Personal Care", "245D" stays "245D").
+    return " ".join(
+        seg.capitalize() if seg.isalpha() else seg for seg in raw.split("_")
+    )
+
+
+def _summarize_to_dict(appt: Appointment) -> dict:
+    """Project a (eager-loaded) Appointment ORM row into the dict shape
+    expected by `AppointmentSummaryResponse`. Joins the caregiver name /
+    phone / staff_code via `Appointment.staff.user`, the program name
+    from the `program_type` enum, and the first service-item label.
+
+    Safe to call even if `appt.staff` or `appt.service_items` aren't
+    eagerly loaded — all joined fields default to None.
+    """
+    # Caregiver: joined via staff → user
+    staff_name: str | None = None
+    staff_phone: str | None = None
+    staff_code: str | None = None
+    staff = getattr(appt, "staff", None)
+    if staff is not None:
+        user = getattr(staff, "user", None)
+        if user is not None:
+            staff_name = getattr(user, "full_name", None)
+            staff_phone = getattr(user, "phone", None)
+        staff_code = getattr(staff, "staff_code", None)
+
+    # Program + service-item label
+    program_name = _humanize_enum(getattr(appt, "program_type", None))
+    service_type_label: str | None = None
+    service_items = getattr(appt, "service_items", None)
+    if service_items:
+        first = service_items[0]
+        service_type_label = _humanize_enum(getattr(first, "service_type", None))
+
+    # `location` is the free-text entered at scheduling time (the agency
+    # types e.g. "123 Oak St, Saint Paul MN"). The schema exposes it as
+    # `location_label` to make the semantic intent clear.
+    location_label = getattr(appt, "location", None)
+
+    return {
+        "id": appt.id,
+        "agency_id": appt.agency_id,
+        "patient_id": appt.patient_id,
+        "staff_id": appt.staff_id,
+        "program_type": appt.program_type,
+        "scheduled_start": appt.scheduled_start,
+        "scheduled_end": appt.scheduled_end,
+        "status": appt.status,
+        "confirmation_status": appt.confirmation_status,
+        "created_at": appt.created_at,
+        "updated_at": appt.updated_at,
+        "staff_name": staff_name,
+        "staff_phone": staff_phone,
+        "staff_code": staff_code,
+        "program_name": program_name,
+        "service_type_label": service_type_label,
+        "location_label": location_label,
+    }
 
 
 __all__ = [

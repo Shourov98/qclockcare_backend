@@ -133,7 +133,15 @@ class AppointmentResponse(BaseModel):
 
 
 class AppointmentSummaryResponse(BaseModel):
-    """Lighter shape for list endpoints — no nested service items."""
+    """Lighter shape for list endpoints — eagerly joins caregiver name,
+    staff phone, program label, first service-item label, and the
+    free-text location so the patient mobile app can render a fully
+    populated card in a single round trip.
+
+    All joined fields are nullable because the underlying relations
+    may not exist (e.g. an unassigned `DRAFT` appointment has no
+    staff). The FE should treat them as optional.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -148,6 +156,23 @@ class AppointmentSummaryResponse(BaseModel):
     confirmation_status: ConfirmationStatus | None
     created_at: datetime
     updated_at: datetime
+    # ----- Joined caregiver info -----
+    # Populated from `Appointment.staff.user` and `Appointment.staff`.
+    staff_name: str | None = None
+    staff_phone: str | None = None
+    staff_code: str | None = None
+    # ----- Joined program + service info -----
+    # `program_name` is a human-readable rendering of the `program_type`
+    # enum ("CFSS"); `service_type_label` is the first service item's
+    # type rendered ("Personal Care"). Both join via
+    # `Appointment.service_items`.
+    program_name: str | None = None
+    service_type_label: str | None = None
+    # ----- Free-text location entered at scheduling -----
+    # Already exists on the full `AppointmentResponse`; promoted to the
+    # summary so the patient mobile app doesn't need a second round trip
+    # to display "123 Oak St, Saint Paul MN".
+    location_label: str | None = None
 
 
 # --------------------------------------------------------------------------

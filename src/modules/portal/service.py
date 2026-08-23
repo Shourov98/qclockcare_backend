@@ -21,6 +21,7 @@ from datetime import date
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from src.core.exceptions import ForbiddenError, NotFoundError
 from src.modules.identity.dependencies import AuthContext
@@ -222,15 +223,52 @@ async def load_visit_with_relations(
     visit_id: uuid.UUID,
     ctx: AuthContext,
 ) -> Visit:
-    """Load a visit (after authz check) with its nested children eager-loaded."""
+    """Load a visit (after authz check) with its nested children + joined
+    caregiver / patient info eager-loaded.
+
+    Eager-loads:
+      - `visit.staff.user` so `_to_response` can populate `staff_name`,
+        `staff_phone`, and `staff_code`.
+      - `visit.appointment.patient.user` so `_to_response` can populate
+        `patient_name`, `patient_code`, and the parent appointment's
+        free-text `location`.
+      - `visit.service_items`, `visit.notes`, `visit.verification`,
+        `visit.issues` so the nested arrays render without N+1 queries.
+
+    We re-issue a fresh SELECT with chained `selectinload`s rather than
+    calling `session.refresh(visit, ["staff", ...])` because chained
+    relationships (`staff.user`, `appointment.patient.user`) need a
+    query-level join to be batched correctly — `refresh` only handles
+    single-level attributes.
+    """
     visit = await _load_visit_for_caller(
         session, visit_id=visit_id, ctx=ctx
     )
-    await session.refresh(
-        visit,
-        attribute_names=["service_items", "notes", "verification", "issues"],
-    )
-    return visit
+    # Re-load with the joined chains in one round trip.
+    from src.modules.appointments.models import Appointment
+    from src.modules.patients.models import PatientProfile
+    from src.modules.staff.models import StaffProfile
+
+    reloaded = (
+        await session.execute(
+            select(Visit)
+            .where(Visit.id == visit.id)
+            .options(
+                selectinload(Visit.service_items),
+                selectinload(Visit.notes),
+                selectinload(Visit.verification),
+                selectinload(Visit.issues),
+                # Caregiver: Visit.staff -> StaffProfile.user
+                selectinload(Visit.staff).selectinload(StaffProfile.user),
+                # Patient + location: Visit.appointment -> Appointment
+                #   -> PatientProfile.user
+                selectinload(Visit.appointment)
+                .selectinload(Appointment.patient)
+                .selectinload(PatientProfile.user),
+            )
+        )
+    ).scalar_one_or_none()
+    return reloaded if reloaded is not None else visit
 
 
 # --------------------------------------------------------------------------

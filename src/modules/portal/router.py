@@ -56,11 +56,44 @@ def _to_response(visit, *, with_relations: bool = False) -> PortalVisitResponse:
         "created_at": visit.created_at,
         "updated_at": visit.updated_at,
     }
+    # ----- Joined caregiver + patient info -----
+    # `load_visit_with_relations` eager-loads `staff.user`,
+    # `appointment.patient.user`, and the nested children. Use the same
+    # try/except pattern as the existing code so a lazy-load miss
+    # (e.g. an unrelated code path calling this helper without the full
+    # eager load) doesn't blow up — it just renders the joined field
+    # as None.
+    try:
+        staff = visit.staff
+        if staff is not None:
+            data["staff_code"] = getattr(staff, "staff_code", None)
+            user = getattr(staff, "user", None)
+            if user is not None:
+                data["staff_name"] = getattr(user, "full_name", None)
+                data["staff_phone"] = getattr(user, "phone", None)
+    except Exception:
+        pass
+    try:
+        appointment = visit.appointment
+        if appointment is not None:
+            data["location_label"] = getattr(appointment, "location", None)
+            patient = getattr(appointment, "patient", None)
+            if patient is not None:
+                data["patient_code"] = getattr(patient, "patient_code", None)
+                user = getattr(patient, "user", None)
+                if user is not None:
+                    data["patient_name"] = getattr(user, "full_name", None)
+    except Exception:
+        pass
     if with_relations:
         try:
             data["service_items"] = list(visit.service_items)
         except Exception:
             data["service_items"] = None
+        try:
+            data["notes"] = list(visit.notes)
+        except Exception:
+            data["notes"] = None
         try:
             data["verification"] = visit.verification
         except Exception:

@@ -281,6 +281,17 @@ async def test_list_appointments(admin_session) -> None:
         body = r.json()
         assert any(a["id"] == appt_id for a in body["data"])
 
+        # The enriched summary fields must always be present on the
+        # response — even when None (no staff assigned, no location, no
+        # service items). Backwards-compat check for the mobile-app card.
+        matched = next(a for a in body["data"] if a["id"] == appt_id)
+        assert "staff_name" in matched
+        assert "staff_phone" in matched
+        assert "staff_code" in matched
+        assert "program_name" in matched
+        assert "service_type_label" in matched
+        assert "location_label" in matched
+
 
 @pytest.mark.asyncio
 async def test_get_with_items_returns_nested_collection(admin_session) -> None:

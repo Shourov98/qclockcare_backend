@@ -246,7 +246,15 @@ async def list_appointments_endpoint(
         page=page,
         page_size=page_size,
     )
-    data = [AppointmentSummaryResponse.model_validate(r) for r in rows]
+    # `list_appointments` eager-loads `staff.user` and `service_items`
+    # so `_summarize_to_dict` can populate the joined display fields
+    # (caregiver name, program label, etc.) without N+1 queries.
+    data = [
+        AppointmentSummaryResponse.model_validate(
+            appointments_service._summarize_to_dict(r)
+        )
+        for r in rows
+    ]
     return build_offset_response(data, total=total, page=page, page_size=page_size)
 
 

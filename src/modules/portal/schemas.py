@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, StringConstraints
 from src.modules.visits.schemas import (
     ServiceVerificationResponse,
     VisitIssueResponse,
+    VisitNoteResponse,
     VisitServiceItemResponse,
 )
 
@@ -29,8 +30,10 @@ from src.modules.visits.schemas import (
 class PortalVisitResponse(BaseModel):
     """Single visit, scoped to the calling patient/guardian.
 
-    Includes nested children so the portal can render the verify/dispute
-    UI without a second round trip.
+    Includes nested children + caregiver + patient joins so the portal
+    can render the full Visit Summary screen (caregiver name, patient
+    name, caregiver phone, visit notes, service items, verification,
+    issues) in a single round trip.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -50,7 +53,20 @@ class PortalVisitResponse(BaseModel):
     duration_seconds: int | None
     created_at: datetime
     updated_at: datetime
+    # ----- Joined caregiver (staff) info -----
+    # Populated from `visit.staff.user` and `visit.staff`.
+    staff_name: str | None = None
+    staff_phone: str | None = None
+    staff_code: str | None = None
+    # ----- Joined patient info (via visit.appointment.patient) -----
+    patient_name: str | None = None
+    patient_code: str | None = None
+    # ----- Free-text location from the parent appointment -----
+    location_label: str | None = None
+    # ----- Nested children (already eager-loaded by
+    #       `portal_service.load_visit_with_relations`) -----
     service_items: list[VisitServiceItemResponse] | None = None
+    notes: list[VisitNoteResponse] | None = None
     verification: ServiceVerificationResponse | None = None
     issues: list[VisitIssueResponse] | None = None
 
