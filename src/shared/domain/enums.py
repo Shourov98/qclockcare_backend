@@ -108,30 +108,50 @@ class ServiceType(StrEnum):
 # Appointments
 # --------------------------------------------------------------------------
 class AppointmentStatus(StrEnum):
-    DRAFT = "DRAFT"
+    """5-state lifecycle per the canonical spec (see
+    `QlockCare_appointemnt_flow.md`). The appointment moves through:
+
+        SCHEDULED -> READY -> IN_PROGRESS -> AWAITING_SIGNATURE -> COMPLETED
+
+    Plus exception edges: `CANCELLED`, `MISSED`, `REJECTED` from any
+    pre-visit state. Service-verification / dispute / billing statuses
+    are no longer first-class appointment states — those concepts moved
+    to `AppointmentSignature` and (future) the billing module.
+
+    Postgres ENUM `appointment_status` MUST match these values exactly.
+    """
+
     SCHEDULED = "SCHEDULED"
-    NOTIFICATION_SENT = "NOTIFICATION_SENT"
-    AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION"
-    CONFIRMED = "CONFIRMED"
-    RESCHEDULE_REQUESTED = "RESCHEDULE_REQUESTED"
-    CANCELLATION_REQUESTED = "CANCELLATION_REQUESTED"
-    ASSIGNED = "ASSIGNED"
-    CHECKED_IN = "CHECKED_IN"
+    READY = "READY"
     IN_PROGRESS = "IN_PROGRESS"
-    CHECKED_OUT = "CHECKED_OUT"
+    AWAITING_SIGNATURE = "AWAITING_SIGNATURE"
     COMPLETED = "COMPLETED"
-    AWAITING_SERVICE_VERIFICATION = "AWAITING_SERVICE_VERIFICATION"
-    SERVICE_VERIFIED = "SERVICE_VERIFIED"
-    DISPUTED = "DISPUTED"
-    UNDER_REVIEW = "UNDER_REVIEW"
-    APPROVED_FOR_BILLING = "APPROVED_FOR_BILLING"
-    PAID = "PAID"
     CANCELLED = "CANCELLED"
-    NO_SHOW = "NO_SHOW"
+    MISSED = "MISSED"
     REJECTED = "REJECTED"
 
 
+# Statuses the UI treats as "active / in-flight" (i.e. not yet finalized
+# or exceptioned). Used as a default filter for the appointment list.
+APPOINTMENT_ACTIVE_STATUSES: frozenset[AppointmentStatus] = frozenset(
+    {
+        AppointmentStatus.SCHEDULED,
+        AppointmentStatus.READY,
+        AppointmentStatus.IN_PROGRESS,
+        AppointmentStatus.AWAITING_SIGNATURE,
+    }
+)
+
+
 class ServiceItemStatus(StrEnum):
+    """Lifecycle of an `AppointmentActivity` row (per-appointment checklist).
+
+    Same five states as before — the rename to "Activity" doesn't change
+    the per-row state machine. `DONE` is required on every row before
+    the caregiver can submit "End Task"; `NOT_DONE` requires a reason
+    (enforced at the service layer).
+    """
+
     PENDING = "PENDING"
     DONE = "DONE"
     NOT_DONE = "NOT_DONE"
@@ -140,56 +160,26 @@ class ServiceItemStatus(StrEnum):
 
 
 # --------------------------------------------------------------------------
-# Appointment event log (immutable domain timeline)
-# --------------------------------------------------------------------------
-class AppointmentEventType(StrEnum):
-    """Domain-level events appended to `appointment_events`.
-
-    Distinct from `AuditAction` (security/compliance trail) — events
-    capture *what happened* to the appointment in business terms,
-    not who audited it. Stored as `text` on the row (rather than a
-    Postgres enum) so new event types can ship without a migration.
-    """
-
-    STATUS_TRANSITION = "STATUS_TRANSITION"
-    CONFIRMATION_FILED = "CONFIRMATION_FILED"
-    RESCHEDULE_REQUESTED = "RESCHEDULE_REQUESTED"
-    CANCELLATION_REQUESTED = "CANCELLATION_REQUESTED"
-    CANCELLED_BY_ADMIN = "CANCELLED_BY_ADMIN"
-
-
-# --------------------------------------------------------------------------
-# Visits
+# Visits — mirrors the appointment lifecycle
 # --------------------------------------------------------------------------
 class VisitStatus(StrEnum):
-    CHECKED_IN = "CHECKED_IN"
+    """The materialized-visit row follows the same 8-state lifecycle
+    as `AppointmentStatus`. The visit row is created when the staff
+    app POSTs `/visits` (transition `READY -> IN_PROGRESS`) and walks
+    the same path to `COMPLETED`.
+
+    The migration collapses the old `CHECKED_IN / CHECKED_OUT` middle
+    states into `IN_PROGRESS` per the spec.
+    """
+
+    SCHEDULED = "SCHEDULED"
+    READY = "READY"
     IN_PROGRESS = "IN_PROGRESS"
-    CHECKED_OUT = "CHECKED_OUT"
+    AWAITING_SIGNATURE = "AWAITING_SIGNATURE"
     COMPLETED = "COMPLETED"
-
-
-# --------------------------------------------------------------------------
-# Confirmations / verifications
-# --------------------------------------------------------------------------
-class ConfirmationStatus(StrEnum):
-    CONFIRMED = "CONFIRMED"
-    DECLINED = "DECLINED"
-
-
-class VerificationStatus(StrEnum):
-    VERIFIED = "VERIFIED"
-    DISPUTED = "DISPUTED"
-
-
-class DisputeReasonCode(StrEnum):
-    STAFF_NEVER_ARRIVED = "STAFF_NEVER_ARRIVED"
-    STAFF_ARRIVED_LATE = "STAFF_ARRIVED_LATE"
-    STAFF_LEFT_EARLY = "STAFF_LEFT_EARLY"
-    SERVICE_NOT_COMPLETED = "SERVICE_NOT_COMPLETED"
-    WRONG_SERVICE_MARKED_DONE = "WRONG_SERVICE_MARKED_DONE"
-    WRONG_NOTE = "WRONG_NOTE"
-    POOR_SERVICE = "POOR_SERVICE"
-    OTHER = "OTHER"
+    CANCELLED = "CANCELLED"
+    MISSED = "MISSED"
+    REJECTED = "REJECTED"
 
 
 # --------------------------------------------------------------------------
@@ -214,15 +204,14 @@ class NotificationStatus(StrEnum):
 class NotificationType(StrEnum):
     APPOINTMENT_CREATED = "APPOINTMENT_CREATED"
     APPOINTMENT_ASSIGNED = "APPOINTMENT_ASSIGNED"
-    APPOINTMENT_CONFIRMED = "APPOINTMENT_CONFIRMED"
-    APPOINTMENT_RESCHEDULE_REQUESTED = "APPOINTMENT_RESCHEDULE_REQUESTED"
-    APPOINTMENT_CANCELLATION_REQUESTED = "APPOINTMENT_CANCELLATION_REQUESTED"
     APPOINTMENT_CANCELLED = "APPOINTMENT_CANCELLED"
-    VISIT_CHECK_IN_REMINDER = "VISIT_CHECK_IN_REMINDER"
-    VISIT_CHECKED_IN = "VISIT_CHECKED_IN"
-    VISIT_CHECKED_OUT = "VISIT_CHECKED_OUT"
-    SERVICE_VERIFIED = "SERVICE_VERIFIED"
-    SERVICE_DISPUTED = "SERVICE_DISPUTED"
+    APPOINTMENT_READY = "APPOINTMENT_READY"
+    VISIT_STARTED = "VISIT_STARTED"
+    VISIT_ENDED = "VISIT_ENDED"
+    VISIT_SUBMITTED_FOR_SIGNATURE = "VISIT_SUBMITTED_FOR_SIGNATURE"
+    VISIT_SIGNED = "VISIT_SIGNED"
+    VISIT_COMPLETED = "VISIT_COMPLETED"
+    BILLING_CONFIRMED = "BILLING_CONFIRMED"
     STAFF_INVITATION = "STAFF_INVITATION"
     PASSWORD_RESET = "PASSWORD_RESET"
     GENERIC = "GENERIC"
@@ -244,15 +233,17 @@ class AuditAction(StrEnum):
     ROLE_REVOKED = "ROLE_REVOKED"
     LINK_PATIENT_GUARDIAN = "LINK_PATIENT_GUARDIAN"
     UNLINK_PATIENT_GUARDIAN = "UNLINK_PATIENT_GUARDIAN"
-    APPOINTMENT_CONFIRMED = "APPOINTMENT_CONFIRMED"
-    APPOINTMENT_RESCHEDULE_REQUESTED = "APPOINTMENT_RESCHEDULE_REQUESTED"
-    APPOINTMENT_CANCELLATION_REQUESTED = "APPOINTMENT_CANCELLATION_REQUESTED"
+    APPOINTMENT_CREATED = "APPOINTMENT_CREATED"
     APPOINTMENT_CANCELLED = "APPOINTMENT_CANCELLED"
+    APPOINTMENT_MARKED_READY = "APPOINTMENT_MARKED_READY"
     APPOINTMENT_ASSIGNED = "APPOINTMENT_ASSIGNED"
-    VISIT_CHECKED_IN = "VISIT_CHECKED_IN"
-    VISIT_CHECKED_OUT = "VISIT_CHECKED_OUT"
-    SERVICE_VERIFIED = "SERVICE_VERIFIED"
-    SERVICE_DISPUTED = "SERVICE_DISPUTED"
+    VISIT_STARTED = "VISIT_STARTED"
+    VISIT_SUBMITTED_FOR_SIGNATURE = "VISIT_SUBMITTED_FOR_SIGNATURE"
+    VISIT_SIGNED = "VISIT_SIGNED"
+    VISIT_COMPLETED = "VISIT_COMPLETED"
+    BILLING_CONFIRMED = "BILLING_CONFIRMED"
+    ACTIVITY_MARKED_DONE = "ACTIVITY_MARKED_DONE"
+    ACTIVITY_MARKED_NOT_DONE = "ACTIVITY_MARKED_NOT_DONE"
 
 
 # --------------------------------------------------------------------------
@@ -419,13 +410,11 @@ class QualificationStatus(StrEnum):
 
 
 __all__ = [
+    "APPOINTMENT_ACTIVE_STATUSES",
     "AgencyStatus",
-    "AppointmentEventType",
     "AppointmentStatus",
     "AuditAction",
     "AuthAuditEventType",
-    "ConfirmationStatus",
-    "DisputeReasonCode",
     "DocumentStatus",
     "DocumentType",
     "LicenseStatus",
@@ -443,6 +432,5 @@ __all__ = [
     "TicketStatus",
     "UserRole",
     "UserStatus",
-    "VerificationStatus",
     "VisitStatus",
 ]
