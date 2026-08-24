@@ -3,6 +3,12 @@
 All routes require authentication with role PATIENT or GUARDIAN.
 Cross-agency / unlinked visits return 404 (not 403) to avoid leaking
 visit existence to unrelated patients/guardians.
+
+The portal is read-only — the state-mutating actions live on the
+visits router:
+  - `POST /visits/{id}/sign` — patient/guardian signs (spec §8)
+  - `POST /visits/{id}/confirm-billing` — admin/staff only
+  - `PATCH /visits/{id}/transition` — admin/staff only
 """
 
 from __future__ import annotations
@@ -10,59 +16,58 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, status
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.logging import get_logger
-from src.modules.audit_logs import service as audit_logs_service
 from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
 )
-from src.modules.notifications import integrations as notif_integrations
 from src.modules.portal import service as portal_service
 from src.modules.portal.schemas import (
-    PortalDisputeRequest,
-    PortalReportIssueRequest,
-    PortalVerifyRequest,
     PortalVisitListItem,
     PortalVisitResponse,
 )
-from src.modules.visits.schemas import (
-    ServiceVerificationResponse,
-    VisitIssueResponse,
+from src.shared.utils.labels import (
+    duration_label,
+    patient_initials,
+    time_range_label,
+    visit_date_label,
 )
-from src.shared.domain.enums import AuditAction
 
 router = APIRouter(prefix="/portal/visits", tags=["portal"])
 log = get_logger(__name__)
 
 
 def _to_response(visit, *, with_relations: bool = False) -> PortalVisitResponse:
+    """Build a `PortalVisitResponse` from an eager-loaded Visit.
+
+    Mirrors the staff Visit Summary shape but trimmed for portal use:
+    patient-friendly caregiver name, joined display labels, the EVV
+    record (start + end), per-activity delivery status, notes, and the
+    (required) signature when filed.
+    """
     data: dict = {
         "id": visit.id,
         "appointment_id": visit.appointment_id,
         "agency_id": visit.agency_id,
         "staff_id": visit.staff_id,
         "status": visit.status,
-        "check_in_time": visit.check_in_time,
-        "check_in_lat": visit.check_in_lat,
-        "check_in_lng": visit.check_in_lng,
-        "check_in_accuracy_m": visit.check_in_accuracy_m,
-        "check_out_time": visit.check_out_time,
-        "check_out_lat": visit.check_out_lat,
-        "check_out_lng": visit.check_out_lng,
-        "duration_seconds": visit.duration_seconds,
+        "billing_confirmed_at": getattr(visit, "billing_confirmed_at", None),
         "created_at": visit.created_at,
         "updated_at": visit.updated_at,
+        "live_lat": getattr(visit, "live_lat", None),
+        "live_lng": getattr(visit, "live_lng", None),
+        "live_ping_at": getattr(visit, "live_ping_at", None),
+        "sharing_location": getattr(visit, "sharing_location", False),
     }
     # ----- Joined caregiver + patient info -----
     # `load_visit_with_relations` eager-loads `staff.user`,
-    # `appointment.patient.user`, and the nested children. Use the same
-    # try/except pattern as the existing code so a lazy-load miss
-    # (e.g. an unrelated code path calling this helper without the full
-    # eager load) doesn't blow up — it just renders the joined field
-    # as None.
+    # `appointment.patient.user`, and the nested children. Use the
+    # try/except pattern so a lazy-load miss (e.g. an unrelated code
+    # path calling this helper without the full eager load) doesn't
+    # blow up — it just renders the joined field as None.
     try:
         staff = visit.staff
         if staff is not None:
@@ -77,31 +82,47 @@ def _to_response(visit, *, with_relations: bool = False) -> PortalVisitResponse:
         appointment = visit.appointment
         if appointment is not None:
             data["location_label"] = getattr(appointment, "location", None)
+            data["scheduled_start"] = getattr(appointment, "scheduled_start", None)
+            data["scheduled_end"] = getattr(appointment, "scheduled_end", None)
             patient = getattr(appointment, "patient", None)
             if patient is not None:
                 data["patient_code"] = getattr(patient, "patient_code", None)
                 user = getattr(patient, "user", None)
                 if user is not None:
                     data["patient_name"] = getattr(user, "full_name", None)
+                    data["patient_initials"] = patient_initials(
+                        getattr(user, "full_name", None)
+                    )
     except Exception:
         pass
+    # ----- Derived display labels from EVV start/end + appointment window -----
+    evv = getattr(visit, "evv_record", None)
+    if evv is not None:
+        try:
+            start_time = getattr(evv, "start_time", None)
+            end_time = getattr(evv, "end_time", None)
+            if start_time is not None and end_time is not None:
+                secs = int((end_time - start_time).total_seconds())
+                data["duration_seconds"] = secs
+                data["duration_label"] = duration_label(secs)
+                data["time_range_label"] = time_range_label(start_time, end_time)
+                data["visit_date_label"] = visit_date_label(start_time)
+        except Exception:
+            pass
+
     if with_relations:
         try:
-            data["service_items"] = list(visit.service_items)
+            data["activities"] = list(visit.activity_deliveries)
         except Exception:
-            data["service_items"] = None
+            data["activities"] = None
         try:
             data["notes"] = list(visit.notes)
         except Exception:
             data["notes"] = None
         try:
-            data["verification"] = visit.verification
+            data["signature"] = visit.signature
         except Exception:
-            data["verification"] = None
-        try:
-            data["issues"] = list(visit.issues)
-        except Exception:
-            data["issues"] = None
+            data["signature"] = None
     return PortalVisitResponse.model_validate(data)
 
 
@@ -116,7 +137,34 @@ async def list_my_visits_endpoint(
     visits = await portal_service.list_my_visits(
         session, ctx=ctx, limit=limit, offset=offset
     )
-    return [PortalVisitListItem.model_validate(v) for v in visits]
+    out: list[PortalVisitListItem] = []
+    for v in visits:
+        appt = getattr(v, "appointment", None)
+        scheduled_start = getattr(appt, "scheduled_start", None) if appt else None
+        staff_name: str | None = None
+        try:
+            staff = getattr(v, "staff", None)
+            if staff is not None:
+                user = getattr(staff, "user", None)
+                if user is not None:
+                    staff_name = getattr(user, "full_name", None)
+        except Exception:
+            pass
+        out.append(
+            PortalVisitListItem.model_validate(
+                {
+                    "id": v.id,
+                    "appointment_id": v.appointment_id,
+                    "status": v.status,
+                    "scheduled_start": scheduled_start,
+                    "scheduled_end": getattr(appt, "scheduled_end", None) if appt else None,
+                    "duration_label": None,  # populated when EVV ends
+                    "staff_name": staff_name,
+                    "created_at": v.created_at,
+                }
+            )
+        )
+    return out
 
 
 @router.get("/{visit_id}", response_model=PortalVisitResponse)
@@ -125,7 +173,7 @@ async def get_my_visit_endpoint(
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> PortalVisitResponse:
-    """Single visit + nested service items / verification / issues."""
+    """Single visit + nested activities / notes / signature / EVV."""
     visit = await portal_service.load_visit_with_relations(
         session, visit_id=visit_id, ctx=ctx
     )
@@ -136,207 +184,6 @@ async def get_my_visit_endpoint(
         role=ctx.role.value,
     )
     return _to_response(visit, with_relations=True)
-
-
-@router.post(
-    "/{visit_id}/verify",
-    response_model=ServiceVerificationResponse,
-    status_code=status.HTTP_200_OK,
-)
-async def verify_visit_endpoint(
-    visit_id: uuid.UUID,
-    payload: PortalVerifyRequest,
-    request: Request,
-    background_tasks: BackgroundTasks,
-    ctx: CurrentAuth,
-    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
-) -> ServiceVerificationResponse:
-    """File a positive verification (idempotent)."""
-    verification = await portal_service.verify_visit(
-        session,
-        visit_id=visit_id,
-        ctx=ctx,
-        comment=payload.comment,
-    )
-    await session.commit()
-    await session.refresh(verification)
-    # Notify the assigned staff (best-effort). In-app row + PENDING
-    # delivery rows are inserted synchronously; provider network
-    # calls (SMTP/Twilio) run on BackgroundTasks so an unreachable
-    # SMTP server cannot block the response.
-    await notif_integrations.notify_verification_status(
-        background_tasks,
-        session,
-        actor_user_id=ctx.user_id,
-        actor_agency_id=verification.agency_id,
-        actor_role=ctx.role,
-        visit_id=visit_id,
-        agency_id=verification.agency_id,
-        verified=(verification.status.value == "VERIFIED"),
-    )
-    # Best-effort audit log (never break the write path).
-    try:
-        ip, ua = audit_logs_service.request_ip_ua(request)
-        await audit_logs_service.audit_log(
-            session,
-            agency_id=verification.agency_id,
-            actor_user_id=ctx.user_id,
-            action=AuditAction.SERVICE_VERIFIED,
-            entity_type="SERVICE_VERIFICATION",
-            entity_id=verification.id,
-            new_data={
-                "visit_id": str(visit_id),
-                "status": verification.status.value,
-                "comment": payload.comment,
-            },
-            ip_address=ip,
-            user_agent=ua,
-        )
-        await session.commit()
-    except Exception:
-        pass
-    log.info(
-        "portal.verification.filed",
-        visit_id=str(visit_id),
-        actor_user_id=str(ctx.user_id),
-        status=verification.status.value,
-    )
-    return ServiceVerificationResponse.model_validate(verification)
-
-
-@router.post(
-    "/{visit_id}/dispute",
-    response_model=ServiceVerificationResponse,
-    status_code=status.HTTP_200_OK,
-)
-async def dispute_visit_endpoint(
-    visit_id: uuid.UUID,
-    payload: PortalDisputeRequest,
-    request: Request,
-    background_tasks: BackgroundTasks,
-    ctx: CurrentAuth,
-    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
-) -> ServiceVerificationResponse:
-    """File a dispute (idempotent)."""
-    verification = await portal_service.dispute_visit(
-        session,
-        visit_id=visit_id,
-        ctx=ctx,
-        dispute_reason_code=payload.dispute_reason_code,
-        comment=payload.comment,
-    )
-    await session.commit()
-    await session.refresh(verification)
-    # Notify the assigned staff (best-effort). In-app row + PENDING
-    # delivery rows are inserted synchronously; provider network
-    # calls (SMTP/Twilio) run on BackgroundTasks so an unreachable
-    # SMTP server cannot block the response.
-    await notif_integrations.notify_verification_status(
-        background_tasks,
-        session,
-        actor_user_id=ctx.user_id,
-        actor_agency_id=verification.agency_id,
-        actor_role=ctx.role,
-        visit_id=visit_id,
-        agency_id=verification.agency_id,
-        verified=False,
-    )
-    # Best-effort audit log (never break the write path).
-    try:
-        ip, ua = audit_logs_service.request_ip_ua(request)
-        await audit_logs_service.audit_log(
-            session,
-            agency_id=verification.agency_id,
-            actor_user_id=ctx.user_id,
-            action=AuditAction.SERVICE_DISPUTED,
-            entity_type="SERVICE_VERIFICATION",
-            entity_id=verification.id,
-            new_data={
-                "visit_id": str(visit_id),
-                "status": verification.status.value,
-                "dispute_reason_code": payload.dispute_reason_code,
-                "comment": payload.comment,
-            },
-            ip_address=ip,
-            user_agent=ua,
-        )
-        await session.commit()
-    except Exception:
-        pass
-    log.info(
-        "portal.verification.disputed",
-        visit_id=str(visit_id),
-        actor_user_id=str(ctx.user_id),
-        reason=payload.dispute_reason_code,
-    )
-    return ServiceVerificationResponse.model_validate(verification)
-
-
-@router.post(
-    "/{visit_id}/report-issue",
-    response_model=VisitIssueResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-async def report_issue_endpoint(
-    visit_id: uuid.UUID,
-    payload: PortalReportIssueRequest,
-    request: Request,
-    background_tasks: BackgroundTasks,
-    ctx: CurrentAuth,
-    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
-) -> VisitIssueResponse:
-    """File a non-blocking issue against the visit."""
-    issue = await portal_service.report_issue(
-        session,
-        visit_id=visit_id,
-        ctx=ctx,
-        issue_type=payload.issue_type,
-        comment=payload.comment,
-    )
-    await session.commit()
-    await session.refresh(issue)
-    # Notify the assigned staff (best-effort). In-app row + PENDING
-    # delivery rows are inserted synchronously; provider network
-    # calls (SMTP/Twilio) run on BackgroundTasks so an unreachable
-    # SMTP server cannot block the response.
-    await notif_integrations.notify_visit_issue_filed(
-        background_tasks,
-        session,
-        actor_user_id=ctx.user_id,
-        actor_agency_id=issue.agency_id,
-        actor_role=ctx.role,
-        visit_id=visit_id,
-        agency_id=issue.agency_id,
-        issue_type=issue.issue_type,
-    )
-    # Best-effort audit log (never break the write path).
-    try:
-        ip, ua = audit_logs_service.request_ip_ua(request)
-        await audit_logs_service.audit_log(
-            session,
-            agency_id=issue.agency_id,
-            actor_user_id=ctx.user_id,
-            action=AuditAction.CREATE,
-            entity_type="VISIT_ISSUE",
-            entity_id=issue.id,
-            new_data={
-                "visit_id": str(visit_id),
-                "issue_type": payload.issue_type,
-                "comment": payload.comment,
-            },
-            ip_address=ip,
-            user_agent=ua,
-        )
-        await session.commit()
-    except Exception:
-        pass
-    log.info(
-        "portal.issue.filed",
-        visit_id=str(visit_id),
-        actor_user_id=str(ctx.user_id),
-        issue_type=payload.issue_type,
-    )
-    return VisitIssueResponse.model_validate(issue)
 
 
 __all__ = ["router"]

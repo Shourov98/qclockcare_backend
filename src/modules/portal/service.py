@@ -1,17 +1,20 @@
 """Patient/Guardian portal service — verifies a caller is linked to a visit
 before delegating to the visits module.
 
-Every function in this module:
+The portal is a read-only surface. Every function here:
   1. Resolves the caller's `user_id` to either a PatientProfile or a
      GuardianProfile within `ctx.agency_id`.
   2. For GUARDIAN callers, requires an active `is_legal=true` relationship
      to the visit's patient (valid_until NULL or >= today).
   3. Verifies the resolved patient matches `visit.appointment.patient_id`.
-  4. Delegates the actual read/write to the visits module.
+  4. Delegates the actual read to the visits module.
 
 The relationship check is intentionally re-implemented at the service
 layer (not just RLS) so we can return a 403 with a clear error code
 ("not linked", "relationship expired") rather than a generic RLS 404.
+
+The spec's signature flow (`POST /visits/{id}/sign`) lives on the
+visits router — the portal doesn't expose its own /sign endpoint.
 """
 
 from __future__ import annotations
@@ -31,17 +34,7 @@ from src.modules.patients.models import (
     PatientProfile,
 )
 from src.modules.visits import service as visits_service
-from src.modules.visits.models import ServiceVerification, Visit, VisitIssue
-from src.modules.visits.schemas import (
-    DisputeReasonCode as _DisputeReasonCode,
-)
-from src.modules.visits.schemas import (
-    ServiceVerificationCreateRequest,
-    VisitIssueCreateRequest,
-)
-from src.modules.visits.schemas import (
-    VerificationStatus as _VerificationStatus,
-)
+from src.modules.visits.models import Visit
 from src.shared.domain.enums import UserRole
 
 
@@ -226,20 +219,10 @@ async def load_visit_with_relations(
     """Load a visit (after authz check) with its nested children + joined
     caregiver / patient info eager-loaded.
 
-    Eager-loads:
-      - `visit.staff.user` so `_to_response` can populate `staff_name`,
-        `staff_phone`, and `staff_code`.
-      - `visit.appointment.patient.user` so `_to_response` can populate
-        `patient_name`, `patient_code`, and the parent appointment's
-        free-text `location`.
-      - `visit.service_items`, `visit.notes`, `visit.verification`,
-        `visit.issues` so the nested arrays render without N+1 queries.
-
-    We re-issue a fresh SELECT with chained `selectinload`s rather than
-    calling `session.refresh(visit, ["staff", ...])` because chained
-    relationships (`staff.user`, `appointment.patient.user`) need a
-    query-level join to be batched correctly — `refresh` only handles
-    single-level attributes.
+    Eager-loads mirror the staff-side `get_visit` shape so the portal can
+    render the same Visit Summary card. Per spec §8 the signature row is
+    the source-of-truth for "did the patient sign"; per spec §10 the
+    EVV start + end records live on the `evv_records` sibling table.
     """
     visit = await _load_visit_for_caller(
         session, visit_id=visit_id, ctx=ctx
@@ -248,16 +231,19 @@ async def load_visit_with_relations(
     from src.modules.appointments.models import Appointment
     from src.modules.patients.models import PatientProfile
     from src.modules.staff.models import StaffProfile
+    from src.modules.visits.models import VisitActivityDelivery
 
     reloaded = (
         await session.execute(
             select(Visit)
             .where(Visit.id == visit.id)
             .options(
-                selectinload(Visit.service_items),
+                selectinload(Visit.activity_deliveries).selectinload(
+                    VisitActivityDelivery.activity
+                ),
                 selectinload(Visit.notes),
-                selectinload(Visit.verification),
-                selectinload(Visit.issues),
+                selectinload(Visit.signature),
+                selectinload(Visit.evv_record),
                 # Caregiver: Visit.staff -> StaffProfile.user
                 selectinload(Visit.staff).selectinload(StaffProfile.user),
                 # Patient + location: Visit.appointment -> Appointment
@@ -272,7 +258,7 @@ async def load_visit_with_relations(
 
 
 # --------------------------------------------------------------------------
-# List / get
+# List
 # --------------------------------------------------------------------------
 async def list_my_visits(
     session: AsyncSession,
@@ -300,7 +286,7 @@ async def list_my_visits(
             page_size=limit,
         )
         return list(rows)
-    # Multiple patients — fetch each, sort merged result by check_in_time desc.
+    # Multiple patients — fetch each, sort merged result by visit date desc.
     all_rows: list[Visit] = []
     for pid in patient_ids:
         rows, _ = await visits_service.list_visits(
@@ -311,9 +297,13 @@ async def list_my_visits(
             page_size=limit,
         )
         all_rows.extend(rows)
-    # Sort newest first (use check_in_time desc, then id desc for stability).
+    # Sort newest first (use appointment.scheduled_start desc, then id).
     all_rows.sort(
-        key=lambda v: (v.check_in_time or v.created_at, v.id),
+        key=lambda v: (
+            getattr(getattr(v, "appointment", None), "scheduled_start", None)
+            or v.created_at,
+            v.id,
+        ),
         reverse=True,
     )
     # Apply offset/limit in Python — acceptable for the portal's expected
@@ -321,94 +311,7 @@ async def list_my_visits(
     return all_rows[offset : offset + limit]
 
 
-# --------------------------------------------------------------------------
-# Verify / dispute / report-issue
-# --------------------------------------------------------------------------
-async def verify_visit(
-    session: AsyncSession,
-    *,
-    visit_id: uuid.UUID,
-    ctx: AuthContext,
-    comment: str | None,
-) -> ServiceVerification:
-    """File a positive verification (idempotent — updates an existing row)."""
-    visit = await _load_visit_for_caller(
-        session, visit_id=visit_id, ctx=ctx
-    )
-    payload = ServiceVerificationCreateRequest(
-        status=_VerificationStatus.VERIFIED,
-        dispute_reason_code=None,
-        comment=comment,
-    )
-    return await visits_service.get_or_create_verification(
-        session,
-        visit_id=visit.id,
-        agency_id=visit.agency_id,
-        verified_by=ctx.user_id,
-        verifier_role=ctx.role,
-        payload=payload,
-    )
-
-
-async def dispute_visit(
-    session: AsyncSession,
-    *,
-    visit_id: uuid.UUID,
-    ctx: AuthContext,
-    dispute_reason_code: str,
-    comment: str | None,
-) -> ServiceVerification:
-    """File a dispute (idempotent — updates an existing row)."""
-    try:
-        reason = _DisputeReasonCode(dispute_reason_code)
-    except ValueError as exc:
-        raise NotFoundError(
-            "Unknown dispute reason code.",
-            details={"code": dispute_reason_code},
-        ) from exc
-    visit = await _load_visit_for_caller(
-        session, visit_id=visit_id, ctx=ctx
-    )
-    payload = ServiceVerificationCreateRequest(
-        status=_VerificationStatus.DISPUTED,
-        dispute_reason_code=reason,
-        comment=comment,
-    )
-    return await visits_service.get_or_create_verification(
-        session,
-        visit_id=visit.id,
-        agency_id=visit.agency_id,
-        verified_by=ctx.user_id,
-        verifier_role=ctx.role,
-        payload=payload,
-    )
-
-
-async def report_issue(
-    session: AsyncSession,
-    *,
-    visit_id: uuid.UUID,
-    ctx: AuthContext,
-    issue_type: str,
-    comment: str,
-) -> VisitIssue:
-    visit = await _load_visit_for_caller(
-        session, visit_id=visit_id, ctx=ctx
-    )
-    payload = VisitIssueCreateRequest(issue_type=issue_type, comment=comment)
-    return await visits_service.add_visit_issue(
-        session,
-        visit_id=visit.id,
-        agency_id=visit.agency_id,
-        payload=payload,
-        reported_by_user_id=ctx.user_id,
-    )
-
-
 __all__ = [
-    "dispute_visit",
     "list_my_visits",
     "load_visit_with_relations",
-    "report_issue",
-    "verify_visit",
 ]

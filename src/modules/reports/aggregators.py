@@ -26,14 +26,14 @@ from collections.abc import Mapping
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.modules.appointments.models import Appointment
 from src.modules.audit_logs.models import AuditLog
 from src.modules.patients.models import PatientProfile
 from src.modules.staff.models import StaffProfile, StaffQualification
-from src.modules.visits.models import ServiceVerification, Visit
+from src.modules.visits.models import AppointmentSignature, EVVRecord, Visit
 
 
 # --------------------------------------------------------------------------
@@ -80,11 +80,29 @@ def _resolve_date_range(params: Mapping[str, Any]) -> tuple[datetime, datetime]:
     return start, end
 
 
-def _hours_billed(duration_seconds: int | None) -> float:
-    """Convert a visit's duration_seconds to decimal hours, rounded to 0.25h."""
-    if duration_seconds is None or duration_seconds <= 0:
+def _hours_billed(seconds: int | None) -> float:
+    """Convert an EVV-derived duration in seconds to decimal hours.
+
+    Returns 0.0 for non-positive values (e.g. an in-flight visit with
+    no `end_time` yet). Rounded to 0.01h for the canonical billing math.
+    """
+    if seconds is None or seconds <= 0:
         return 0.0
-    return round(duration_seconds / 3600.0, 2)
+    return round(seconds / 3600.0, 2)
+
+
+def _evv_duration_seconds(
+    end_time: datetime | None, start_time: datetime | None
+) -> int | None:
+    """Compute the visit duration in whole seconds from EVV start + end.
+
+    Returns None when either boundary is missing (visit still in flight).
+    The reports use this to derive the `duration_seconds` metric that
+    used to live on `visits` before the EVV split.
+    """
+    if end_time is None or start_time is None:
+        return None
+    return int((end_time - start_time).total_seconds())
 
 
 # --------------------------------------------------------------------------
@@ -98,21 +116,31 @@ async def aggregate_visit_summary(
 ) -> dict[str, Any]:
     """Counts and hours-billed for visits inside the date window.
 
-    Drives the "Visit Summary Report" card. Reads from `visits` only —
-    appointments are upstream, but the visit row is what actually
-    happened (and what gets billed).
+    Drives the "Visit Summary Report" card. Joins `visits` with the
+    sibling `evv_records` table to get start + end times (per spec §10,
+    EVV is now its own table) and `appointment_signatures` to count
+    how many visits in the window have been signed off.
     """
     start, end = _resolve_date_range(params)
 
     base = (
         select(
             func.count(Visit.id).label("total"),
-            func.count(Visit.check_out_time).label("completed"),
-            func.coalesce(func.sum(Visit.duration_seconds), 0).label("total_seconds"),
+            func.count(EVVRecord.end_time).label("completed"),
+            func.coalesce(
+                func.sum(
+                    func.extract(
+                        "epoch",
+                        EVVRecord.end_time - EVVRecord.start_time,
+                    )
+                ),
+                0,
+            ).label("total_seconds"),
         )
+        .join(EVVRecord, EVVRecord.visit_id == Visit.id, isouter=True)
         .where(Visit.agency_id == agency_id)
-        .where(Visit.check_in_time >= start)
-        .where(Visit.check_in_time < end)
+        .where(EVVRecord.start_time >= start)
+        .where(EVVRecord.start_time < end)
     )
 
     total_row = (await session.execute(base)).one()
@@ -124,24 +152,27 @@ async def aggregate_visit_summary(
     status_rows = (
         await session.execute(
             select(Visit.status, func.count(Visit.id))
+            .join(EVVRecord, EVVRecord.visit_id == Visit.id, isouter=True)
             .where(Visit.agency_id == agency_id)
-            .where(Visit.check_in_time >= start)
-            .where(Visit.check_in_time < end)
+            .where(EVVRecord.start_time >= start)
+            .where(EVVRecord.start_time < end)
             .group_by(Visit.status)
         )
     ).all()
     by_status: dict[str, int] = {str(status): count for status, count in status_rows}
 
-    # Disputed verifications — count + sample IDs (capped) for Claude to call out.
-    disputed_q = (
-        select(func.count(ServiceVerification.id))
-        .join(Visit, Visit.id == ServiceVerification.visit_id)
-        .where(ServiceVerification.agency_id == agency_id)
-        .where(ServiceVerification.status == "DISPUTED")
-        .where(ServiceVerification.created_at >= start)
-        .where(ServiceVerification.created_at < end)
+    # Signed-off visits — count + sample IDs (capped) for Claude to call out.
+    # `appointment_signatures` is the spec §8 replacement for the legacy
+    # `ServiceVerification.status == DISPUTED` metric.
+    signed_q = (
+        select(func.count(AppointmentSignature.id))
+        .join(Visit, Visit.id == AppointmentSignature.visit_id)
+        .join(EVVRecord, EVVRecord.visit_id == Visit.id, isouter=True)
+        .where(AppointmentSignature.agency_id == agency_id)
+        .where(AppointmentSignature.signed_at >= start)
+        .where(AppointmentSignature.signed_at < end)
     )
-    disputed_count = int((await session.execute(disputed_q)).scalar() or 0)
+    signed_count = int((await session.execute(signed_q)).scalar() or 0)
 
     return {
         "_data_availability": "full",
@@ -156,7 +187,7 @@ async def aggregate_visit_summary(
             "hours_billed": hours_billed,
         },
         "by_status": by_status,
-        "disputed_verifications": disputed_count,
+        "signed_off_visits": signed_count,
     }
 
 
@@ -188,7 +219,7 @@ async def aggregate_billing(
         "available_metrics": {
             "completed_visits_in_window": summary["totals"]["completed_visits"],
             "hours_billed_in_window": summary["totals"]["hours_billed"],
-            "disputed_verifications_in_window": summary["disputed_verifications"],
+            "signed_off_visits_in_window": summary["signed_off_visits"],
         },
         "window": summary["window"],
         "narrative_hint": (
@@ -277,24 +308,37 @@ async def aggregate_client(
     """
     start, end = _resolve_date_range(params)
 
+    # Duration is now derived from `evv_records.end_time - start_time`
+    # (per spec §10) rather than the dropped `Visit.duration_seconds`.
     rows = (
         await session.execute(
             select(
                 PatientProfile.id,
                 PatientProfile.patient_code,
                 func.count(Visit.id).label("visit_count"),
-                func.coalesce(func.sum(Visit.duration_seconds), 0).label("total_seconds"),
+                func.coalesce(
+                    func.sum(
+                        func.extract(
+                            "epoch",
+                            EVVRecord.end_time - EVVRecord.start_time,
+                        )
+                    ),
+                    0,
+                ).label("total_seconds"),
             )
             .select_from(PatientProfile)
-            .outerjoin(
-                Visit,
-                and_(
-                    Visit.patient_id == PatientProfile.id,
-                    Visit.check_in_time >= start,
-                    Visit.check_in_time < end,
-                ),
-            )
+            .outerjoin(Visit, Visit.patient_id == PatientProfile.id)
+            .outerjoin(EVVRecord, EVVRecord.visit_id == Visit.id)
             .where(PatientProfile.agency_id == agency_id)
+            .where(
+                or_(
+                    EVVRecord.start_time.is_(None),
+                    and_(
+                        EVVRecord.start_time >= start,
+                        EVVRecord.start_time < end,
+                    ),
+                )
+            )
             .group_by(PatientProfile.id, PatientProfile.patient_code)
             .order_by(func.count(Visit.id).desc())
             .limit(50)
@@ -336,24 +380,37 @@ async def aggregate_staff(
     """Hours worked + visit count + active credential count per caregiver."""
     start, end = _resolve_date_range(params)
 
+    # Duration is now derived from `evv_records.end_time - start_time`
+    # rather than the dropped `Visit.duration_seconds` column.
     rows = (
         await session.execute(
             select(
                 StaffProfile.id,
                 StaffProfile.staff_code,
                 func.count(Visit.id).label("visit_count"),
-                func.coalesce(func.sum(Visit.duration_seconds), 0).label("total_seconds"),
+                func.coalesce(
+                    func.sum(
+                        func.extract(
+                            "epoch",
+                            EVVRecord.end_time - EVVRecord.start_time,
+                        )
+                    ),
+                    0,
+                ).label("total_seconds"),
             )
             .select_from(StaffProfile)
-            .outerjoin(
-                Visit,
-                and_(
-                    Visit.staff_id == StaffProfile.id,
-                    Visit.check_in_time >= start,
-                    Visit.check_in_time < end,
-                ),
-            )
+            .outerjoin(Visit, Visit.staff_id == StaffProfile.id)
+            .outerjoin(EVVRecord, EVVRecord.visit_id == Visit.id)
             .where(StaffProfile.agency_id == agency_id)
+            .where(
+                or_(
+                    EVVRecord.start_time.is_(None),
+                    and_(
+                        EVVRecord.start_time >= start,
+                        EVVRecord.start_time < end,
+                    ),
+                )
+            )
             .group_by(StaffProfile.id, StaffProfile.staff_code)
             .order_by(func.count(Visit.id).desc())
             .limit(100)
@@ -407,23 +464,31 @@ async def aggregate_evv(
 ) -> dict[str, Any]:
     """Electronic Visit Verification snapshot.
 
-    We don't have a separate EVV table — all of the data lives on
-    `visits` (check-in coordinates, duration). The "manual override"
-    detector is `check_in_lat IS NULL` — when the staff checked in
-    without GPS verification (offline clock-in or location services
-    denied).
+    Per spec §10, EVV data now lives in the `evv_records` table (1:1
+    with each visit). The "manual override" detector is
+    `evv_records.start_lat IS NULL` — when the staff clocked in without
+    GPS verification (offline clock-in or location services denied).
+    Duration is derived from `end_time - start_time`.
     """
     start, end = _resolve_date_range(params)
 
     base = (
         select(
-            func.count(Visit.id).label("total"),
-            func.count(Visit.check_in_lat).label("with_gps"),
-            func.coalesce(func.sum(Visit.duration_seconds), 0).label("total_seconds"),
+            func.count(EVVRecord.id).label("total"),
+            func.count(EVVRecord.start_lat).label("with_gps"),
+            func.coalesce(
+                func.sum(
+                    func.extract(
+                        "epoch",
+                        EVVRecord.end_time - EVVRecord.start_time,
+                    )
+                ),
+                0,
+            ).label("total_seconds"),
         )
-        .where(Visit.agency_id == agency_id)
-        .where(Visit.check_in_time >= start)
-        .where(Visit.check_in_time < end)
+        .where(EVVRecord.agency_id == agency_id)
+        .where(EVVRecord.start_time >= start)
+        .where(EVVRecord.start_time < end)
     )
     row = (await session.execute(base)).one()
     total = int(row.total or 0)
@@ -432,23 +497,29 @@ async def aggregate_evv(
 
     # Manual overrides — clock-ins without a GPS fix.
     manual_q = (
-        select(func.count(Visit.id))
-        .where(Visit.agency_id == agency_id)
-        .where(Visit.check_in_time >= start)
-        .where(Visit.check_in_time < end)
-        .where(Visit.check_in_lat.is_(None))
+        select(func.count(EVVRecord.id))
+        .where(EVVRecord.agency_id == agency_id)
+        .where(EVVRecord.start_time >= start)
+        .where(EVVRecord.start_time < end)
+        .where(EVVRecord.start_lat.is_(None))
     )
     manual_overrides = int((await session.execute(manual_q)).scalar() or 0)
 
-    # Missed clock-ins — appointments with `checked_in_at IS NULL` after
-    # their scheduled_end. This is the "no-show + late cancel" signal.
+    # Missed clock-ins — appointments in the window that have NO matching
+    # visit (the caregiver never clocked in). `Appointment.checked_in_at`
+    # was dropped during the EVV split, so "no visit row" is the new
+    # canonical signal.
     missed_q = (
         select(func.count(Appointment.id))
         .where(Appointment.agency_id == agency_id)
         .where(Appointment.scheduled_start >= start)
         .where(Appointment.scheduled_start < end)
-        .where(Appointment.checked_in_at.is_(None))
-        .where(Appointment.status.notin_(["CANCELLED"]))
+        .where(
+            ~select(Visit.id)
+            .where(Visit.appointment_id == Appointment.id)
+            .exists()
+        )
+        .where(Appointment.status.notin_(["CANCELLED", "MISSED"]))
     )
     missed_clock_ins = int((await session.execute(missed_q)).scalar() or 0)
 
@@ -536,13 +607,23 @@ async def aggregate_audit_readiness(
     # Outstanding compliance gaps — staff with zero ACTIVE credentials
     # who completed at least one visit in the window. This is a hard
     # "uh-oh" signal: they were working but not credentialed.
+    # `Visit.check_in_time` was dropped during the EVV split — use
+    # `EVVRecord.start_time` instead via outer join.
     uncred_q = (
         select(func.count(func.distinct(StaffProfile.id)))
         .select_from(StaffProfile)
         .join(Visit, Visit.staff_id == StaffProfile.id)
+        .join(EVVRecord, EVVRecord.visit_id == Visit.id, isouter=True)
         .where(StaffProfile.agency_id == agency_id)
-        .where(Visit.check_in_time >= start)
-        .where(Visit.check_in_time < end)
+        .where(
+            or_(
+                EVVRecord.start_time.is_(None),
+                and_(
+                    EVVRecord.start_time >= start,
+                    EVVRecord.start_time < end,
+                ),
+            )
+        )
         .where(
             ~select(StaffQualification.id)
             .where(StaffQualification.staff_id == StaffProfile.id)
