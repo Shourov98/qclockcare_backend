@@ -58,6 +58,7 @@ def _auth(role: UserRole, user_id=None, agency_id=None):
         user=CurrentUser.model_construct(),
         role=role,
         agency_id=agency_id or uuid.uuid4(),
+        scopes=(),
         raw_token="x",
     )
 

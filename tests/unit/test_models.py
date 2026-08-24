@@ -14,8 +14,6 @@ def test_enums_load() -> None:
         AppointmentStatus,
         AuditAction,
         AuthAuditEventType,
-        ConfirmationStatus,
-        DisputeReasonCode,
         NotificationChannel,
         NotificationStatus,
         NotificationType,
@@ -27,7 +25,6 @@ def test_enums_load() -> None:
         ServiceType,
         UserRole,
         UserStatus,
-        VerificationStatus,
         VisitStatus,
     )
 
@@ -38,8 +35,6 @@ def test_enums_load() -> None:
         AppointmentStatus,
         AuditAction,
         AuthAuditEventType,
-        ConfirmationStatus,
-        DisputeReasonCode,
         NotificationChannel,
         NotificationStatus,
         NotificationType,
@@ -51,7 +46,6 @@ def test_enums_load() -> None:
         ServiceType,
         UserRole,
         UserStatus,
-        VerificationStatus,
         VisitStatus,
     ):
         assert len(list(cls)) > 0, f"{cls.__name__} is empty"
@@ -65,8 +59,6 @@ def test_enum_mapping_complete() -> None:
         AppointmentStatus,
         AuditAction,
         AuthAuditEventType,
-        ConfirmationStatus,
-        DisputeReasonCode,
         NotificationChannel,
         NotificationStatus,
         NotificationType,
@@ -78,7 +70,6 @@ def test_enum_mapping_complete() -> None:
         ServiceType,
         UserRole,
         UserStatus,
-        VerificationStatus,
         VisitStatus,
     )
 
@@ -88,8 +79,6 @@ def test_enum_mapping_complete() -> None:
         AppointmentStatus,
         AuditAction,
         AuthAuditEventType,
-        ConfirmationStatus,
-        DisputeReasonCode,
         NotificationChannel,
         NotificationStatus,
         NotificationType,
@@ -101,7 +90,6 @@ def test_enum_mapping_complete() -> None:
         ServiceType,
         UserRole,
         UserStatus,
-        VerificationStatus,
         VisitStatus,
     ):
         # Every enum has a Postgres name mapping

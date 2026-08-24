@@ -87,10 +87,13 @@ class TestAuditActionRead:
         from src.shared.domain.enums import AuditAction
 
         members = list(AuditAction)
-        # 20 pre-existing members + 1 new READ = 21.
-        assert len(members) == 21, (
-            f"expected 21 AuditAction members (20 existing + READ), "
-            f"got {len(members)}: {[m.name for m in members]}"
+        # Migration 0027 added VISIT_* / APPOINTMENT_MARKED_READY /
+        # BILLING_CONFIRMED / ACTIVITY_MARKED_* audit actions for the
+        # new 5-state lifecycle. Pre-migration count was 21 (20 + READ).
+        assert len(members) == 23, (
+            f"expected 23 AuditAction members (21 pre-migration + 2 "
+            f"new from migration 0027), got {len(members)}: "
+            f"{[m.name for m in members]}"
         )
 
 

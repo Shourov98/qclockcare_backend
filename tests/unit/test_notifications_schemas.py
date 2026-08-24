@@ -65,8 +65,8 @@ class TestNotificationResponse:
         orm.id = uuid.uuid4()
         orm.agency_id = uuid.uuid4()
         orm.recipient_user_id = uuid.uuid4()
-        orm.type = NotificationType.SERVICE_VERIFIED
-        orm.title = "Verified"
+        orm.type = NotificationType.VISIT_SIGNED
+        orm.title = "Visit signed"
         orm.body = "All good"
         orm.status = NotificationStatus.SENT
         orm.metadata_ = {"k": "v"}

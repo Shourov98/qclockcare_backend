@@ -1,116 +1,105 @@
-"""Unit tests for /portal/visits/* request schemas."""
+"""Unit tests for /portal/visits/* response schemas.
+
+The portal is read-only — all state-mutating actions live on the
+visits router (sign, confirm-billing). So the only schemas the
+portal exposes are response shapes:
+  - `PortalVisitListItem` — list endpoint
+  - `PortalVisitResponse`  — single-visit detail
+
+Per migration 0027 / spec alignment:
+  - `service_items` field renamed to `activities`
+  - `verification` field replaced by `signature` (AppointmentSignature)
+  - `issues` field removed
+  - New joined display fields (staff_name, patient_initials, etc.)
+"""
 
 from __future__ import annotations
 
 import uuid
 
-import pytest
-from pydantic import ValidationError
-
-from src.modules.portal.schemas import (
-    PortalDisputeRequest,
-    PortalReportIssueRequest,
-    PortalVerifyRequest,
-)
-
-
-# --------------------------------------------------------------------------
-# PortalVerifyRequest
-# --------------------------------------------------------------------------
-class TestPortalVerifyRequest:
-    def test_minimal_ok(self) -> None:
-        v = PortalVerifyRequest()
-        assert v.comment is None
-
-    def test_with_comment_ok(self) -> None:
-        v = PortalVerifyRequest(comment="thanks!")
-        assert v.comment == "thanks!"
-
-    def test_extra_field_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            PortalVerifyRequest(status="VERIFIED")  # type: ignore[call-arg]
-
-
-# --------------------------------------------------------------------------
-# PortalDisputeRequest
-# --------------------------------------------------------------------------
-class TestPortalDisputeRequest:
-    def test_minimal_ok(self) -> None:
-        v = PortalDisputeRequest(dispute_reason_code="SERVICE_NOT_RECEIVED")
-        assert v.dispute_reason_code == "SERVICE_NOT_RECEIVED"
-        assert v.comment is None
-
-    def test_missing_reason_code_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            PortalDisputeRequest()  # type: ignore[call-arg]
-
-    def test_extra_field_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            PortalDisputeRequest(dispute_reason_code="X", status="DISPUTED")  # type: ignore[call-arg]
-
-
-# --------------------------------------------------------------------------
-# PortalReportIssueRequest
-# --------------------------------------------------------------------------
-class TestPortalReportIssueRequest:
-    def test_minimal_ok(self) -> None:
-        v = PortalReportIssueRequest(
-            issue_type="noise_complaint",
-            comment="Too loud.",
-        )
-        assert v.issue_type == "noise_complaint"
-        assert v.comment == "Too loud."
-
-    def test_empty_issue_type_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            PortalReportIssueRequest(issue_type="", comment="hello")
-
-    def test_empty_comment_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            PortalReportIssueRequest(issue_type="noise", comment="")
-
-    def test_overlong_issue_type_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            PortalReportIssueRequest(
-                issue_type="x" * 300,
-                comment="ok",
-            )
-
-    def test_overlong_comment_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            PortalReportIssueRequest(
-                issue_type="noise",
-                comment="x" * 5000,
-            )
-
-    def test_extra_field_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            PortalReportIssueRequest(
-                issue_type="noise",
-                comment="ok",
-                severity="high",  # type: ignore[call-arg]
-            )
+from src.modules.portal import schemas
 
 
 # --------------------------------------------------------------------------
 # Module surface
 # --------------------------------------------------------------------------
 def test_module_exports() -> None:
-    """PortalVisitListItem etc. exist (response schemas — light coverage)."""
-    from src.modules.portal import schemas
-
+    """`PortalVisitListItem` + `PortalVisitResponse` exist."""
     assert hasattr(schemas, "PortalVisitListItem")
     assert hasattr(schemas, "PortalVisitResponse")
-    # Just ensure they instantiate the bare shape.
-    item = schemas.PortalVisitListItem.model_validate(
-        {
-            "id": str(uuid.uuid4()),
-            "appointment_id": str(uuid.uuid4()),
-            "status": "CHECKED_IN",
-            "check_in_time": None,
-            "check_out_time": None,
-            "duration_seconds": None,
-            "created_at": "2026-06-27T10:00:00Z",
-        }
-    )
-    assert item.status == "CHECKED_IN"
+
+
+# --------------------------------------------------------------------------
+# PortalVisitListItem
+# --------------------------------------------------------------------------
+class TestPortalVisitListItem:
+    def test_minimal_instantiation(self) -> None:
+        item = schemas.PortalVisitListItem.model_validate(
+            {
+                "id": str(uuid.uuid4()),
+                "appointment_id": str(uuid.uuid4()),
+                "status": "IN_PROGRESS",
+                "scheduled_start": "2026-06-27T09:00:00Z",
+                "scheduled_end": "2026-06-27T11:00:00Z",
+                "duration_label": None,
+                "staff_name": "John Smith",
+                "created_at": "2026-06-27T08:30:00Z",
+            }
+        )
+        assert item.status == "IN_PROGRESS"
+        assert item.staff_name == "John Smith"
+        assert item.duration_label is None
+
+    def test_extra_fields_ignored(self) -> None:
+        # `from_attributes=True` + extras=ignore default — Pydantic v2
+        # drops unknown fields silently.
+        item = schemas.PortalVisitListItem.model_validate(
+            {
+                "id": str(uuid.uuid4()),
+                "appointment_id": str(uuid.uuid4()),
+                "status": "SCHEDULED",
+                "scheduled_start": "2026-06-27T09:00:00Z",
+                "scheduled_end": "2026-06-27T11:00:00Z",
+                "duration_label": None,
+                "staff_name": None,
+                "created_at": "2026-06-27T08:30:00Z",
+                "extra_field": "should be ignored",
+            }
+        )
+        assert item.status == "SCHEDULED"
+
+
+# --------------------------------------------------------------------------
+# PortalVisitResponse
+# --------------------------------------------------------------------------
+class TestPortalVisitResponse:
+    def test_minimal_instantiation(self) -> None:
+        resp = schemas.PortalVisitResponse.model_validate(
+            {
+                "id": str(uuid.uuid4()),
+                "appointment_id": str(uuid.uuid4()),
+                "agency_id": str(uuid.uuid4()),
+                "staff_id": str(uuid.uuid4()),
+                "status": "IN_PROGRESS",
+                "billing_confirmed_at": None,
+                "created_at": "2026-06-27T08:30:00Z",
+                "updated_at": "2026-06-27T11:30:00Z",
+            }
+        )
+        assert resp.status == "IN_PROGRESS"
+        assert resp.billing_confirmed_at is None
+        # New joined display fields default to None when not populated.
+        assert resp.staff_name is None
+        assert resp.patient_name is None
+        assert resp.patient_initials is None
+        assert resp.duration_label is None
+        assert resp.time_range_label is None
+        assert resp.visit_date_label is None
+        assert resp.activities is None
+        assert resp.notes is None
+        assert resp.signature is None
+        # Live GPS / sharing flag — defaults
+        assert resp.live_lat is None
+        assert resp.live_lng is None
+        assert resp.live_ping_at is None
+        assert resp.sharing_location is False

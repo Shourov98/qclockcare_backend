@@ -1,7 +1,13 @@
-"""Unit tests for appointments + service items Pydantic schemas.
+"""Unit tests for appointments + activity Pydantic schemas.
 
 Pure-Pydantic: no DB, no app. Validates field-level constraints and the
 custom model_validators (window ordering, planned_minutes range, etc.).
+
+Per migration 0027 / spec alignment:
+  - `service_items` -> `activities`
+  - `AppointmentServiceItem` -> `AppointmentActivity`
+  - `service_type` enum -> free-text `name`
+  - `confirmation_status` removed (replaced by the signature flow)
 """
 
 from __future__ import annotations
@@ -13,20 +19,14 @@ import pytest
 from pydantic import ValidationError
 
 from src.modules.appointments.schemas import (
+    AppointmentActivityCreateRequest,
+    AppointmentActivityUpdateRequest,
     AppointmentCancelRequest,
     AppointmentCreateRequest,
-    AppointmentServiceItemCreateRequest,
-    AppointmentServiceItemUpdateRequest,
     AppointmentStatusTransitionRequest,
     AppointmentUpdateRequest,
 )
-from src.shared.domain.enums import (
-    AppointmentStatus,
-    ConfirmationStatus,
-    ProgramType,
-    ServiceItemStatus,
-    ServiceType,
-)
+from src.shared.domain.enums import AppointmentStatus, ProgramType, ServiceItemStatus
 
 _UUID_A = "00000000-0000-0000-0000-000000000001"
 _UUID_B = "00000000-0000-0000-0000-000000000002"
@@ -48,7 +48,7 @@ class TestAppointmentCreateRequest:
         assert req.patient_id == uuid.UUID(_UUID_A)
         assert req.staff_id is None
         assert req.program_type is None
-        assert req.service_items == []
+        assert req.activities == []
 
     def test_all_fields(self) -> None:
         req = AppointmentCreateRequest(
@@ -59,9 +59,9 @@ class TestAppointmentCreateRequest:
             scheduled_end=_END,
             location="123 Main St",
             notes="Bring paperwork",
-            service_items=[
-                AppointmentServiceItemCreateRequest(
-                    service_type=ServiceType.PERSONAL_CARE,
+            activities=[
+                AppointmentActivityCreateRequest(
+                    name="Check blood pressure",
                     planned_minutes=60,
                     notes="First visit",
                 ),
@@ -69,8 +69,8 @@ class TestAppointmentCreateRequest:
         )
         assert req.staff_id == uuid.UUID(_UUID_B)
         assert req.program_type == ProgramType.ARMHS
-        assert len(req.service_items) == 1
-        assert req.service_items[0].service_type == ServiceType.PERSONAL_CARE
+        assert len(req.activities) == 1
+        assert req.activities[0].name == "Check blood pressure"
 
     def test_extra_fields_rejected(self) -> None:
         with pytest.raises(ValidationError):
@@ -137,17 +137,14 @@ class TestAppointmentStatusTransitionRequest:
     def test_status_required(self) -> None:
         req = AppointmentStatusTransitionRequest(status=AppointmentStatus.SCHEDULED)
         assert req.status == AppointmentStatus.SCHEDULED
-        assert req.confirmation_status is None
         assert req.note is None
 
-    def test_with_confirmation(self) -> None:
+    def test_with_note(self) -> None:
         req = AppointmentStatusTransitionRequest(
-            status=AppointmentStatus.CONFIRMED,
-            confirmation_status=ConfirmationStatus.CONFIRMED,
-            note="Patient confirmed by phone",
+            status=AppointmentStatus.AWAITING_SIGNATURE,
+            note="Caregiver submitted end task",
         )
-        assert req.confirmation_status == ConfirmationStatus.CONFIRMED
-        assert req.note == "Patient confirmed by phone"
+        assert req.note == "Caregiver submitted end task"
 
 
 # --------------------------------------------------------------------------
@@ -164,53 +161,57 @@ class TestAppointmentCancelRequest:
 
 
 # --------------------------------------------------------------------------
-# AppointmentServiceItemCreateRequest
+# AppointmentActivityCreateRequest (renamed from AppointmentServiceItem)
 # --------------------------------------------------------------------------
-class TestAppointmentServiceItemCreateRequest:
+class TestAppointmentActivityCreateRequest:
     def test_minimal(self) -> None:
-        req = AppointmentServiceItemCreateRequest(service_type=ServiceType.HOMEMAKING)
+        req = AppointmentActivityCreateRequest(name="Prepare meal")
         assert req.planned_minutes is None
         assert req.notes is None
 
+    def test_name_must_be_present(self) -> None:
+        with pytest.raises(ValidationError):
+            AppointmentActivityCreateRequest(name="")
+
     def test_planned_minutes_must_be_positive(self) -> None:
         with pytest.raises(ValidationError):
-            AppointmentServiceItemCreateRequest(
-                service_type=ServiceType.PERSONAL_CARE,
+            AppointmentActivityCreateRequest(
+                name="Medication reminder",
                 planned_minutes=0,
             )
         with pytest.raises(ValidationError):
-            AppointmentServiceItemCreateRequest(
-                service_type=ServiceType.PERSONAL_CARE,
+            AppointmentActivityCreateRequest(
+                name="Medication reminder",
                 planned_minutes=-5,
             )
 
     def test_planned_minutes_upper_bound(self) -> None:
         # 24h * 60min = 1440 should be allowed
-        req = AppointmentServiceItemCreateRequest(
-            service_type=ServiceType.PERSONAL_CARE,
+        req = AppointmentActivityCreateRequest(
+            name="24-hour observation",
             planned_minutes=1440,
         )
         assert req.planned_minutes == 1440
         with pytest.raises(ValidationError):
-            AppointmentServiceItemCreateRequest(
-                service_type=ServiceType.PERSONAL_CARE,
+            AppointmentActivityCreateRequest(
+                name="24-hour observation",
                 planned_minutes=1441,
             )
 
 
 # --------------------------------------------------------------------------
-# AppointmentServiceItemUpdateRequest
+# AppointmentActivityUpdateRequest
 # --------------------------------------------------------------------------
-class TestAppointmentServiceItemUpdateRequest:
+class TestAppointmentActivityUpdateRequest:
     def test_empty_update(self) -> None:
-        req = AppointmentServiceItemUpdateRequest()
-        assert req.service_type is None
+        req = AppointmentActivityUpdateRequest()
+        assert req.name is None
         assert req.status is None
 
     def test_status_change(self) -> None:
-        req = AppointmentServiceItemUpdateRequest(status=ServiceItemStatus.DONE)
+        req = AppointmentActivityUpdateRequest(status=ServiceItemStatus.DONE)
         assert req.status == ServiceItemStatus.DONE
 
     def test_planned_minutes_must_be_positive_when_set(self) -> None:
         with pytest.raises(ValidationError):
-            AppointmentServiceItemUpdateRequest(planned_minutes=0)
+            AppointmentActivityUpdateRequest(planned_minutes=0)

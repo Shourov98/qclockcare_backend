@@ -45,13 +45,13 @@ class TestNotificationPreferenceResponse:
         now = datetime.now(UTC)
         r = NotificationPreferenceResponse(
             user_id=uuid.uuid4(),
-            type=NotificationType.VISIT_CHECKED_OUT,
+            type=NotificationType.VISIT_ENDED,
             channel=NotificationChannel.IN_APP,
             opted_in=False,
             updated_at=now,
         )
         assert r.opted_in is False
-        assert r.type == NotificationType.VISIT_CHECKED_OUT
+        assert r.type == NotificationType.VISIT_ENDED
         assert r.channel == NotificationChannel.IN_APP
         assert r.updated_at == now
 

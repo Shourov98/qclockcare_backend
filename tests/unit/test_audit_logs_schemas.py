@@ -76,8 +76,8 @@ class TestAuditLogResponse:
         orm.id = uuid.uuid4()
         orm.agency_id = uuid.uuid4()
         orm.actor_user_id = uuid.uuid4()
-        orm.action = AuditAction.SERVICE_VERIFIED
-        orm.entity_type = "SERVICE_VERIFICATION"
+        orm.action = AuditAction.VISIT_SIGNED
+        orm.entity_type = "APPOINTMENT_SIGNATURE"
         orm.entity_id = uuid.uuid4()
         orm.old_data = None
         orm.new_data = {"visit_id": "v1"}
@@ -92,7 +92,7 @@ class TestAuditLogResponse:
         orm.created_at = datetime.now(UTC)
 
         r = AuditLogResponse.model_validate(orm)
-        assert r.action == AuditAction.SERVICE_VERIFIED
+        assert r.action == AuditAction.VISIT_SIGNED
         assert r.metadata == {"trace_id": "t1", "ip": "10.0.0.1"}
         # ip_address should be stringified
         assert r.ip_address == "192.168.1.42"
