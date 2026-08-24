@@ -191,7 +191,7 @@ class Settings(BaseSettings):
     # Default is `supabase` — clients already running on Supabase don't
     # need to set up a separate S3-compatible service. Switch to `s3`
     # for AWS S3 / Floci / MinIO / Cloudflare R2 deployments.
-    STORAGE_BACKEND: Literal["s3", "supabase"] = "supabase"
+    STORAGE_BACKEND: Literal["s3", "supabase", "local"] = "supabase"
     STORAGE_MAX_FILE_SIZE_MB: int = Field(default=10, ge=1, le=100)
     # `NoDecode` — same as CORS_ORIGINS, we want the raw CSV from env.
     STORAGE_ALLOWED_MIME_TYPES: Annotated[list[str], NoDecode] = Field(
@@ -200,6 +200,27 @@ class Settings(BaseSettings):
     # Signed-URL TTL — canonical setting shared by every storage backend.
     STORAGE_PRESIGNED_URL_TTL_SECONDS: int = Field(default=900, ge=60, le=86400)
 
+    # ----- Signature storage (spec §8 — visit signature capture) -----
+    # Where the signature image (the caregiver-collected patient/guardian
+    # autograph) is persisted. Defaults to a local `/var/qlockcare/signatures`
+    # dir for offline / dev deployments. Production should set this to the
+    # same S3 / Supabase bucket used for qualifications.
+    SIGNATURE_STORAGE_PATH: str = "/var/qlockcare/signatures"
+    # Public URL prefix used to render the signature image in the
+    # portal — points at the backend in dev (FastAPI serves static files
+    # out of `SIGNATURE_STORAGE_PATH`) and at a CDN in production.
+    SIGNATURE_PUBLIC_URL_PREFIX: str = "/static/signatures"
+    # Max accepted signature payload size (bytes). Captures are small
+    # (~10kB for a typical handheld scribble) but we tolerate a generous
+    # ceiling so higher-resolution styluses don't truncate.
+    SIGNATURE_MAX_BYTES: int = Field(default=1_000_000, ge=10_000, le=10_000_000)
+    # Mime types accepted on the signature upload. PNG is the dominant
+    # format from staff mobile signature pads; we also accept JPEG in
+    # case a future pad uses a different encoder.
+    SIGNATURE_ALLOWED_MIME_TYPES: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["image/png", "image/jpeg"]
+    )
+
     # ----- S3-Compatible (only used when STORAGE_BACKEND=s3) -----
     S3_ENDPOINT_URL: str | None = None
     S3_REGION: str = "us-east-1"
@@ -207,6 +228,7 @@ class Settings(BaseSettings):
     S3_SECRET_ACCESS_KEY: SecretStr = SecretStr("any")
     S3_FORCE_PATH_STYLE: bool = False
     S3_BUCKET_QUALIFICATIONS: str = "qualifications"
+    S3_BUCKET_SIGNATURES: str = "signatures"
     # Deprecated alias for `STORAGE_PRESIGNED_URL_TTL_SECONDS`. Kept so
     # existing deployments with `S3_PRESIGNED_URL_TTL_SECONDS=...` in
     # their `.env` keep working after the rename.

@@ -124,7 +124,7 @@ async def _recipient_ids_for_visit_patient(
     return list(recipients)
 
 
-async def notify_visit_checked_in(
+async def notify_visit_started(
     background_tasks: BackgroundTasks,
     session: AsyncSession,
     *,
@@ -134,7 +134,7 @@ async def notify_visit_checked_in(
     visit_id: uuid.UUID,
     agency_id: uuid.UUID,
 ) -> None:
-    """Fan out a VISIT_CHECKED_IN notification to the patient + their guardians.
+    """Fan out a VISIT_STARTED notification to the patient + their guardians.
 
     The in-app Notification row + per-channel PENDING delivery rows
     are inserted synchronously; the provider network calls
@@ -152,7 +152,7 @@ async def notify_visit_checked_in(
                 session,
                 agency_id=agency_id,
                 recipient_user_id=uid,
-                type=NotificationType.VISIT_CHECKED_IN,
+                type=NotificationType.VISIT_STARTED,
                 title="Your visit has started",
                 body="Your care professional has checked in.",
                 metadata={
@@ -172,14 +172,14 @@ async def notify_visit_checked_in(
                 )
     except Exception as exc:
         log.warning(
-            "notifications.notify_visit_checked_in_failed",
+            "notifications.notify_visit_started_failed",
             visit_id=str(visit_id),
             error=type(exc).__name__,
             detail=str(exc),
         )
 
 
-async def notify_visit_checked_out(
+async def notify_visit_ended(
     background_tasks: BackgroundTasks,
     session: AsyncSession,
     *,
@@ -189,7 +189,7 @@ async def notify_visit_checked_out(
     visit_id: uuid.UUID,
     agency_id: uuid.UUID,
 ) -> None:
-    """Fan out VISIT_CHECKED_OUT so the patient can review + verify."""
+    """Fan out VISIT_ENDED so the patient knows the caregiver has left."""
     try:
         user_ids = await _recipient_ids_for_visit_patient(
             session, visit_id=visit_id, agency_id=agency_id
@@ -199,9 +199,9 @@ async def notify_visit_checked_out(
                 session,
                 agency_id=agency_id,
                 recipient_user_id=uid,
-                type=NotificationType.VISIT_CHECKED_OUT,
+                type=NotificationType.VISIT_ENDED,
                 title="Your visit has ended",
-                body="Please review the services and confirm or report any issues.",
+                body="Your care professional has finished today's visit.",
                 metadata={
                     "entity_id": str(visit_id),
                     "visit_id": str(visit_id),
@@ -219,7 +219,7 @@ async def notify_visit_checked_out(
                 )
     except Exception as exc:
         log.warning(
-            "notifications.notify_visit_checked_out_failed",
+            "notifications.notify_visit_ended_failed",
             visit_id=str(visit_id),
             error=type(exc).__name__,
             detail=str(exc),
@@ -245,7 +245,7 @@ async def _staff_user_id_for_visit(
     return staff.user_id if staff else None
 
 
-async def notify_verification_status(
+async def notify_visit_signed(
     background_tasks: BackgroundTasks,
     session: AsyncSession,
     *,
@@ -254,12 +254,8 @@ async def notify_verification_status(
     actor_role: UserRole,
     visit_id: uuid.UUID,
     agency_id: uuid.UUID,
-    verified: bool,
 ) -> None:
-    """Notify the assigned staff when a verification is filed.
-
-    `verified=True` → SERVICE_VERIFIED. `verified=False` → SERVICE_DISPUTED.
-    """
+    """Notify the assigned staff that the patient/guardian has signed the visit."""
     staff_user_id = await _staff_user_id_for_visit(session, visit_id=visit_id)
     if staff_user_id is None:
         return
@@ -268,19 +264,9 @@ async def notify_verification_status(
             session,
             agency_id=agency_id,
             recipient_user_id=staff_user_id,
-            type=(
-                NotificationType.SERVICE_VERIFIED
-                if verified
-                else NotificationType.SERVICE_DISPUTED
-            ),
-            title=(
-                "Services verified" if verified else "Services disputed"
-            ),
-            body=(
-                "The patient/guardian has confirmed the services."
-                if verified
-                else "The patient/guardian has disputed the services. Please follow up."
-            ),
+            type=NotificationType.VISIT_SIGNED,
+            title="Visit signed",
+            body="The patient/guardian has signed off on the visit.",
             metadata={"entity_id": str(visit_id), "visit_id": str(visit_id)},
         )
         if result is not None:
@@ -295,7 +281,7 @@ async def notify_verification_status(
             )
     except Exception as exc:
         log.warning(
-            "notifications.notify_verification_status_failed",
+            "notifications.notify_visit_signed_failed",
             visit_id=str(visit_id),
             error=type(exc).__name__,
             detail=str(exc),
@@ -398,7 +384,7 @@ async def _agency_admin_user_ids(
     return list(rows)
 
 
-async def notify_appointment_confirmed(
+async def notify_appointment_marked_ready(
     background_tasks: BackgroundTasks,
     session: AsyncSession,
     *,
@@ -408,7 +394,12 @@ async def notify_appointment_confirmed(
     appointment_id: uuid.UUID,
     agency_id: uuid.UUID,
 ) -> None:
-    """Notify the assigned staff that the appointment is locked in."""
+    """Notify the assigned staff that an appointment is READY for the visit.
+
+    Triggered when the admin flips `SCHEDULED → READY`. The caregiver
+    is expected to call `POST /visits` next to actually start the visit
+    (which transitions `READY → IN_PROGRESS`).
+    """
     try:
         staff_user_id = await _staff_user_id_for_appointment(
             session, appointment_id=appointment_id
@@ -419,9 +410,9 @@ async def notify_appointment_confirmed(
             session,
             agency_id=agency_id,
             recipient_user_id=staff_user_id,
-            type=NotificationType.APPOINTMENT_CONFIRMED,
-            title="Appointment confirmed",
-            body="The patient/guardian has confirmed this appointment.",
+            type=NotificationType.APPOINTMENT_READY,
+            title="Appointment ready",
+            body="A scheduled visit is ready to start.",
             metadata={"entity_id": str(appointment_id), "appointment_id": str(appointment_id)},
         )
         if result is not None:
@@ -436,110 +427,7 @@ async def notify_appointment_confirmed(
             )
     except Exception as exc:
         log.warning(
-            "notifications.notify_appointment_confirmed_failed",
-            appointment_id=str(appointment_id),
-            error=type(exc).__name__,
-            detail=str(exc),
-        )
-
-
-async def notify_appointment_reschedule_requested(
-    background_tasks: BackgroundTasks,
-    session: AsyncSession,
-    *,
-    actor_user_id: uuid.UUID,
-    actor_agency_id: uuid.UUID,
-    actor_role: UserRole,
-    appointment_id: uuid.UUID,
-    agency_id: uuid.UUID,
-    proposed_start: object,
-    proposed_end: object,
-) -> None:
-    """Fan out to staff + AGENCY_ADMIN: patient has requested a reschedule."""
-    try:
-        staff_user_id = await _staff_user_id_for_appointment(
-            session, appointment_id=appointment_id
-        )
-        admin_ids = await _agency_admin_user_ids(session, agency_id=agency_id)
-        recipients = {uid for uid in (staff_user_id, *admin_ids) if uid is not None}
-        for uid in recipients:
-            result = await notifications_service.dispatch_notification(
-                session,
-                agency_id=agency_id,
-                recipient_user_id=uid,
-                type=NotificationType.APPOINTMENT_RESCHEDULE_REQUESTED,
-                title="Reschedule requested",
-                body=(
-                    f"A reschedule was requested for appointment {appointment_id}: "
-                    f"{proposed_start} → {proposed_end}."
-                ),
-                metadata={
-                    "entity_id": str(appointment_id),
-                    "appointment_id": str(appointment_id),
-                    "proposed_start": str(proposed_start),
-                    "proposed_end": str(proposed_end),
-                },
-            )
-            if result is not None:
-                notification, deliveries = result
-                _schedule_dispatch(
-                    background_tasks,
-                    actor_user_id=actor_user_id,
-                    actor_agency_id=actor_agency_id,
-                    actor_role=actor_role,
-                    notification_id=notification.id,
-                    deliveries=deliveries,
-                )
-    except Exception as exc:
-        log.warning(
-            "notifications.notify_appointment_reschedule_requested_failed",
-            appointment_id=str(appointment_id),
-            error=type(exc).__name__,
-            detail=str(exc),
-        )
-
-
-async def notify_appointment_cancellation_requested(
-    background_tasks: BackgroundTasks,
-    session: AsyncSession,
-    *,
-    actor_user_id: uuid.UUID,
-    actor_agency_id: uuid.UUID,
-    actor_role: UserRole,
-    appointment_id: uuid.UUID,
-    agency_id: uuid.UUID,
-    reason: str,
-) -> None:
-    """Fan out to AGENCY_ADMIN: patient/guardian has requested cancellation."""
-    try:
-        admin_ids = await _agency_admin_user_ids(session, agency_id=agency_id)
-        for uid in admin_ids:
-            result = await notifications_service.dispatch_notification(
-                session,
-                agency_id=agency_id,
-                recipient_user_id=uid,
-                type=NotificationType.APPOINTMENT_CANCELLATION_REQUESTED,
-                title="Cancellation requested",
-                body=f"Reason: {reason}",
-                metadata={
-                    "entity_id": str(appointment_id),
-                    "appointment_id": str(appointment_id),
-                    "reason": reason,
-                },
-            )
-            if result is not None:
-                notification, deliveries = result
-                _schedule_dispatch(
-                    background_tasks,
-                    actor_user_id=actor_user_id,
-                    actor_agency_id=actor_agency_id,
-                    actor_role=actor_role,
-                    notification_id=notification.id,
-                    deliveries=deliveries,
-                )
-    except Exception as exc:
-        log.warning(
-            "notifications.notify_appointment_cancellation_requested_failed",
+            "notifications.notify_appointment_marked_ready_failed",
             appointment_id=str(appointment_id),
             error=type(exc).__name__,
             detail=str(exc),
@@ -547,11 +435,9 @@ async def notify_appointment_cancellation_requested(
 
 
 __all__ = [
-    "notify_appointment_cancellation_requested",
-    "notify_appointment_confirmed",
-    "notify_appointment_reschedule_requested",
-    "notify_verification_status",
-    "notify_visit_checked_in",
-    "notify_visit_checked_out",
+    "notify_appointment_marked_ready",
+    "notify_visit_ended",
     "notify_visit_issue_filed",
+    "notify_visit_signed",
+    "notify_visit_started",
 ]

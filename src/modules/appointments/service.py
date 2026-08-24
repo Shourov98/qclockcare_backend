@@ -1,36 +1,17 @@
-"""Appointments service — business logic for appointments + service items.
+"""Appointments service — business logic for appointments + activities.
 
 Routes delegate here. This is the only place that composes ORM operations,
 enforces business rules (state-machine validation, patient/staff
 existence checks, etc.), and raises the right domain exceptions.
 
-Status lifecycle (see `AppointmentStatus`):
+5-state lifecycle per the spec (see `AppointmentStatus`):
 
-  DRAFT  ─→  SCHEDULED  ─→  AWAITING_CONFIRMATION  ─→  CONFIRMED
-                                                          │
-                                                          ▼
-                                                       ASSIGNED  ─→  CHECKED_IN
-                                                                      │
-                                                                      ▼
-                                                                  IN_PROGRESS
-                                                                      │
-                                                                      ▼
-                                                                  CHECKED_OUT
-                                                                      │
-                                                                      ▼
-                                                                 COMPLETED  ─→
-                                                            AWAITING_SERVICE_VERIFICATION
-                                                            SERVICE_VERIFIED / DISPUTED
-                                                            UNDER_REVIEW
-                                                            APPROVED_FOR_BILLING  ─→  PAID
+  SCHEDULED → READY → IN_PROGRESS → AWAITING_SIGNATURE → COMPLETED
+              ↘  CANCELLED / MISSED / REJECTED  ↙
 
-  Branches off the main line:
-    - DRAFT / SCHEDULED  → CANCELLED, NO_SHOW, REJECTED
-    - AWAITING_CONFIRMATION → CANCELLATION_REQUESTED → CANCELLED
-    - CONFIRMED → RESCHEDULE_REQUESTED → SCHEDULED (reschedule cycle)
-
-  Terminal states (no outbound transitions):
-    CANCELLED, NO_SHOW, REJECTED, PAID
+The legacy confirmation / reschedule / cancel-request flows are gone —
+the spec's `AppointmentSignature` replaces them. EVV start/end records
+and signatures live on the `visits` module.
 
 RLS is the source of truth for tenant scoping; functions still take an
 `agency_id` parameter for defence in depth.
@@ -40,7 +21,6 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
-from datetime import date
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -56,21 +36,12 @@ from src.core.exceptions import (
     ValidationError,
 )
 from src.modules.agencies.models import Agency
-from src.modules.appointments.events import append_appointment_event
-from src.modules.appointments.models import (
-    Appointment,
-    AppointmentConfirmation,
-    AppointmentEvent,
-    AppointmentServiceItem,
-)
+from src.modules.appointments.models import Appointment, AppointmentActivity
 from src.modules.appointments.schemas import (
-    AppointmentCancellationRequest,
+    AppointmentActivityCreateRequest,
+    AppointmentActivityUpdateRequest,
     AppointmentCancelRequest,
-    AppointmentConfirmRequest,
     AppointmentCreateRequest,
-    AppointmentRescheduleRequest,
-    AppointmentServiceItemCreateRequest,
-    AppointmentServiceItemUpdateRequest,
     AppointmentStatusTransitionRequest,
     AppointmentUpdateRequest,
 )
@@ -81,146 +52,61 @@ from src.modules.patients.models import (
 )
 from src.modules.staff.models import StaffProfile
 from src.shared.domain.enums import (
-    AppointmentEventType,
     AppointmentStatus,
-    ConfirmationStatus,
     ServiceItemStatus,
     UserRole,
 )
 from src.shared.utils.datetime_utils import utc_now
 
 # --------------------------------------------------------------------------
-# State machine
+# State machine — 5-state lifecycle per the spec
 # --------------------------------------------------------------------------
-# Allowed forward transitions. The keys are the FROM state, values are the
-# set of TO states that are valid. Terminal states (CANCELLED, NO_SHOW,
-# REJECTED, PAID) have empty sets.
+# Allowed forward transitions. The keys are the FROM state, values are
+# the set of TO states that are valid. Terminal states (COMPLETED,
+# CANCELLED, MISSED, REJECTED) have empty sets.
+#
+#   SCHEDULED → READY → IN_PROGRESS → AWAITING_SIGNATURE → COMPLETED
+#               ↘  CANCELLED / MISSED / REJECTED  ↙
 _ALLOWED_TRANSITIONS: dict[AppointmentStatus, frozenset[AppointmentStatus]] = {
-    AppointmentStatus.DRAFT: frozenset(
-        {
-            AppointmentStatus.SCHEDULED,
-            AppointmentStatus.CANCELLED,
-        }
-    ),
     AppointmentStatus.SCHEDULED: frozenset(
         {
-            AppointmentStatus.NOTIFICATION_SENT,
-            AppointmentStatus.AWAITING_CONFIRMATION,
+            AppointmentStatus.READY,
             AppointmentStatus.CANCELLED,
-            AppointmentStatus.NO_SHOW,
+            AppointmentStatus.MISSED,
             AppointmentStatus.REJECTED,
         }
     ),
-    AppointmentStatus.NOTIFICATION_SENT: frozenset(
-        {
-            AppointmentStatus.AWAITING_CONFIRMATION,
-            AppointmentStatus.CANCELLED,
-            AppointmentStatus.NO_SHOW,
-        }
-    ),
-    AppointmentStatus.AWAITING_CONFIRMATION: frozenset(
-        {
-            AppointmentStatus.CONFIRMED,
-            AppointmentStatus.CANCELLATION_REQUESTED,
-            AppointmentStatus.RESCHEDULE_REQUESTED,
-            AppointmentStatus.NO_SHOW,
-            AppointmentStatus.REJECTED,
-        }
-    ),
-    AppointmentStatus.CONFIRMED: frozenset(
-        {
-            AppointmentStatus.RESCHEDULE_REQUESTED,
-            AppointmentStatus.CANCELLATION_REQUESTED,
-            AppointmentStatus.ASSIGNED,
-            AppointmentStatus.CANCELLED,
-            AppointmentStatus.NO_SHOW,
-        }
-    ),
-    AppointmentStatus.RESCHEDULE_REQUESTED: frozenset(
-        {
-            AppointmentStatus.SCHEDULED,
-            AppointmentStatus.CANCELLED,
-        }
-    ),
-    AppointmentStatus.CANCELLATION_REQUESTED: frozenset(
-        {
-            AppointmentStatus.CANCELLED,
-            AppointmentStatus.CONFIRMED,  # patient changed their mind
-        }
-    ),
-    AppointmentStatus.ASSIGNED: frozenset(
-        {
-            AppointmentStatus.CHECKED_IN,
-            AppointmentStatus.CANCELLED,
-            AppointmentStatus.NO_SHOW,
-        }
-    ),
-    AppointmentStatus.CHECKED_IN: frozenset(
+    AppointmentStatus.READY: frozenset(
         {
             AppointmentStatus.IN_PROGRESS,
-            AppointmentStatus.CHECKED_OUT,
-            AppointmentStatus.NO_SHOW,
+            AppointmentStatus.CANCELLED,
+            AppointmentStatus.MISSED,
         }
     ),
     AppointmentStatus.IN_PROGRESS: frozenset(
         {
-            AppointmentStatus.CHECKED_OUT,
+            AppointmentStatus.AWAITING_SIGNATURE,
+            AppointmentStatus.CANCELLED,
+            AppointmentStatus.MISSED,
         }
     ),
-    AppointmentStatus.CHECKED_OUT: frozenset(
+    AppointmentStatus.AWAITING_SIGNATURE: frozenset(
         {
             AppointmentStatus.COMPLETED,
-        }
-    ),
-    AppointmentStatus.COMPLETED: frozenset(
-        {
-            AppointmentStatus.AWAITING_SERVICE_VERIFICATION,
-            AppointmentStatus.DISPUTED,
-        }
-    ),
-    AppointmentStatus.AWAITING_SERVICE_VERIFICATION: frozenset(
-        {
-            AppointmentStatus.SERVICE_VERIFIED,
-            AppointmentStatus.DISPUTED,
-        }
-    ),
-    AppointmentStatus.SERVICE_VERIFIED: frozenset(
-        {
-            AppointmentStatus.UNDER_REVIEW,
-            AppointmentStatus.APPROVED_FOR_BILLING,
-            AppointmentStatus.DISPUTED,
-        }
-    ),
-    AppointmentStatus.DISPUTED: frozenset(
-        {
-            AppointmentStatus.UNDER_REVIEW,
-            AppointmentStatus.SERVICE_VERIFIED,
-        }
-    ),
-    AppointmentStatus.UNDER_REVIEW: frozenset(
-        {
-            AppointmentStatus.APPROVED_FOR_BILLING,
-            AppointmentStatus.DISPUTED,
-            AppointmentStatus.SERVICE_VERIFIED,
-        }
-    ),
-    AppointmentStatus.APPROVED_FOR_BILLING: frozenset(
-        {
-            AppointmentStatus.PAID,
+            AppointmentStatus.CANCELLED,
         }
     ),
     # Terminal — no outbound transitions
+    AppointmentStatus.COMPLETED: frozenset(),
     AppointmentStatus.CANCELLED: frozenset(),
-    AppointmentStatus.NO_SHOW: frozenset(),
+    AppointmentStatus.MISSED: frozenset(),
     AppointmentStatus.REJECTED: frozenset(),
-    AppointmentStatus.PAID: frozenset(),
 }
 
 
 def _is_transition_allowed(
     from_state: AppointmentStatus, to_state: AppointmentStatus
 ) -> bool:
-    """Return True iff the (from → to) edge exists in the state machine."""
     return to_state in _ALLOWED_TRANSITIONS.get(from_state, frozenset())
 
 
@@ -244,15 +130,15 @@ async def _get_appointment_or_404(
     *,
     appointment_id: uuid.UUID,
     agency_id: uuid.UUID,
-    with_items: bool = False,
+    with_activities: bool = False,
     with_patient: bool = False,
 ) -> Appointment:
     stmt = select(Appointment).where(
         Appointment.id == appointment_id,
         Appointment.agency_id == agency_id,
     )
-    if with_items:
-        stmt = stmt.options(selectinload(Appointment.service_items))
+    if with_activities:
+        stmt = stmt.options(selectinload(Appointment.activities))
     if with_patient:
         stmt = stmt.options(selectinload(Appointment.patient))
     appt = (await session.execute(stmt)).scalar_one_or_none()
@@ -263,27 +149,24 @@ async def _get_appointment_or_404(
     return appt
 
 
-async def _get_service_item_or_404(
+async def _get_activity_or_404(
     session: AsyncSession,
     *,
-    item_id: uuid.UUID,
+    activity_id: uuid.UUID,
     appointment_id: uuid.UUID,
     agency_id: uuid.UUID,
-) -> AppointmentServiceItem:
-    stmt = select(AppointmentServiceItem).where(
-        AppointmentServiceItem.id == item_id,
-        AppointmentServiceItem.appointment_id == appointment_id,
-        AppointmentServiceItem.agency_id == agency_id,
+) -> AppointmentActivity:
+    stmt = select(AppointmentActivity).where(
+        AppointmentActivity.id == activity_id,
+        AppointmentActivity.appointment_id == appointment_id,
+        AppointmentActivity.agency_id == agency_id,
     )
-    item = (await session.execute(stmt)).scalar_one_or_none()
-    if item is None:
+    a = (await session.execute(stmt)).scalar_one_or_none()
+    if a is None:
         raise NotFoundError(
-            details={
-                "resource": "appointment_service_item",
-                "id": str(item_id),
-            }
+            details={"resource": "appointment_activity", "id": str(activity_id)}
         )
-    return item
+    return a
 
 
 async def _assert_patient_exists(
@@ -328,9 +211,6 @@ async def _assert_actor_may_act_for_patient(
       - GUARDIAN: must have an active legal guardian relationship to
         the patient at the agency.
       - STAFF / SUPER_ADMIN: not allowed on patient-initiated actions.
-    Raises:
-        CrossAgencyAccessDeniedError: actor has no relationship to the
-            patient at the agency.
     """
     if actor_role == UserRole.AGENCY_ADMIN:
         return
@@ -345,15 +225,12 @@ async def _assert_actor_may_act_for_patient(
             )
         ).scalar_one_or_none()
         if owner != actor_user_id:
-            # Privacy: don't leak the existence of an appointment to a
-            # patient who doesn't own it. 404 is the right answer.
             raise NotFoundError(
                 details={"resource": "appointment", "id": str(patient_id)}
             )
         return
 
     if actor_role == UserRole.GUARDIAN:
-        # Resolve the guardian profile for this user at the agency.
         guardian = (
             await session.execute(
                 select(GuardianProfile.id).where(
@@ -363,13 +240,9 @@ async def _assert_actor_may_act_for_patient(
             )
         ).scalar_one_or_none()
         if guardian is None:
-            # Privacy: don't leak the existence of an appointment to a
-            # guardian who has no link at this agency.
             raise NotFoundError(
                 details={"resource": "appointment", "id": str(patient_id)}
             )
-        # Look up an active (non-expired) legal relationship.
-        today = date.today()
         rel = (
             await session.execute(
                 select(PatientGuardianRelationship.id).where(
@@ -384,25 +257,6 @@ async def _assert_actor_may_act_for_patient(
             raise NotFoundError(
                 details={"resource": "appointment", "id": str(patient_id)}
             )
-        # Check the optional validity window.
-        validity = (
-            await session.execute(
-                select(
-                    PatientGuardianRelationship.valid_from,
-                    PatientGuardianRelationship.valid_until,
-                ).where(PatientGuardianRelationship.id == rel)
-            )
-        ).one_or_none()
-        if validity is not None:
-            vfrom, vuntil = validity
-            if vfrom is not None and vfrom > today:
-                raise NotFoundError(
-                    details={"resource": "appointment", "id": str(patient_id)}
-                )
-            if vuntil is not None and vuntil < today:
-                raise NotFoundError(
-                    details={"resource": "appointment", "id": str(patient_id)}
-                )
         return
 
     raise CrossAgencyAccessDeniedError(
@@ -411,7 +265,6 @@ async def _assert_actor_may_act_for_patient(
 
 
 def _extract_constraint(exc: IntegrityError) -> str:
-    """Pull a constraint name out of a Postgres IntegrityError, if possible."""
     orig = getattr(exc, "orig", None)
     diag = getattr(orig, "diag", None)
     if diag is not None and getattr(diag, "constraint_name", None):
@@ -431,13 +284,13 @@ async def create_appointment(
 ) -> Appointment:
     """Schedule a new appointment at the caller's agency.
 
-    Validates that the patient (required) and staff (optional) exist at
-    the same agency, then creates the appointment + any inline service
-    items in a single transaction.
-
-    The new row starts in `DRAFT` by default. Callers transition state
-    via `transition_status` (e.g. DRAFT → SCHEDULED → AWAITING_CONFIRMATION).
+    New rows start in `SCHEDULED`. The admin marks them `READY` via
+    `mark_appointment_ready` once the caregiver is notified; the
+    caregiver then calls `POST /visits` to start the visit (transition
+    to `IN_PROGRESS`).
     """
+    # Unused parameter; kept for forward-compat (audit log plumbing).
+    _ = scheduled_by_user_id
     await _assert_agency_active(session, agency_id)
     await _assert_patient_exists(
         session, patient_id=payload.patient_id, agency_id=agency_id
@@ -456,11 +309,11 @@ async def create_appointment(
         scheduled_end=payload.scheduled_end,
         location=payload.location,
         notes=payload.notes,
-        status=AppointmentStatus.DRAFT,
+        status=AppointmentStatus.SCHEDULED,
     )
     session.add(appt)
     try:
-        await session.flush()  # populate appt.id
+        await session.flush()
     except IntegrityError as exc:
         await session.rollback()
         raise DuplicateResourceError(
@@ -468,27 +321,26 @@ async def create_appointment(
             details={"constraint": _extract_constraint(exc)},
         ) from exc
 
-    # Inline service items (if any)
-    for item_payload in payload.service_items:
-        item = AppointmentServiceItem(
+    # Inline activities (if any)
+    for activity_payload in payload.activities:
+        activity = AppointmentActivity(
             appointment_id=appt.id,
             agency_id=agency_id,
-            service_type=item_payload.service_type,
-            planned_minutes=item_payload.planned_minutes,
-            notes=item_payload.notes,
+            name=activity_payload.name,
+            planned_minutes=activity_payload.planned_minutes,
+            notes=activity_payload.notes,
         )
-        session.add(item)
+        session.add(activity)
     try:
         await session.flush()
     except IntegrityError as exc:
         await session.rollback()
         raise ValidationError(
-            "Service item violates a check constraint.",
+            "Activity violates a check constraint.",
             details={"constraint": _extract_constraint(exc)},
         ) from exc
 
-    # Refresh to populate relationships for response serialization
-    await session.refresh(appt, attribute_names=["service_items"])
+    await session.refresh(appt, attribute_names=["activities"])
     return appt
 
 
@@ -497,16 +349,14 @@ async def get_appointment(
     *,
     appointment_id: uuid.UUID,
     agency_id: uuid.UUID,
-    with_items: bool = False,
+    with_activities: bool = False,
     with_patient: bool = False,
 ) -> Appointment:
-    """Fetch a single appointment, optionally with nested service items
-    and/or the linked PatientProfile eager-loaded."""
     return await _get_appointment_or_404(
         session,
         appointment_id=appointment_id,
         agency_id=agency_id,
-        with_items=with_items,
+        with_activities=with_activities,
         with_patient=with_patient,
     )
 
@@ -523,12 +373,9 @@ async def list_appointments(
 ) -> tuple[Sequence[Appointment], int]:
     """Paginated list of appointments at the caller's agency.
 
-    Eagerly joins the caregiver (`staff.user`), staff profile, and
-    service items so the patient mobile app can render a fully populated
-    card from a single round trip.
-
-    Sorted by `scheduled_start DESC` (newest first) so the calendar view
-    can page backwards through history.
+    Eager-loads the caregiver (`staff.user`), staff profile, and the
+    parent activities so the patient mobile app can render a fully
+    populated card from a single round trip.
     """
     page = max(1, page)
     page_size = max(1, min(100, page_size))
@@ -537,13 +384,8 @@ async def list_appointments(
         select(Appointment)
         .where(Appointment.agency_id == agency_id)
         .options(
-            # Caregiver display name + phone live on the User; staff_code
-            # lives on the StaffProfile. selectinload keeps the join
-            # batched (1 + N queries for N appointments, not N+1).
             selectinload(Appointment.staff).selectinload(StaffProfile.user),
-            # Service items so we can read the first service_type for the
-            # "CFSS — Personal Care" label on the patient card.
-            selectinload(Appointment.service_items),
+            selectinload(Appointment.activities),
         )
     )
     count_base = (
@@ -590,17 +432,11 @@ async def update_appointment(
 
     # Block edits once the visit is in flight or terminal.
     if appt.status in {
-        AppointmentStatus.CHECKED_IN,
         AppointmentStatus.IN_PROGRESS,
-        AppointmentStatus.CHECKED_OUT,
+        AppointmentStatus.AWAITING_SIGNATURE,
         AppointmentStatus.COMPLETED,
-        AppointmentStatus.AWAITING_SERVICE_VERIFICATION,
-        AppointmentStatus.SERVICE_VERIFIED,
-        AppointmentStatus.UNDER_REVIEW,
-        AppointmentStatus.APPROVED_FOR_BILLING,
-        AppointmentStatus.PAID,
         AppointmentStatus.CANCELLED,
-        AppointmentStatus.NO_SHOW,
+        AppointmentStatus.MISSED,
         AppointmentStatus.REJECTED,
     }:
         raise InvalidStateTransitionError(
@@ -649,22 +485,20 @@ async def transition_status(
     agency_id: uuid.UUID,
     payload: AppointmentStatusTransitionRequest,
     actor_user_id: uuid.UUID | None = None,
-    ip_address: str | None = None,
-    user_agent: str | None = None,
 ) -> Appointment:
     """Move the appointment through the lifecycle state machine.
 
     Validates the (current → requested) edge exists; otherwise raises
-    `InvalidStateTransitionError`. Also stamps the lifecycle timestamps
-    (confirmed_at, checked_in_at, etc.) when applicable. Appends one
-    `STATUS_TRANSITION` event on success.
+    `InvalidStateTransitionError`. Some transitions require an assigned
+    staff member (e.g. `READY → IN_PROGRESS` only happens via
+    `POST /visits`, which the visits module enforces; this generic
+    endpoint only walks the state machine for admin overrides).
     """
     appt = await _get_appointment_or_404(
         session, appointment_id=appointment_id, agency_id=agency_id
     )
 
     if appt.status == payload.status:
-        # No-op — return the appointment unchanged.
         return appt
 
     if not _is_transition_allowed(appt.status, payload.status):
@@ -673,51 +507,58 @@ async def transition_status(
             details={"from": appt.status.value, "to": payload.status.value},
         )
 
-    # Some transitions require a staff assignee (e.g. CHECKED_IN is meaningless
-    # without a staff member). Only ASSIGNED status requires it; CHECKED_IN
-    # also implies a staff member performed the check-in.
-    if payload.status in {
-        AppointmentStatus.ASSIGNED,
-        AppointmentStatus.CHECKED_IN,
-        AppointmentStatus.IN_PROGRESS,
-    } and appt.staff_id is None:
+    # `READY → IN_PROGRESS` requires the staff assignment to be locked
+    # in. `IN_PROGRESS → AWAITING_SIGNATURE` and beyond are driven by
+    # the visits module (gated by activities + billing + signature).
+    if (
+        payload.status in {AppointmentStatus.READY, AppointmentStatus.IN_PROGRESS}
+        and appt.staff_id is None
+    ):
         raise ConflictError(
             "Cannot transition to this status without an assigned staff member.",
-            details={"current_status": appt.status.value, "requested_status": payload.status.value},
+            details={
+                "current_status": appt.status.value,
+                "requested_status": payload.status.value,
+            },
         )
 
-    # Confirmation flow side-effects
-    if payload.confirmation_status is not None:
-        appt.confirmation_status = payload.confirmation_status
-        if payload.confirmation_status == ConfirmationStatus.CONFIRMED:
-            appt.confirmed_at = utc_now()
-        if payload.note:
-            appt.confirmation_note = payload.note
-
-    # Visit timestamp side-effects
-    if payload.status == AppointmentStatus.CHECKED_IN and appt.checked_in_at is None:
-        appt.checked_in_at = utc_now()
-    if payload.status == AppointmentStatus.CHECKED_OUT and appt.checked_out_at is None:
-        appt.checked_out_at = utc_now()
-    if payload.status == AppointmentStatus.COMPLETED and appt.completed_at is None:
-        appt.completed_at = utc_now()
-
-    from_status = appt.status
     appt.status = payload.status
+    # Unused argument; kept so the signature matches the audit_logs
+    # plumbing in the router.
+    _ = actor_user_id
     await session.flush()
+    return appt
 
-    await append_appointment_event(
-        session,
-        agency_id=agency_id,
-        appointment_id=appt.id,
-        event_type=AppointmentEventType.STATUS_TRANSITION,
-        actor_user_id=actor_user_id,
-        from_status=from_status,
-        to_status=appt.status,
-        metadata={"note": payload.note},
-        ip_address=ip_address,
-        user_agent=user_agent,
+
+async def mark_appointment_ready(
+    session: AsyncSession,
+    *,
+    appointment_id: uuid.UUID,
+    agency_id: uuid.UUID,
+    actor_user_id: uuid.UUID | None = None,
+) -> Appointment:
+    """Convenience helper — admin marks an appointment as READY.
+
+    Same effect as `transition_status(... READY)`. Kept as a named
+    helper so the router's `POST /appointments/{id}/ready` endpoint
+    reads cleanly.
+    """
+    appt = await _get_appointment_or_404(
+        session, appointment_id=appointment_id, agency_id=agency_id
     )
+    if appt.status != AppointmentStatus.SCHEDULED:
+        raise InvalidStateTransitionError(
+            "Only SCHEDULED appointments can be marked ready.",
+            details={"current_status": appt.status.value},
+        )
+    if appt.staff_id is None:
+        raise ConflictError(
+            "Cannot mark an appointment ready without an assigned staff member.",
+            details={"appointment_id": str(appt.id)},
+        )
+    appt.status = AppointmentStatus.READY
+    _ = actor_user_id
+    await session.flush()
     return appt
 
 
@@ -728,57 +569,34 @@ async def cancel_appointment(
     agency_id: uuid.UUID,
     payload: AppointmentCancelRequest,
     actor_user_id: uuid.UUID | None = None,
-    ip_address: str | None = None,
-    user_agent: str | None = None,
 ) -> Appointment:
     """Cancel an appointment.
 
-    Cancellation is only allowed BEFORE the visit is checked in. After
-    that, use `transition_status` to mark NO_SHOW or to walk the dispute
-    flow. Appends one `CANCELLED_BY_ADMIN` event on success.
+    Allowed only BEFORE the visit is in progress. After `IN_PROGRESS`,
+    the visit-side transition should be used (or `MISSED`).
     """
     appt = await _get_appointment_or_404(
         session, appointment_id=appointment_id, agency_id=agency_id
     )
 
     if appt.status == AppointmentStatus.CANCELLED:
-        # Idempotent — return as-is (no event)
         return appt
 
     if appt.status in {
-        AppointmentStatus.CHECKED_IN,
         AppointmentStatus.IN_PROGRESS,
-        AppointmentStatus.CHECKED_OUT,
+        AppointmentStatus.AWAITING_SIGNATURE,
         AppointmentStatus.COMPLETED,
-        AppointmentStatus.AWAITING_SERVICE_VERIFICATION,
-        AppointmentStatus.SERVICE_VERIFIED,
-        AppointmentStatus.UNDER_REVIEW,
-        AppointmentStatus.APPROVED_FOR_BILLING,
-        AppointmentStatus.PAID,
     }:
         raise InvalidStateTransitionError(
             "Cannot cancel an appointment that is already in progress or completed.",
             details={"current_status": appt.status.value},
         )
 
-    from_status = appt.status
     appt.status = AppointmentStatus.CANCELLED
     appt.cancelled_reason = payload.reason
     appt.cancelled_at = utc_now()
+    _ = actor_user_id
     await session.flush()
-
-    await append_appointment_event(
-        session,
-        agency_id=agency_id,
-        appointment_id=appt.id,
-        event_type=AppointmentEventType.CANCELLED_BY_ADMIN,
-        actor_user_id=actor_user_id,
-        from_status=from_status,
-        to_status=appt.status,
-        metadata={"reason": payload.reason},
-        ip_address=ip_address,
-        user_agent=user_agent,
-    )
     return appt
 
 
@@ -791,25 +609,19 @@ async def assign_staff(
 ) -> Appointment:
     """Assign (or re-assign) the staff member who will perform the visit.
 
-    Allowed in pre-visit states only. After CHECKED_IN, the staff is
-    locked in (callers should use the dispute flow to re-assign later).
+    Allowed in pre-visit states only (SCHEDULED / READY). After the
+    visit is in flight the staff is locked in.
     """
     appt = await _get_appointment_or_404(
         session, appointment_id=appointment_id, agency_id=agency_id
     )
 
     if appt.status in {
-        AppointmentStatus.CHECKED_IN,
         AppointmentStatus.IN_PROGRESS,
-        AppointmentStatus.CHECKED_OUT,
+        AppointmentStatus.AWAITING_SIGNATURE,
         AppointmentStatus.COMPLETED,
-        AppointmentStatus.AWAITING_SERVICE_VERIFICATION,
-        AppointmentStatus.SERVICE_VERIFIED,
-        AppointmentStatus.UNDER_REVIEW,
-        AppointmentStatus.APPROVED_FOR_BILLING,
-        AppointmentStatus.PAID,
         AppointmentStatus.CANCELLED,
-        AppointmentStatus.NO_SHOW,
+        AppointmentStatus.MISSED,
         AppointmentStatus.REJECTED,
     }:
         raise InvalidStateTransitionError(
@@ -824,501 +636,170 @@ async def assign_staff(
 
 
 # --------------------------------------------------------------------------
-# Service items
+# Activities
 # --------------------------------------------------------------------------
-async def list_service_items(
+async def list_activities(
     session: AsyncSession,
     *,
     appointment_id: uuid.UUID,
     agency_id: uuid.UUID,
-) -> Sequence[AppointmentServiceItem]:
-    """List service items for an appointment."""
+) -> Sequence[AppointmentActivity]:
+    """List activities for an appointment (oldest first)."""
     await _get_appointment_or_404(
         session, appointment_id=appointment_id, agency_id=agency_id
     )
     stmt = (
-        select(AppointmentServiceItem)
+        select(AppointmentActivity)
         .where(
-            AppointmentServiceItem.appointment_id == appointment_id,
-            AppointmentServiceItem.agency_id == agency_id,
+            AppointmentActivity.appointment_id == appointment_id,
+            AppointmentActivity.agency_id == agency_id,
         )
-        .order_by(AppointmentServiceItem.created_at.asc())
+        .order_by(AppointmentActivity.created_at.asc())
     )
     return (await session.execute(stmt)).scalars().all()
 
 
-async def add_service_item(
+async def add_activity(
     session: AsyncSession,
     *,
     appointment_id: uuid.UUID,
     agency_id: uuid.UUID,
-    payload: AppointmentServiceItemCreateRequest,
-) -> AppointmentServiceItem:
-    """Add a service item to an existing appointment.
+    payload: AppointmentActivityCreateRequest,
+) -> AppointmentActivity:
+    """Add a free-text activity to an existing appointment.
 
-    Once the visit is COMPLETED, no more service items can be added —
-    use the dispute flow instead.
+    Allowed only while the appointment is in a pre-visit state. After
+    the visit is in progress, the caregiver updates each
+    `VisitActivityDelivery` row instead — that becomes the source of
+    truth for "what was actually delivered".
     """
     appt = await _get_appointment_or_404(
         session, appointment_id=appointment_id, agency_id=agency_id
     )
     if appt.status in {
+        AppointmentStatus.IN_PROGRESS,
+        AppointmentStatus.AWAITING_SIGNATURE,
         AppointmentStatus.COMPLETED,
-        AppointmentStatus.AWAITING_SERVICE_VERIFICATION,
-        AppointmentStatus.SERVICE_VERIFIED,
-        AppointmentStatus.UNDER_REVIEW,
-        AppointmentStatus.APPROVED_FOR_BILLING,
-        AppointmentStatus.PAID,
         AppointmentStatus.CANCELLED,
-        AppointmentStatus.NO_SHOW,
+        AppointmentStatus.MISSED,
         AppointmentStatus.REJECTED,
     }:
         raise InvalidStateTransitionError(
-            "Cannot add service items to a finalized appointment.",
+            "Cannot add activities to an in-flight or finalized appointment.",
             details={"current_status": appt.status.value},
         )
 
-    item = AppointmentServiceItem(
+    activity = AppointmentActivity(
         appointment_id=appt.id,
         agency_id=agency_id,
-        service_type=payload.service_type,
+        name=payload.name,
         planned_minutes=payload.planned_minutes,
         notes=payload.notes,
     )
-    session.add(item)
+    session.add(activity)
     try:
         await session.flush()
     except IntegrityError as exc:
         await session.rollback()
         raise ValidationError(
-            "Service item violates a check constraint.",
+            "Activity violates a check constraint.",
             details={"constraint": _extract_constraint(exc)},
         ) from exc
-    return item
+    return activity
 
 
-async def update_service_item(
+async def update_activity(
     session: AsyncSession,
     *,
-    item_id: uuid.UUID,
+    activity_id: uuid.UUID,
     appointment_id: uuid.UUID,
     agency_id: uuid.UUID,
-    payload: AppointmentServiceItemUpdateRequest,
-) -> AppointmentServiceItem:
-    """Patch a service item (status, notes, etc.)."""
-    item = await _get_service_item_or_404(
+    payload: AppointmentActivityUpdateRequest,
+) -> AppointmentActivity:
+    """Patch an activity (name, planned_minutes, notes)."""
+    activity = await _get_activity_or_404(
         session,
-        item_id=item_id,
+        activity_id=activity_id,
         appointment_id=appointment_id,
         agency_id=agency_id,
     )
 
-    if payload.service_type is not None:
-        item.service_type = payload.service_type
+    if payload.name is not None:
+        activity.name = payload.name
     if payload.planned_minutes is not None:
-        item.planned_minutes = payload.planned_minutes
+        activity.planned_minutes = payload.planned_minutes
     if payload.notes is not None:
-        item.notes = payload.notes
-    if payload.status is not None and payload.status != item.status:
-        # Don't allow rewinding a DONE item back to PENDING — that would
-        # hide billing-relevant state.
-        if item.status == ServiceItemStatus.DONE and payload.status != ServiceItemStatus.DONE:
+        activity.notes = payload.notes
+    if payload.status is not None and payload.status != activity.status:
+        if (
+            activity.status == ServiceItemStatus.DONE
+            and payload.status != ServiceItemStatus.DONE
+        ):
             raise InvalidStateTransitionError(
-                "Cannot move a DONE service item back to a non-final status.",
-                details={"from": item.status.value, "to": payload.status.value},
+                "Cannot move a DONE activity back to a non-final status.",
+                details={"from": activity.status.value, "to": payload.status.value},
             )
-        item.status = payload.status
+        activity.status = payload.status
 
     try:
         await session.flush()
     except IntegrityError as exc:
         await session.rollback()
         raise ValidationError(
-            "Service item update violates a check constraint.",
+            "Activity update violates a check constraint.",
             details={"constraint": _extract_constraint(exc)},
         ) from exc
-    return item
+    return activity
 
 
-async def delete_service_item(
+async def delete_activity(
     session: AsyncSession,
     *,
-    item_id: uuid.UUID,
+    activity_id: uuid.UUID,
     appointment_id: uuid.UUID,
     agency_id: uuid.UUID,
 ) -> None:
-    """Remove a service item.
+    """Remove an activity.
 
-    Only allowed for PENDING items — once an item has been delivered
-    (DONE / NOT_DONE / etc.) it's part of the clinical record.
+    Only allowed for PENDING activities — once an item has been
+    delivered it's part of the clinical record.
     """
-    item = await _get_service_item_or_404(
+    activity = await _get_activity_or_404(
         session,
-        item_id=item_id,
+        activity_id=activity_id,
         appointment_id=appointment_id,
         agency_id=agency_id,
     )
-    if item.status != ServiceItemStatus.PENDING:
+    if activity.status != ServiceItemStatus.PENDING:
         raise InvalidStateTransitionError(
-            "Cannot delete a service item that has been delivered.",
-            details={"current_status": item.status.value},
+            "Cannot delete an activity that has been delivered.",
+            details={"current_status": activity.status.value},
         )
-    await session.delete(item)
+    await session.delete(activity)
     await session.flush()
 
 
 # --------------------------------------------------------------------------
-# Lifecycle — patient-facing confirm / reschedule / cancel-request
-# --------------------------------------------------------------------------
-async def confirm_appointment(
-    session: AsyncSession,
-    *,
-    appointment_id: uuid.UUID,
-    agency_id: uuid.UUID,
-    actor_user_id: uuid.UUID,
-    actor_role: UserRole,
-    payload: AppointmentConfirmRequest,
-    ip_address: str | None = None,
-    user_agent: str | None = None,
-) -> tuple[Appointment, AppointmentConfirmation]:
-    """Patient/guardian/admin confirms or declines an appointment.
-
-    Allowed from `AWAITING_CONFIRMATION`, `SCHEDULED`, `NOTIFICATION_SENT`
-    (admin override). Writes a row to `appointment_confirmations` (1:1
-    upsert — re-confirming overwrites the prior row) and appends an
-    `AppointmentEvent`. Best-effort fan-out to staff notifications.
-    """
-    appt = await _get_appointment_or_404(
-        session, appointment_id=appointment_id, agency_id=agency_id
-    )
-
-    # Role gate.
-    if actor_role not in {UserRole.PATIENT, UserRole.GUARDIAN, UserRole.AGENCY_ADMIN}:
-        raise CrossAgencyAccessDeniedError(
-            details={"reason": "only PATIENT/GUARDIAN/AGENCY_ADMIN may confirm"}
-        )
-
-    # Ownership/relationship check (AGENCY_ADMIN passes through).
-    await _assert_actor_may_act_for_patient(
-        session,
-        actor_user_id=actor_user_id,
-        actor_role=actor_role,
-        patient_id=appt.patient_id,
-        agency_id=agency_id,
-    )
-
-    # State-machine gate.
-    allowed_from = {
-        AppointmentStatus.AWAITING_CONFIRMATION,
-        AppointmentStatus.SCHEDULED,
-        AppointmentStatus.NOTIFICATION_SENT,
-    }
-    if appt.status not in allowed_from:
-        raise InvalidStateTransitionError(
-            "Cannot confirm an appointment in its current state.",
-            details={"current_status": appt.status.value},
-        )
-
-    from_status = appt.status
-    new_confirmation_status = (
-        ConfirmationStatus.DECLINED if payload.declined else ConfirmationStatus.CONFIRMED
-    )
-
-    # Upsert the confirmation row (1:1 with the appointment).
-    confirmation_role = (
-        UserRole.GUARDIAN if actor_role == UserRole.GUARDIAN else UserRole.PATIENT
-    )
-
-    existing = (
-        await session.execute(
-            select(AppointmentConfirmation).where(
-                AppointmentConfirmation.appointment_id == appt.id
-            )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
-        existing.confirmed_by = actor_user_id
-        existing.confirmation_role = confirmation_role
-        existing.status = new_confirmation_status
-        existing.comment = payload.comment
-        existing.created_at = utc_now()
-        confirmation = existing
-    else:
-        confirmation = AppointmentConfirmation(
-            appointment_id=appt.id,
-            confirmed_by=actor_user_id,
-            confirmation_role=confirmation_role,
-            status=new_confirmation_status,
-            comment=payload.comment,
-        )
-        session.add(confirmation)
-        await session.flush()
-
-    # Move the appointment forward only on CONFIRMED; DECLINED leaves
-    # the status as-is (admin still has to /cancel to finalise).
-    if not payload.declined:
-        if not _is_transition_allowed(appt.status, AppointmentStatus.CONFIRMED):
-            raise InvalidStateTransitionError(
-                f"Cannot transition from {appt.status.value} to CONFIRMED.",
-                details={"from": appt.status.value},
-            )
-        appt.status = AppointmentStatus.CONFIRMED
-        appt.confirmation_status = ConfirmationStatus.CONFIRMED
-        appt.confirmed_at = utc_now()
-        if payload.comment:
-            appt.confirmation_note = payload.comment
-
-    to_status = appt.status
-
-    await append_appointment_event(
-        session,
-        agency_id=agency_id,
-        appointment_id=appt.id,
-        event_type=AppointmentEventType.CONFIRMATION_FILED,
-        actor_user_id=actor_user_id,
-        from_status=from_status,
-        to_status=to_status,
-        metadata={"declined": payload.declined, "comment": payload.comment},
-        ip_address=ip_address,
-        user_agent=user_agent,
-    )
-
-    # Best-effort staff notification (only on confirmed, not declined) is
-    # now scheduled by the router after commit via FastAPI BackgroundTasks,
-    # so the SMTP/Twilio call cannot block this endpoint.
-
-    await session.flush()
-    return appt, confirmation
-
-
-async def request_reschedule(
-    session: AsyncSession,
-    *,
-    appointment_id: uuid.UUID,
-    agency_id: uuid.UUID,
-    actor_user_id: uuid.UUID,
-    actor_role: UserRole,
-    payload: AppointmentRescheduleRequest,
-    ip_address: str | None = None,
-    user_agent: str | None = None,
-) -> Appointment:
-    """Patient/guardian/admin proposes a new visit window.
-
-    The appointment moves to `RESCHEDULE_REQUESTED`; the admin reviews
-    and either patches the existing `scheduled_start`/`scheduled_end`
-    (via PATCH) or cancels. The proposed window is stored in the event's
-    `metadata` so it's visible in the timeline.
-    """
-    appt = await _get_appointment_or_404(
-        session, appointment_id=appointment_id, agency_id=agency_id
-    )
-
-    if actor_role not in {UserRole.PATIENT, UserRole.GUARDIAN, UserRole.AGENCY_ADMIN}:
-        raise CrossAgencyAccessDeniedError(
-            details={"reason": "only PATIENT/GUARDIAN/AGENCY_ADMIN may request"}
-        )
-
-    await _assert_actor_may_act_for_patient(
-        session,
-        actor_user_id=actor_user_id,
-        actor_role=actor_role,
-        patient_id=appt.patient_id,
-        agency_id=agency_id,
-    )
-
-    allowed_from = {
-        AppointmentStatus.AWAITING_CONFIRMATION,
-        AppointmentStatus.SCHEDULED,
-        AppointmentStatus.NOTIFICATION_SENT,
-        AppointmentStatus.CONFIRMED,
-    }
-    if appt.status not in allowed_from:
-        raise InvalidStateTransitionError(
-            "Cannot request a reschedule in the current state.",
-            details={"current_status": appt.status.value},
-        )
-    if not _is_transition_allowed(appt.status, AppointmentStatus.RESCHEDULE_REQUESTED):
-        raise InvalidStateTransitionError(
-            f"Cannot transition from {appt.status.value} to RESCHEDULE_REQUESTED.",
-            details={"from": appt.status.value},
-        )
-
-    from_status = appt.status
-    appt.status = AppointmentStatus.RESCHEDULE_REQUESTED
-    to_status = appt.status
-
-    await append_appointment_event(
-        session,
-        agency_id=agency_id,
-        appointment_id=appt.id,
-        event_type=AppointmentEventType.RESCHEDULE_REQUESTED,
-        actor_user_id=actor_user_id,
-        from_status=from_status,
-        to_status=to_status,
-        metadata={
-            "proposed_start": payload.proposed_start.isoformat(),
-            "proposed_end": payload.proposed_end.isoformat(),
-            "comment": payload.comment,
-        },
-        ip_address=ip_address,
-        user_agent=user_agent,
-    )
-
-    # Best-effort reschedule notification is now scheduled by the
-    # router after commit via FastAPI BackgroundTasks, so the
-    # SMTP/Twilio call cannot block this endpoint.
-
-    await session.flush()
-    return appt
-
-
-async def request_cancellation(
-    session: AsyncSession,
-    *,
-    appointment_id: uuid.UUID,
-    agency_id: uuid.UUID,
-    actor_user_id: uuid.UUID,
-    actor_role: UserRole,
-    payload: AppointmentCancellationRequest,
-    ip_address: str | None = None,
-    user_agent: str | None = None,
-) -> Appointment:
-    """Patient/guardian/admin requests cancellation. Moves the appointment
-    to `CANCELLATION_REQUESTED`; admin finalises via the existing /cancel."""
-    appt = await _get_appointment_or_404(
-        session, appointment_id=appointment_id, agency_id=agency_id
-    )
-
-    if actor_role not in {UserRole.PATIENT, UserRole.GUARDIAN, UserRole.AGENCY_ADMIN}:
-        raise CrossAgencyAccessDeniedError(
-            details={"reason": "only PATIENT/GUARDIAN/AGENCY_ADMIN may request"}
-        )
-
-    await _assert_actor_may_act_for_patient(
-        session,
-        actor_user_id=actor_user_id,
-        actor_role=actor_role,
-        patient_id=appt.patient_id,
-        agency_id=agency_id,
-    )
-
-    allowed_from = {
-        AppointmentStatus.AWAITING_CONFIRMATION,
-        AppointmentStatus.CONFIRMED,
-        AppointmentStatus.SCHEDULED,
-        AppointmentStatus.NOTIFICATION_SENT,
-        AppointmentStatus.RESCHEDULE_REQUESTED,
-    }
-    if appt.status not in allowed_from:
-        raise InvalidStateTransitionError(
-            "Cannot request cancellation in the current state.",
-            details={"current_status": appt.status.value},
-        )
-    if not _is_transition_allowed(
-        appt.status, AppointmentStatus.CANCELLATION_REQUESTED
-    ):
-        raise InvalidStateTransitionError(
-            f"Cannot transition from {appt.status.value} to CANCELLATION_REQUESTED.",
-            details={"from": appt.status.value},
-        )
-
-    from_status = appt.status
-    appt.status = AppointmentStatus.CANCELLATION_REQUESTED
-    # Stash the reason so admin reviewers see it on the row.
-    appt.cancelled_reason = payload.reason
-    to_status = appt.status
-
-    await append_appointment_event(
-        session,
-        agency_id=agency_id,
-        appointment_id=appt.id,
-        event_type=AppointmentEventType.CANCELLATION_REQUESTED,
-        actor_user_id=actor_user_id,
-        from_status=from_status,
-        to_status=to_status,
-        metadata={"reason": payload.reason},
-        ip_address=ip_address,
-        user_agent=user_agent,
-    )
-
-    # Best-effort cancellation notification is now scheduled by the
-    # router after commit via FastAPI BackgroundTasks, so the
-    # SMTP/Twilio call cannot block this endpoint.
-
-    await session.flush()
-    return appt
-
-
-async def list_appointment_events(
-    session: AsyncSession,
-    *,
-    appointment_id: uuid.UUID,
-    agency_id: uuid.UUID,
-) -> list[AppointmentEvent]:
-    """List events for one appointment, oldest first (timeline order)."""
-    await _get_appointment_or_404(
-        session, appointment_id=appointment_id, agency_id=agency_id
-    )
-    stmt = (
-        select(AppointmentEvent)
-        .where(
-            AppointmentEvent.appointment_id == appointment_id,
-            AppointmentEvent.agency_id == agency_id,
-        )
-        .order_by(AppointmentEvent.created_at.asc(), AppointmentEvent.id)
-    )
-    return list((await session.execute(stmt)).scalars().all())
-
-
-async def get_latest_confirmation(
-    session: AsyncSession,
-    *,
-    appointment_id: uuid.UUID,
-    agency_id: uuid.UUID,
-) -> AppointmentConfirmation | None:
-    """Return the (single) confirmation row for an appointment, or None."""
-    await _get_appointment_or_404(
-        session, appointment_id=appointment_id, agency_id=agency_id
-    )
-    return (
-        await session.execute(
-            select(AppointmentConfirmation).where(
-                AppointmentConfirmation.appointment_id == appointment_id
-            )
-        )
-    ).scalar_one_or_none()
-
-
-# --------------------------------------------------------------------------
-# Summary serialization helpers
+# Summary serialization helper
 # --------------------------------------------------------------------------
 def _humanize_enum(value: object) -> str | None:
-    """Render a StrEnum (e.g. `ServiceType.PERSONAL_CARE`) as a human
-    label ("Personal Care"). Returns None for None.
+    """Render a `StrEnum` value as a human-readable label.
 
-    Uses the enum's `.value` so the wire format of the underlying
-    constants stays the source of truth (no separate label table).
+    Backwards-compat shim — prefer `humanize_enum` from
+    `src.shared.utils.labels`.
     """
-    if value is None:
-        return None
-    raw = getattr(value, "value", str(value))
-    # Title-case each underscore-separated segment ("PERSONAL_CARE" →
-    # "Personal Care", "245D" stays "245D").
-    return " ".join(
-        seg.capitalize() if seg.isalpha() else seg for seg in raw.split("_")
-    )
+    from src.shared.utils.labels import humanize_enum
+
+    return humanize_enum(value)
 
 
 def _summarize_to_dict(appt: Appointment) -> dict:
     """Project a (eager-loaded) Appointment ORM row into the dict shape
-    expected by `AppointmentSummaryResponse`. Joins the caregiver name /
-    phone / staff_code via `Appointment.staff.user`, the program name
-    from the `program_type` enum, and the first service-item label.
+    expected by `AppointmentSummaryResponse`.
 
-    Safe to call even if `appt.staff` or `appt.service_items` aren't
+    Safe to call even if `appt.staff` or `appt.activities` aren't
     eagerly loaded — all joined fields default to None.
     """
-    # Caregiver: joined via staff → user
     staff_name: str | None = None
     staff_phone: str | None = None
     staff_code: str | None = None
@@ -1330,17 +811,13 @@ def _summarize_to_dict(appt: Appointment) -> dict:
             staff_phone = getattr(user, "phone", None)
         staff_code = getattr(staff, "staff_code", None)
 
-    # Program + service-item label
     program_name = _humanize_enum(getattr(appt, "program_type", None))
-    service_type_label: str | None = None
-    service_items = getattr(appt, "service_items", None)
-    if service_items:
-        first = service_items[0]
-        service_type_label = _humanize_enum(getattr(first, "service_type", None))
+    activity_label: str | None = None
+    activities = getattr(appt, "activities", None)
+    if activities:
+        first = activities[0]
+        activity_label = getattr(first, "name", None)
 
-    # `location` is the free-text entered at scheduling time (the agency
-    # types e.g. "123 Oak St, Saint Paul MN"). The schema exposes it as
-    # `location_label` to make the semantic intent clear.
     location_label = getattr(appt, "location", None)
 
     return {
@@ -1352,33 +829,28 @@ def _summarize_to_dict(appt: Appointment) -> dict:
         "scheduled_start": appt.scheduled_start,
         "scheduled_end": appt.scheduled_end,
         "status": appt.status,
-        "confirmation_status": appt.confirmation_status,
         "created_at": appt.created_at,
         "updated_at": appt.updated_at,
         "staff_name": staff_name,
         "staff_phone": staff_phone,
         "staff_code": staff_code,
         "program_name": program_name,
-        "service_type_label": service_type_label,
+        "service_type_label": activity_label,
         "location_label": location_label,
     }
 
 
 __all__ = [
-    "add_service_item",
+    "add_activity",
     "assign_staff",
     "cancel_appointment",
-    "confirm_appointment",
     "create_appointment",
-    "delete_service_item",
+    "delete_activity",
     "get_appointment",
-    "get_latest_confirmation",
-    "list_appointment_events",
+    "list_activities",
     "list_appointments",
-    "list_service_items",
-    "request_cancellation",
-    "request_reschedule",
+    "mark_appointment_ready",
     "transition_status",
+    "update_activity",
     "update_appointment",
-    "update_service_item",
 ]

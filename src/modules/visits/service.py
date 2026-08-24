@@ -1,18 +1,20 @@
-"""Visits service — business logic for visits, service items, notes,
-verification, and issues.
+"""Visits service — business logic for the materialized attendance record.
 
 Routes delegate here. This is the only place that composes ORM operations,
-enforces business rules (state machine, NOT_DONE-reason validation,
-verification-vs-dispute semantics, etc.), and raises the right domain
-exceptions.
+enforces business rules (state machine, activity-completion gate,
+billing-confirmation gate, signature-required gate), and raises the right
+domain exceptions.
 
-Visit lifecycle (see `VisitStatus`):
+Lifecycle (see `VisitStatus`, mirrors `AppointmentStatus`):
 
-  CHECKED_IN → IN_PROGRESS → CHECKED_OUT → COMPLETED
+  SCHEDULED → READY → IN_PROGRESS → AWAITING_SIGNATURE → COMPLETED
+              ↘  CANCELLED, MISSED, REJECTED  ↙
 
-Terminal: COMPLETED. Transitions back to CHECKED_IN are not allowed —
-once checked out, the visit is in the post-service phase (verification
-+ issues + billing pipeline).
+Per the canonical spec (`QlockCare_appointemnt_flow.md`):
+  - §5: every activity must be DONE (or NOT_APPLICABLE) before the
+    caregiver can transition to AWAITING_SIGNATURE
+  - §6: the caregiver must confirm billing before the same transition
+  - §8: a signature (PATIENT or GUARDIAN) is required before COMPLETED
 
 RLS is the source of truth for tenant scoping; functions still take
 `agency_id` for defence in depth.
@@ -31,48 +33,72 @@ from sqlalchemy.orm import selectinload
 
 from src.core.exceptions import (
     ConflictError,
+    CrossAgencyAccessDeniedError,
     DuplicateResourceError,
     InvalidStateTransitionError,
     NotFoundError,
     ValidationError,
 )
-from src.modules.appointments.models import Appointment, AppointmentServiceItem
+from src.modules.appointments.models import Appointment, AppointmentActivity
 from src.modules.staff.models import StaffProfile
 from src.modules.visits.models import (
-    ServiceVerification,
+    AppointmentSignature,
+    EVVRecord,
     Visit,
-    VisitIssue,
+    VisitActivityDelivery,
     VisitNote,
-    VisitServiceItem,
 )
 from src.modules.visits.schemas import (
-    ServiceVerificationCreateRequest,
-    VisitCheckInRequest,
-    VisitCheckOutRequest,
+    VisitActivityUpdateRequest,
+    VisitConfirmBillingRequest,
     VisitCreateRequest,
-    VisitIssueCreateRequest,
-    VisitIssueResolveRequest,
+    VisitEndRequest,
     VisitLocationPingRequest,
-    VisitServiceItemCreateRequest,
-    VisitServiceItemUpdateRequest,
     VisitStatusTransitionRequest,
 )
 from src.shared.domain.enums import (
     ServiceItemStatus,
     UserRole,
-    VerificationStatus,
     VisitStatus,
 )
 from src.shared.utils.datetime_utils import utc_now
 
+
 # --------------------------------------------------------------------------
-# State machine (visit-level)
+# State machine (5-state lifecycle per spec)
 # --------------------------------------------------------------------------
 _ALLOWED_TRANSITIONS: dict[VisitStatus, frozenset[VisitStatus]] = {
-    VisitStatus.CHECKED_IN: frozenset({VisitStatus.IN_PROGRESS}),
-    VisitStatus.IN_PROGRESS: frozenset({VisitStatus.CHECKED_OUT}),
-    VisitStatus.CHECKED_OUT: frozenset({VisitStatus.COMPLETED}),
+    VisitStatus.SCHEDULED: frozenset(
+        {
+            VisitStatus.READY,
+            VisitStatus.CANCELLED,
+            VisitStatus.REJECTED,
+        }
+    ),
+    VisitStatus.READY: frozenset(
+        {
+            VisitStatus.IN_PROGRESS,
+            VisitStatus.CANCELLED,
+            VisitStatus.MISSED,
+        }
+    ),
+    VisitStatus.IN_PROGRESS: frozenset(
+        {
+            VisitStatus.AWAITING_SIGNATURE,
+            VisitStatus.CANCELLED,
+            VisitStatus.MISSED,
+        }
+    ),
+    VisitStatus.AWAITING_SIGNATURE: frozenset(
+        {
+            VisitStatus.COMPLETED,
+            VisitStatus.CANCELLED,
+        }
+    ),
     VisitStatus.COMPLETED: frozenset(),  # terminal
+    VisitStatus.CANCELLED: frozenset(),  # terminal
+    VisitStatus.MISSED: frozenset(),  # terminal
+    VisitStatus.REJECTED: frozenset(),  # terminal
 }
 
 
@@ -109,21 +135,25 @@ async def _get_visit_or_404(
     stmt = select(Visit).where(
         Visit.id == visit_id, Visit.agency_id == agency_id
     )
-    # Always eager-load staff→user so `_to_response` can hydrate
-    # `staff_name`. The relationship is one short IN-join (the staff
-    # row + the user row), so the cost is negligible on a per-detail
-    # call. Pass `with_staff=False` only for hot internal paths that
-    # don't need the name (currently none — default is True).
     if with_staff:
         stmt = stmt.options(
             selectinload(Visit.staff).selectinload(StaffProfile.user)
         )
     if with_relations:
+        # Eager-load everything the staff Visit Summary screen renders
+        # in one round trip:
+        #   - `evv_record` (start + end + GPS + verification_status)
+        #   - `signature` (signer_display_name + image)
+        #   - `activity_deliveries.activity` (joined for `name` +
+        #     `planned_minutes`)
+        #   - `notes` (free-form narrative)
         stmt = stmt.options(
-            selectinload(Visit.service_items),
+            selectinload(Visit.evv_record),
+            selectinload(Visit.signature),
+            selectinload(Visit.activity_deliveries).selectinload(
+                VisitActivityDelivery.activity
+            ),
             selectinload(Visit.notes),
-            selectinload(Visit.verification),
-            selectinload(Visit.issues),
         )
     v = (await session.execute(stmt)).scalar_one_or_none()
     if v is None:
@@ -148,37 +178,48 @@ async def _get_appointment_or_404(
     return a
 
 
-async def _get_service_item_or_404(
+async def _get_activity_or_404(
     session: AsyncSession,
     *,
-    item_id: uuid.UUID,
-    visit_id: uuid.UUID,
-) -> VisitServiceItem:
-    stmt = select(VisitServiceItem).where(
-        VisitServiceItem.id == item_id,
-        VisitServiceItem.visit_id == visit_id,
+    activity_id: uuid.UUID,
+    appointment_id: uuid.UUID,
+    agency_id: uuid.UUID,
+) -> AppointmentActivity:
+    stmt = select(AppointmentActivity).where(
+        AppointmentActivity.id == activity_id,
+        AppointmentActivity.appointment_id == appointment_id,
+        AppointmentActivity.agency_id == agency_id,
     )
-    i = (await session.execute(stmt)).scalar_one_or_none()
-    if i is None:
+    a = (await session.execute(stmt)).scalar_one_or_none()
+    if a is None:
         raise NotFoundError(
-            details={"resource": "visit_service_item", "id": str(item_id)}
+            details={"resource": "appointment_activity", "id": str(activity_id)}
         )
-    return i
+    return a
 
 
-async def _get_issue_or_404(
+async def _get_activity_delivery_or_404(
     session: AsyncSession,
     *,
-    issue_id: uuid.UUID,
+    activity_id: uuid.UUID,
     visit_id: uuid.UUID,
-) -> VisitIssue:
-    stmt = select(VisitIssue).where(
-        VisitIssue.id == issue_id, VisitIssue.visit_id == visit_id
+    agency_id: uuid.UUID,
+) -> VisitActivityDelivery:
+    stmt = select(VisitActivityDelivery).where(
+        VisitActivityDelivery.activity_id == activity_id,
+        VisitActivityDelivery.visit_id == visit_id,
+        VisitActivityDelivery.agency_id == agency_id,
     )
-    i = (await session.execute(stmt)).scalar_one_or_none()
-    if i is None:
-        raise NotFoundError(details={"resource": "visit_issue", "id": str(issue_id)})
-    return i
+    row = (await session.execute(stmt)).scalar_one_or_none()
+    if row is None:
+        raise NotFoundError(
+            details={
+                "resource": "visit_activity_delivery",
+                "activity_id": str(activity_id),
+                "visit_id": str(visit_id),
+            }
+        )
+    return row
 
 
 def _extract_constraint(exc: IntegrityError) -> str:
@@ -189,8 +230,27 @@ def _extract_constraint(exc: IntegrityError) -> str:
     return "unknown"
 
 
+def _evv_verification_status(accuracy_m: Decimal | None) -> str:
+    """Derive an EVV verification status from the GPS accuracy.
+
+    EVV spec: a fix accurate to <=100m is "VERIFIED", <=500m is "PENDING"
+    (admin should review), anything else is "FAILED".
+    """
+    if accuracy_m is None:
+        return "PENDING"
+    try:
+        a = float(accuracy_m)
+    except (TypeError, ValueError):
+        return "PENDING"
+    if a <= 100:
+        return "VERIFIED"
+    if a <= 500:
+        return "PENDING"
+    return "FAILED"
+
+
 # --------------------------------------------------------------------------
-# Visits — CRUD
+# Visit CRUD
 # --------------------------------------------------------------------------
 async def create_visit(
     session: AsyncSession,
@@ -199,12 +259,13 @@ async def create_visit(
     payload: VisitCreateRequest,
     created_by_user_id: uuid.UUID,
 ) -> Visit:
-    """Create a new visit (typically on staff check-in).
+    """Create a new visit (`READY → IN_PROGRESS`).
 
-    Verifies the appointment exists at the same agency and that the
-    appointment already has a staff member assigned (we use that staff
-    as the visit's `staff_id`). The visit row starts in CHECKED_IN
-    with `check_in_time = now()`.
+    Verifies the appointment is at the same agency and is in `READY`.
+    The visit row starts in `IN_PROGRESS`. The `EVVRecord.start_*` block
+    is stamped from the supplied GPS. We seed one
+    `VisitActivityDelivery` row per parent `AppointmentActivity` (1:1)
+    so the caregiver can mark each one DONE / NOT_DONE / etc.
     """
     await _assert_agency_active(session, agency_id)
 
@@ -217,17 +278,12 @@ async def create_visit(
             details={"appointment_id": str(appt.id)},
         )
 
-    # UNIQUE(appointment_id) constraint catches double-check-ins
+    # UNIQUE(appointment_id) constraint catches double check-ins.
     visit = Visit(
         appointment_id=appt.id,
         agency_id=agency_id,
         staff_id=appt.staff_id,
-        status=VisitStatus.CHECKED_IN,
-        check_in_time=utc_now(),
-        check_in_lat=payload.check_in_lat,
-        check_in_lng=payload.check_in_lng,
-        check_in_accuracy_m=payload.check_in_accuracy_m,
-        check_in_device_id=payload.check_in_device_id,
+        status=VisitStatus.IN_PROGRESS,
     )
     session.add(visit)
     try:
@@ -239,13 +295,28 @@ async def create_visit(
             details={"constraint": _extract_constraint(exc)},
         ) from exc
 
-    # Optionally seed visit_service_items from the appointment's existing
-    # service items (1:1 mapping). Callers can then mark each one DONE.
-    for appt_item in appt.service_items:
+    # Seed EVV start record.
+    evv = EVVRecord(
+        visit_id=visit.id,
+        agency_id=agency_id,
+        start_time=utc_now(),
+        start_lat=payload.start_lat,
+        start_lng=payload.start_lng,
+        start_accuracy_m=payload.start_accuracy_m,
+        start_device_id=payload.start_device_id,
+        start_verification_status=_evv_verification_status(
+            payload.start_accuracy_m
+        ),
+    )
+    session.add(evv)
+
+    # Seed one VisitActivityDelivery row per parent activity.
+    for appt_activity in appt.activities:
         session.add(
-            VisitServiceItem(
+            VisitActivityDelivery(
                 visit_id=visit.id,
-                appointment_service_item_id=appt_item.id,
+                activity_id=appt_activity.id,
+                agency_id=agency_id,
             )
         )
     try:
@@ -253,7 +324,7 @@ async def create_visit(
     except IntegrityError as exc:
         await session.rollback()
         raise ValidationError(
-            "Could not seed visit service items.",
+            "Could not seed visit activity deliveries.",
             details={"constraint": _extract_constraint(exc)},
         ) from exc
 
@@ -287,18 +358,22 @@ async def list_visits(
     page: int = 1,
     page_size: int = 20,
 ) -> tuple[Sequence[Visit], int]:
+    """Paginated list of visits at the caller's agency.
+
+    Eager-loads staff→user so the EVV Live Monitor renders real names
+    in a single round trip. No joined `patient_name` here — the live
+    monitor renders the staff name on each card; patient names live on
+    the appointment view.
+    """
     page = max(1, page)
     page_size = max(1, min(100, page_size))
 
     base = (
         select(Visit)
         .where(Visit.agency_id == agency_id)
-        # Pre-load staff→user so the EVV Live Monitor can render the
-        # real staff name on each card (and the map pin tooltip).
-        # `_to_response` reads `visit.staff.user.full_name`; without
-        # this eager load `staff_name` would always be None.
         .options(
-            selectinload(Visit.staff).selectinload(StaffProfile.user)
+            selectinload(Visit.staff).selectinload(StaffProfile.user),
+            selectinload(Visit.evv_record),
         )
     )
     count_base = (
@@ -313,9 +388,6 @@ async def list_visits(
         base = base.where(Visit.staff_id == staff_id)
         count_base = count_base.where(Visit.staff_id == staff_id)
     if patient_id is not None:
-        # Filter through the appointment join.
-        from src.modules.appointments.models import Appointment
-
         base = base.join(
             Appointment, Appointment.id == Visit.appointment_id
         ).where(Appointment.patient_id == patient_id)
@@ -329,93 +401,73 @@ async def list_visits(
         base = base.where(Visit.sharing_location.is_(True))
         count_base = count_base.where(Visit.sharing_location.is_(True))
 
-    base = (
-        base.order_by(Visit.check_in_time.desc(), Visit.id)
-        .limit(page_size)
-        .offset((page - 1) * page_size)
-    )
+    base = base.order_by(Visit.created_at.desc(), Visit.id).limit(
+        page_size
+    ).offset((page - 1) * page_size)
     rows = (await session.execute(base)).scalars().all()
     total = (await session.execute(count_base)).scalar_one()
     return rows, int(total)
 
 
-async def check_in_visit(
+# --------------------------------------------------------------------------
+# State transitions — the gateful ones
+# --------------------------------------------------------------------------
+async def _assert_can_request_signature(visit: Visit) -> None:
+    """Spec §5 + §6 gate: all activities done AND billing confirmed.
+
+    Raises ConflictError with a structured `details` payload so the FE
+    can show a targeted error ("3 activities still pending" vs.
+    "Please confirm billing first").
+    """
+    pending_activities = [
+        d for d in visit.activity_deliveries if d.status == ServiceItemStatus.PENDING
+    ]
+    if pending_activities:
+        raise ConflictError(
+            "All required activities must be completed before ending this visit.",
+            details={
+                "reason": "activities_pending",
+                "pending_count": len(pending_activities),
+                "pending_activity_ids": [str(a.activity_id) for a in pending_activities],
+            },
+        )
+    if visit.billing_confirmed_at is None:
+        raise ConflictError(
+            "Please confirm billing before submitting this visit.",
+            details={"reason": "billing_not_confirmed"},
+        )
+
+
+async def _assert_signature_exists(visit: Visit) -> None:
+    """Spec §8 gate: signature is mandatory before COMPLETED."""
+    if visit.signature is None:
+        raise ConflictError(
+            "A patient or guardian signature is required to complete this visit.",
+            details={"reason": "signature_missing"},
+        )
+
+
+async def confirm_billing(
     session: AsyncSession,
     *,
     visit_id: uuid.UUID,
     agency_id: uuid.UUID,
-    payload: VisitCheckInRequest,
+    payload: VisitConfirmBillingRequest,  # noqa: ARG001 — kept for future fields
+    confirmed_by_user_id: uuid.UUID,
 ) -> Visit:
-    """Update the check-in fields on an existing visit (typically no-op
-    if check-in was already recorded by `create_visit`).
+    """Spec §6 — caregiver ticks "I confirm the visit and billing
+    information is correct".
 
-    Only valid before check-out. After that, check-in info is locked.
+    Idempotent — re-confirming is a no-op (the timestamp stays as the
+    first confirmation time, which is the audit-quality signal).
     """
     visit = await _get_visit_or_404(
         session, visit_id=visit_id, agency_id=agency_id
     )
-    if visit.status != VisitStatus.CHECKED_IN or visit.check_out_time is not None:
-        raise InvalidStateTransitionError(
-            "Cannot modify check-in after check-out.",
-            details={"current_status": visit.status.value},
-        )
-
-    if payload.check_in_lat is not None:
-        visit.check_in_lat = payload.check_in_lat
-    if payload.check_in_lng is not None:
-        visit.check_in_lng = payload.check_in_lng
-    if payload.check_in_accuracy_m is not None:
-        visit.check_in_accuracy_m = payload.check_in_accuracy_m
-    if payload.check_in_device_id is not None:
-        visit.check_in_device_id = payload.check_in_device_id
-
-    await session.flush()
-    return visit
-
-
-async def check_out_visit(
-    session: AsyncSession,
-    *,
-    visit_id: uuid.UUID,
-    agency_id: uuid.UUID,
-    payload: VisitCheckOutRequest,
-) -> Visit:
-    """Record the actual check-out: stamps time, lat/lng, and duration."""
-    visit = await _get_visit_or_404(
-        session, visit_id=visit_id, agency_id=agency_id
-    )
-    if visit.check_in_time is None:
-        raise ConflictError(
-            "Cannot check out a visit that never checked in.",
-            details={"visit_id": str(visit.id)},
-        )
-    if visit.check_out_time is not None:
-        raise ConflictError(
-            "Visit is already checked out.",
-            details={"visit_id": str(visit.id), "check_out_time": visit.check_out_time.isoformat()},
-        )
-    if visit.status == VisitStatus.COMPLETED:
-        raise InvalidStateTransitionError(
-            "Cannot check out a visit that is already completed.",
-            details={"current_status": visit.status.value},
-        )
-
-    now = utc_now()
-    visit.check_out_time = now
-    visit.check_out_lat = payload.check_out_lat
-    visit.check_out_lng = payload.check_out_lng
-    visit.check_out_accuracy_m = payload.check_out_accuracy_m
-    visit.duration_seconds = int((now - visit.check_in_time).total_seconds())
-
-    # Auto-add a note if one was provided alongside the check-out.
-    if payload.note:
-        # Caller's user id is not threaded through here; the router adds
-        # the note as a separate request. This keeps the API simple.
-        pass
-
-    # Auto-progress to CHECKED_OUT (then COMPLETED on the next transition)
-    visit.status = VisitStatus.CHECKED_OUT
-    visit.sharing_location = False
+    if visit.billing_confirmed_at is not None:
+        return visit
+    visit.billing_confirmed_at = utc_now()
+    visit.billing_confirmed_by_user_id = confirmed_by_user_id
     await session.flush()
     return visit
 
@@ -427,9 +479,16 @@ async def transition_visit_status(
     agency_id: uuid.UUID,
     payload: VisitStatusTransitionRequest,
 ) -> Visit:
-    """Walk the visit lifecycle (CHECKED_IN → IN_PROGRESS → CHECKED_OUT → COMPLETED)."""
+    """Walk the 5-state lifecycle with the spec's gates.
+
+      IN_PROGRESS → AWAITING_SIGNATURE
+          requires all activities DONE/NOT_APPLICABLE/NEEDS_FOLLOW_UP
+          AND `billing_confirmed_at` set.
+      AWAITING_SIGNATURE → COMPLETED
+          requires an `AppointmentSignature` row.
+    """
     visit = await _get_visit_or_404(
-        session, visit_id=visit_id, agency_id=agency_id
+        session, visit_id=visit_id, agency_id=agency_id, with_relations=True
     )
 
     if visit.status == payload.status:
@@ -441,6 +500,20 @@ async def transition_visit_status(
             details={"from": visit.status.value, "to": payload.status.value},
         )
 
+    # Spec §5 + §6 gates on the End Task transition.
+    if (
+        visit.status == VisitStatus.IN_PROGRESS
+        and payload.status == VisitStatus.AWAITING_SIGNATURE
+    ):
+        await _assert_can_request_signature(visit)
+
+    # Spec §8 gate on completion.
+    if (
+        visit.status == VisitStatus.AWAITING_SIGNATURE
+        and payload.status == VisitStatus.COMPLETED
+    ):
+        await _assert_signature_exists(visit)
+
     visit.status = payload.status
     if payload.status == VisitStatus.COMPLETED:
         visit.sharing_location = False
@@ -449,7 +522,54 @@ async def transition_visit_status(
 
 
 # --------------------------------------------------------------------------
-# Live location sharing (EVV)
+# EVV end
+# --------------------------------------------------------------------------
+async def end_visit(
+    session: AsyncSession,
+    *,
+    visit_id: uuid.UUID,
+    agency_id: uuid.UUID,
+    payload: VisitEndRequest,
+) -> Visit:
+    """Record the EVV End block (caregiver departure).
+
+    Stamps `evv_records.end_*` and (if start was also recorded) populates
+    `duration_seconds`. Does NOT auto-progress the visit status — the
+    caregiver must call `/confirm-billing` then `/transition` to
+    AWAITING_SIGNATURE.
+    """
+    visit = await _get_visit_or_404(
+        session, visit_id=visit_id, agency_id=agency_id, with_relations=True
+    )
+    if visit.evv_record is None:
+        raise ConflictError(
+            "Cannot end a visit that never started.",
+            details={"visit_id": str(visit.id)},
+        )
+    if visit.evv_record.end_time is not None:
+        raise ConflictError(
+            "Visit is already ended.",
+            details={"visit_id": str(visit.id), "end_time": visit.evv_record.end_time.isoformat()},
+        )
+    if visit.status != VisitStatus.IN_PROGRESS:
+        raise InvalidStateTransitionError(
+            "Cannot end a visit that is not in progress.",
+            details={"current_status": visit.status.value},
+        )
+
+    now = utc_now()
+    evv = visit.evv_record
+    evv.end_time = now
+    evv.end_lat = payload.end_lat
+    evv.end_lng = payload.end_lng
+    evv.end_accuracy_m = payload.end_accuracy_m
+    visit.sharing_location = False
+    await session.flush()
+    return visit
+
+
+# --------------------------------------------------------------------------
+# Live location sharing
 # --------------------------------------------------------------------------
 async def start_location_sharing(
     session: AsyncSession,
@@ -460,28 +580,17 @@ async def start_location_sharing(
     initial_lng: Decimal | None = None,
     initial_accuracy_m: Decimal | None = None,
 ) -> Visit:
-    """Mark the visit as having the staff device sharing live GPS.
-
-    Called by the staff mobile app when the user toggles "Share my
-    location" on. Subsequent `record_location_ping` calls update the
-    live lat/lng. Idempotent — calling twice is a no-op.
-
-    Staff must be the assigned staff member on the visit. Agency
-    admins may also call this remotely (e.g. to mark a visit as
-    sharing while debugging).
-    """
+    """Opt in to live GPS streaming for the visit."""
     visit = await _get_visit_or_404(
         session, visit_id=visit_id, agency_id=agency_id
     )
-    if visit.status not in {VisitStatus.CHECKED_IN, VisitStatus.IN_PROGRESS}:
+    if visit.status != VisitStatus.IN_PROGRESS:
         raise InvalidStateTransitionError(
             "Cannot share location while the visit is not in progress.",
             details={"current_status": visit.status.value},
         )
 
     visit.sharing_location = True
-    # If the caller passed an initial pinpoint, store it as the first
-    # live location (avoids a "live but no position" gap on the EVV UI).
     if initial_lat is not None and initial_lng is not None:
         visit.live_lat = initial_lat
         visit.live_lng = initial_lng
@@ -499,49 +608,29 @@ async def record_location_ping(
     agency_id: uuid.UUID,
     payload: VisitLocationPingRequest,
 ) -> Visit:
-    """Update the visit's live lat/lng with a fresh ping.
-
-    Called by the staff mobile app every ~15 seconds while sharing is
-    active. Pings are ignored (the visit row is left untouched) if:
-      - the visit is not CHECKED_IN or IN_PROGRESS, OR
-      - `sharing_location` is False (the staff user revoked permission).
-
-    No-op for completed/no-show/cancelled visits so a stale device
-    doesn't keep updating a finished visit.
-
-    Also denormalises the same ping onto `staff_profiles.last_known_*`
-    so the EVV Live Monitor's staff-level view can show a staff pin
-    even when the staff isn't on a clocked-in visit (see migration 0021).
-    The staff-level write is gated by the same `sharing_location` guard
-    as the visit-level write — a staff member who explicitly revoked
-    permission keeps their previous last-known location; the new ping
-    is silently suppressed.
-    """
+    """Update the visit's live lat/lng with a fresh ping."""
     visit = await _get_visit_or_404(
         session, visit_id=visit_id, agency_id=agency_id
     )
-    if visit.status not in {VisitStatus.CHECKED_IN, VisitStatus.IN_PROGRESS}:
-        # Silently drop the ping — the visit is over.
-        return visit
+    if visit.status != VisitStatus.IN_PROGRESS:
+        return visit  # silently drop stale pings
     if not visit.sharing_location:
-        # The staff user revoked permission; ignore pings.
-        return visit
+        return visit  # staff revoked permission
 
     visit.live_lat = payload.lat
     visit.live_lng = payload.lng
     visit.live_ping_at = utc_now()
     if payload.accuracy_m is not None:
         visit.live_accuracy_m = payload.accuracy_m
-    # Persist the device_id on the first ping only — subsequent pings
-    # don't overwrite since callers may not send it every time.
-    if payload.device_id is not None and visit.check_in_device_id is None:
-        visit.check_in_device_id = payload.device_id
+    if payload.device_id is not None and visit.staff_id is not None:
+        # Mirror the device_id onto staff.last_known_device_id only on
+        # the first ping. We do not read-modify-write the staff row here
+        # — visit.staff is lazy; the FE never needs the device_id on
+        # the staff row to render.
+        pass
 
-    # Mirror the ping onto the staff profile so the EVV Live Monitor's
-    # staff-level view can show a "last seen at" pin. The staff row
-    # isn't pre-loaded by `_get_visit_or_404`; cheap single-row fetch.
-    # Done inline (rather than via staff_service._get_staff_or_404) to
-    # keep this module dependency-free — visits is a leaf module.
+    # Mirror onto staff.last_known_* so the EVV Live Monitor's
+    # staff-level view can show a "last seen at" pin.
     staff = (
         await session.execute(
             select(StaffProfile).where(
@@ -570,13 +659,7 @@ async def stop_location_sharing(
     visit_id: uuid.UUID,
     agency_id: uuid.UUID,
 ) -> Visit:
-    """Mark the visit as no longer sharing live GPS.
-
-    Called by the staff app when the user toggles "Share my location"
-    off, or by the agency admin to force-stop sharing. The previous
-    lat/lng + timestamp are kept on the row so the EVV page can still
-    show "Last seen: 5 min ago" until the visit is checked out.
-    """
+    """Opt out of live GPS. Keeps the last known position on the row."""
     visit = await _get_visit_or_404(
         session, visit_id=visit_id, agency_id=agency_id
     )
@@ -586,132 +669,91 @@ async def stop_location_sharing(
 
 
 # --------------------------------------------------------------------------
-# Visit service items
+# Activities
 # --------------------------------------------------------------------------
-async def list_visit_service_items(
+async def list_visit_activities(
     session: AsyncSession,
     *,
     visit_id: uuid.UUID,
     agency_id: uuid.UUID,
-) -> Sequence[VisitServiceItem]:
+) -> Sequence[VisitActivityDelivery]:
+    """List the activity deliveries for one visit (oldest first)."""
     await _get_visit_or_404(session, visit_id=visit_id, agency_id=agency_id)
     stmt = (
-        select(VisitServiceItem)
-        .where(VisitServiceItem.visit_id == visit_id)
-        .order_by(VisitServiceItem.created_at.asc())
+        select(VisitActivityDelivery)
+        .where(
+            VisitActivityDelivery.visit_id == visit_id,
+            VisitActivityDelivery.agency_id == agency_id,
+        )
+        .options(selectinload(VisitActivityDelivery.activity))
+        .order_by(VisitActivityDelivery.created_at.asc())
     )
     return (await session.execute(stmt)).scalars().all()
 
 
-async def add_visit_service_item(
+async def update_visit_activity(
     session: AsyncSession,
     *,
     visit_id: uuid.UUID,
     agency_id: uuid.UUID,
-    payload: VisitServiceItemCreateRequest,
-) -> VisitServiceItem:
-    """Attach an additional appointment_service_item to a visit."""
+    activity_id: uuid.UUID,
+    payload: VisitActivityUpdateRequest,
+    completed_by_user_id: uuid.UUID,
+) -> VisitActivityDelivery:
+    """Mark one activity DONE / NOT_DONE / NOT_APPLICABLE / FOLLOW_UP.
+
+    Per spec §5, `NOT_DONE` requires a reason (DB-enforced).
+    """
     visit = await _get_visit_or_404(
         session, visit_id=visit_id, agency_id=agency_id
     )
-    if visit.status == VisitStatus.COMPLETED:
+    if visit.status not in {
+        VisitStatus.IN_PROGRESS,
+        VisitStatus.AWAITING_SIGNATURE,
+    }:
         raise InvalidStateTransitionError(
-            "Cannot add items to a completed visit.",
+            "Cannot update activities on a visit in its current state.",
             details={"current_status": visit.status.value},
         )
 
-    # The appointment_service_item must belong to this visit's appointment
-    stmt = select(AppointmentServiceItem).where(
-        AppointmentServiceItem.id == payload.appointment_service_item_id,
-        AppointmentServiceItem.appointment_id == visit.appointment_id,
-    )
-    if (await session.execute(stmt)).scalar_one_or_none() is None:
-        raise NotFoundError(
-            details={
-                "resource": "appointment_service_item",
-                "id": str(payload.appointment_service_item_id),
-            }
-        )
-
-    item = VisitServiceItem(
-        visit_id=visit.id,
-        appointment_service_item_id=payload.appointment_service_item_id,
-        note=payload.note,
-    )
-    session.add(item)
-    try:
-        await session.flush()
-    except IntegrityError as exc:
-        await session.rollback()
-        raise DuplicateResourceError(
-            "This appointment_service_item is already attached to the visit.",
-            details={"constraint": _extract_constraint(exc)},
-        ) from exc
-    return item
-
-
-async def update_visit_service_item(
-    session: AsyncSession,
-    *,
-    item_id: uuid.UUID,
-    visit_id: uuid.UUID,
-    payload: VisitServiceItemUpdateRequest,
-    completed_by_user_id: uuid.UUID | None = None,
-) -> VisitServiceItem:
-    """Patch a visit service item (status / reason / note)."""
-    item = await _get_service_item_or_404(
-        session, item_id=item_id, visit_id=visit_id
+    delivery = await _get_activity_delivery_or_404(
+        session,
+        activity_id=activity_id,
+        visit_id=visit_id,
+        agency_id=agency_id,
     )
 
-    if payload.status is not None and payload.status != item.status:
-        # Don't allow rewinding a DONE item back to PENDING.
-        if item.status == ServiceItemStatus.DONE and payload.status != ServiceItemStatus.DONE:
+    if payload.status is not None:
+        if (
+            delivery.status == ServiceItemStatus.DONE
+            and payload.status != ServiceItemStatus.DONE
+        ):
             raise InvalidStateTransitionError(
-                "Cannot move a DONE service item back to a non-final status.",
-                details={"from": item.status.value, "to": payload.status.value},
+                "Cannot move a DONE activity back to a non-final status.",
+                details={"from": delivery.status.value, "to": payload.status.value},
             )
-        item.status = payload.status
-        if payload.status == ServiceItemStatus.DONE:
-            item.completed_at = utc_now()
-            if completed_by_user_id is not None:
-                item.completed_by = completed_by_user_id
-
+        delivery.status = payload.status
+        if payload.status != ServiceItemStatus.PENDING:
+            delivery.completed_at = utc_now()
+            delivery.completed_by = completed_by_user_id
     if payload.reason is not None:
-        item.reason = payload.reason
+        delivery.reason = payload.reason
     if payload.note is not None:
-        item.note = payload.note
+        delivery.note = payload.note
 
     try:
         await session.flush()
     except IntegrityError as exc:
         await session.rollback()
         raise ValidationError(
-            "Visit service item update violates a check constraint.",
+            "Activity delivery violates a check constraint.",
             details={"constraint": _extract_constraint(exc)},
         ) from exc
-    return item
-
-
-async def delete_visit_service_item(
-    session: AsyncSession,
-    *,
-    item_id: uuid.UUID,
-    visit_id: uuid.UUID,
-) -> None:
-    item = await _get_service_item_or_404(
-        session, item_id=item_id, visit_id=visit_id
-    )
-    if item.status != ServiceItemStatus.PENDING:
-        raise InvalidStateTransitionError(
-            "Cannot delete a service item that has been delivered.",
-            details={"current_status": item.status.value},
-        )
-    await session.delete(item)
-    await session.flush()
+    return delivery
 
 
 # --------------------------------------------------------------------------
-# Visit notes
+# Notes
 # --------------------------------------------------------------------------
 async def list_visit_notes(
     session: AsyncSession,
@@ -722,7 +764,10 @@ async def list_visit_notes(
     await _get_visit_or_404(session, visit_id=visit_id, agency_id=agency_id)
     stmt = (
         select(VisitNote)
-        .where(VisitNote.visit_id == visit_id)
+        .where(
+            VisitNote.visit_id == visit_id,
+        )
+        .options(selectinload(VisitNote.author))
         .order_by(VisitNote.created_at.asc())
     )
     return (await session.execute(stmt)).scalars().all()
@@ -739,169 +784,166 @@ async def add_visit_note(
     visit = await _get_visit_or_404(
         session, visit_id=visit_id, agency_id=agency_id
     )
+    if visit.status not in {
+        VisitStatus.IN_PROGRESS,
+        VisitStatus.AWAITING_SIGNATURE,
+        VisitStatus.COMPLETED,
+    }:
+        raise InvalidStateTransitionError(
+            "Cannot add a note to a visit in its current state.",
+            details={"current_status": visit.status.value},
+        )
+
     note = VisitNote(
         visit_id=visit.id,
         author_user_id=author_user_id,
         body=body,
     )
     session.add(note)
-    await session.flush()
-    return note
-
-
-# --------------------------------------------------------------------------
-# Service verification
-# --------------------------------------------------------------------------
-async def get_or_create_verification(
-    session: AsyncSession,
-    *,
-    visit_id: uuid.UUID,
-    agency_id: uuid.UUID,
-    verified_by: uuid.UUID,
-    verifier_role: UserRole,
-    payload: ServiceVerificationCreateRequest,
-) -> ServiceVerification:
-    """Create (or update if it already exists) the verification for a visit.
-
-    The DB has UNIQUE(visit_id) on service_verifications, so there's
-    exactly one row per visit. If one already exists, we update it —
-    this supports the patient "I disputed, then changed my mind" flow.
-    """
-    if verifier_role not in {UserRole.PATIENT, UserRole.GUARDIAN}:
-        raise ValidationError(
-            "Only PATIENT or GUARDIAN may file a service verification.",
-            details={"verifier_role": verifier_role.value},
-        )
-
-    visit = await _get_visit_or_404(
-        session, visit_id=visit_id, agency_id=agency_id
-    )
-
-    existing = (
-        await session.execute(
-            select(ServiceVerification).where(
-                ServiceVerification.visit_id == visit.id
-            )
-        )
-    ).scalar_one_or_none()
-
-    if existing is not None:
-        # Update the existing verification
-        if payload.status == VerificationStatus.DISPUTED and (
-            payload.dispute_reason_code is None
-            and existing.dispute_reason_code is None
-        ):
-            raise ValidationError(
-                "dispute_reason_code is required when disputing.",
-            )
-        existing.status = payload.status
-        existing.dispute_reason_code = payload.dispute_reason_code
-        if payload.comment is not None:
-            existing.comment = payload.comment
-        await session.flush()
-        return existing
-
-    verification = ServiceVerification(
-        visit_id=visit.id,
-        agency_id=agency_id,
-        verified_by=verified_by,
-        verifier_role=verifier_role,
-        status=payload.status,
-        dispute_reason_code=payload.dispute_reason_code,
-        comment=payload.comment,
-    )
-    session.add(verification)
     try:
         await session.flush()
     except IntegrityError as exc:
         await session.rollback()
         raise ValidationError(
-            "Verification violates a check constraint.",
+            "Visit note violates a check constraint.",
             details={"constraint": _extract_constraint(exc)},
         ) from exc
-    return verification
+    return note
 
 
 # --------------------------------------------------------------------------
-# Visit issues
+# Signatures
 # --------------------------------------------------------------------------
-async def list_visit_issues(
+async def get_or_create_signature_placeholder(
     session: AsyncSession,
     *,
     visit_id: uuid.UUID,
     agency_id: uuid.UUID,
-) -> Sequence[VisitIssue]:
-    await _get_visit_or_404(session, visit_id=visit_id, agency_id=agency_id)
-    stmt = (
-        select(VisitIssue)
-        .where(VisitIssue.visit_id == visit_id)
-        .order_by(VisitIssue.created_at.asc())
-    )
-    return (await session.execute(stmt)).scalars().all()
+) -> AppointmentSignature | None:
+    """Read the signature row for a visit (used by `_to_response`)."""
+    return (
+        await session.execute(
+            select(AppointmentSignature).where(
+                AppointmentSignature.visit_id == visit_id,
+                AppointmentSignature.agency_id == agency_id,
+            )
+        )
+    ).scalar_one_or_none()
 
 
-async def add_visit_issue(
+async def sign_visit(
     session: AsyncSession,
     *,
     visit_id: uuid.UUID,
     agency_id: uuid.UUID,
-    payload: VisitIssueCreateRequest,
-    reported_by_user_id: uuid.UUID,
-) -> VisitIssue:
+    signer_user_id: uuid.UUID,
+    signer_role: UserRole,
+    signature_image_url: str,
+    signer_display_name_override: str | None = None,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> AppointmentSignature:
+    """File a signature on a visit (spec §8).
+
+    Spec rule: PATIENT OR GUARDIAN — either signer satisfies the gate.
+    The `signer_display_name` is computed from the signer's `users.full_name`
+    via `signer_display_name()` ("J. Smith" format) unless the FE passes
+    an explicit override (rare — for legacy UI that already formats).
+
+    Idempotent at the visit level: a second signature POST overwrites
+    the prior row (1:1 UNIQUE constraint), keeping the most recent
+    intent. This matches the spec's "Patient signs → valid / Guardian
+    signs → valid / Patient + Guardian sign → also valid" wording — we
+    keep the last signer for audit.
+    """
+    if signer_role not in {UserRole.PATIENT, UserRole.GUARDIAN}:
+        raise CrossAgencyAccessDeniedError(
+            details={"reason": "only PATIENT or GUARDIAN may sign"}
+        )
+
     visit = await _get_visit_or_404(
         session, visit_id=visit_id, agency_id=agency_id
     )
-    issue = VisitIssue(
-        visit_id=visit.id,
-        agency_id=agency_id,
-        reported_by=reported_by_user_id,
-        issue_type=payload.issue_type,
-        comment=payload.comment,
-    )
-    session.add(issue)
-    await session.flush()
-    return issue
+    if visit.status != VisitStatus.AWAITING_SIGNATURE:
+        raise InvalidStateTransitionError(
+            "Visit is not awaiting signature.",
+            details={"current_status": visit.status.value},
+        )
 
+    # Resolve the rendered display name.
+    from src.modules.identity.models import User
 
-async def resolve_visit_issue(
-    session: AsyncSession,
-    *,
-    issue_id: uuid.UUID,
-    visit_id: uuid.UUID,
-    payload: VisitIssueResolveRequest,
-    resolved_by_user_id: uuid.UUID,
-) -> VisitIssue:
-    issue = await _get_issue_or_404(
-        session, issue_id=issue_id, visit_id=visit_id
-    )
-    if issue.resolved_at is not None:
-        # Idempotent — return as-is
-        return issue
-    issue.resolved_at = utc_now()
-    issue.resolved_by = resolved_by_user_id
-    issue.resolution_note = payload.resolution_note
-    await session.flush()
-    return issue
+    signer_user = (
+        await session.execute(
+            select(User).where(User.id == signer_user_id)
+        )
+    ).scalar_one_or_none()
+    if signer_user is None:
+        raise NotFoundError(
+            details={"resource": "user", "id": str(signer_user_id)}
+        )
+    from src.shared.utils.labels import signer_display_name
+    rendered_name = signer_display_name(signer_user.full_name) or ""
+
+    existing = (
+        await session.execute(
+            select(AppointmentSignature).where(
+                AppointmentSignature.visit_id == visit_id
+            )
+        )
+    ).scalar_one_or_none()
+
+    if existing is not None:
+        existing.signer_user_id = signer_user_id
+        existing.signer_role = signer_role
+        existing.signer_display_name = (
+            signer_display_name_override or rendered_name
+        )
+        existing.signature_image_url = signature_image_url
+        existing.signed_at = utc_now()
+        if ip_address is not None:
+            existing.ip_address = ip_address
+        if user_agent is not None:
+            existing.user_agent = user_agent
+        sig = existing
+    else:
+        sig = AppointmentSignature(
+            visit_id=visit_id,
+            agency_id=agency_id,
+            signer_user_id=signer_user_id,
+            signer_role=signer_role,
+            signer_display_name=signer_display_name_override or rendered_name,
+            signature_image_url=signature_image_url,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+        session.add(sig)
+
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise ValidationError(
+            "Signature violates a check constraint.",
+            details={"constraint": _extract_constraint(exc)},
+        ) from exc
+    return sig
 
 
 __all__ = [
-    "add_visit_issue",
     "add_visit_note",
-    "add_visit_service_item",
-    "check_in_visit",
-    "check_out_visit",
+    "confirm_billing",
     "create_visit",
-    "delete_visit_service_item",
-    "get_or_create_verification",
+    "end_visit",
     "get_visit",
-    "list_visit_issues",
+    "get_or_create_signature_placeholder",
+    "list_visit_activities",
     "list_visit_notes",
-    "list_visit_service_items",
     "list_visits",
     "record_location_ping",
-    "resolve_visit_issue",
+    "sign_visit",
     "start_location_sharing",
     "stop_location_sharing",
     "transition_visit_status",
-    "update_visit_service_item",
+    "update_visit_activity",
 ]

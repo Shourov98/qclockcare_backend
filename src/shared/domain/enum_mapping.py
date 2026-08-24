@@ -11,12 +11,9 @@ from __future__ import annotations
 from src.shared.domain.enums import (
     AgencyStatus,
     AgencySubscriptionPlan,
-    AppointmentEventType,
     AppointmentStatus,
     AuditAction,
     AuthAuditEventType,
-    ConfirmationStatus,
-    DisputeReasonCode,
     DocumentStatus,
     DocumentType,
     LicenseStatus,
@@ -34,7 +31,6 @@ from src.shared.domain.enums import (
     TicketStatus,
     UserRole,
     UserStatus,
-    VerificationStatus,
     VisitStatus,
 )
 
@@ -42,12 +38,9 @@ from src.shared.domain.enums import (
 ENUM_TYPE_NAMES: dict[type, str] = {
     AgencyStatus: "agency_status",
     AgencySubscriptionPlan: "agency_subscription_plan",
-    AppointmentEventType: "appointment_event_type",
     AppointmentStatus: "appointment_status",
     AuditAction: "audit_action",
     AuthAuditEventType: "auth_audit_event_type",
-    ConfirmationStatus: "confirmation_status",
-    DisputeReasonCode: "dispute_reason_code",
     DocumentStatus: "document_status",
     DocumentType: "document_type",
     LicenseStatus: "license_status",
@@ -65,7 +58,6 @@ ENUM_TYPE_NAMES: dict[type, str] = {
     TicketStatus: "ticket_status",
     UserRole: "user_role",
     UserStatus: "user_status",
-    VerificationStatus: "verification_status",
     VisitStatus: "visit_status",
 }
 

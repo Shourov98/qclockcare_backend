@@ -1,14 +1,20 @@
 """Visits module — request/response Pydantic schemas (DTOs).
 
-Wire format for every visit + service-item + note + verification + issue
-endpoint.
+Wire format for every visit + EVV + signature + activity + note endpoint.
 
 Pattern:
 - `*Request`  — what the client sends
 - `*Response` — what we return
 - Nested `*Nested` — child resources inlined in a parent response
 
-See `13_DATABASE_SCHEMA_COMPLETE.md` §11 and §12 for the data model.
+The schemas are aligned with the canonical spec
+(`QlockCare_appointemnt_flow.md`): the 5-state lifecycle, free-text
+activities, EVV start+end records, and a required patient-or-guardian
+signature. Verified values are dropped from the wire — the patient
+either signs (`AppointmentSignature`) or doesn't.
+
+See `13_DATABASE_SCHEMA_COMPLETE.md` §11-§12 for the data model and
+status lifecycle.
 """
 
 from __future__ import annotations
@@ -20,69 +26,68 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, StringConstraints, model_validator
 
-from src.shared.domain.enums import (
-    DisputeReasonCode,
-    ServiceItemStatus,
-    UserRole,
-    VerificationStatus,
-    VisitStatus,
-)
+from src.shared.domain.enums import ServiceItemStatus, UserRole, VisitStatus
 
 
 # --------------------------------------------------------------------------
-# Visit
+# Visit — request
 # --------------------------------------------------------------------------
 class VisitCreateRequest(BaseModel):
-    """POST /visits — create a visit (typically auto-created on check-in).
+    """POST /visits — start the visit (transitions `READY → IN_PROGRESS`).
 
-    In the typical flow, the staff app POSTs /visits with appointment_id
-    + the GPS / device info captured at check-in. The service stamps
-    check_in_time = now() and sets status = CHECKED_IN.
+    On success the server creates a Visit + EVVRecord (start filled
+    in with the supplied GPS) + VisitActivityDelivery row per parent
+    appointment activity.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     appointment_id: UUID
-    check_in_lat: Decimal | None = None
-    check_in_lng: Decimal | None = None
-    check_in_accuracy_m: Decimal | None = None
-    check_in_device_id: Annotated[str, StringConstraints(max_length=512)] | None = None
+    start_lat: Decimal | None = None
+    start_lng: Decimal | None = None
+    start_accuracy_m: Decimal | None = None
+    start_device_id: Annotated[str, StringConstraints(max_length=512)] | None = None
 
     @model_validator(mode="after")
     def _validate_lat_lng_pair(self) -> VisitCreateRequest:
-        if (self.check_in_lat is None) != (self.check_in_lng is None):
-            raise ValueError("check_in_lat and check_in_lng must both be set or both be null")
+        if (self.start_lat is None) != (self.start_lng is None):
+            raise ValueError(
+                "start_lat and start_lng must both be set or both be null"
+            )
         return self
 
 
-class VisitCheckInRequest(BaseModel):
-    """PATCH /visits/{id}/check-in — record the actual check-in.
+class VisitEndRequest(BaseModel):
+    """PATCH /visits/{id}/end — record the EVV end (caregiver departure)."""
 
-    Used when the visit row was pre-created (e.g. by a "scheduled visit"
-    endpoint) and the staff member is now actually at the location.
+    model_config = ConfigDict(extra="forbid")
+
+    end_lat: Decimal | None = None
+    end_lng: Decimal | None = None
+    end_accuracy_m: Decimal | None = None
+
+
+class VisitConfirmBillingRequest(BaseModel):
+    """POST /visits/{id}/confirm-billing — caregiver ticks the billing
+    confirmation checkbox.
+
+    Required before the visit can transition to `AWAITING_SIGNATURE`
+    (spec §6 / §11). Idempotent — re-confirming is a no-op.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    check_in_lat: Decimal | None = None
-    check_in_lng: Decimal | None = None
-    check_in_accuracy_m: Decimal | None = None
-    check_in_device_id: Annotated[str, StringConstraints(max_length=512)] | None = None
-
-
-class VisitCheckOutRequest(BaseModel):
-    """PATCH /visits/{id}/check-out — record the actual check-out."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    check_out_lat: Decimal | None = None
-    check_out_lng: Decimal | None = None
-    check_out_accuracy_m: Decimal | None = None
-    note: Annotated[str, StringConstraints(max_length=4000)] | None = None
-
 
 class VisitStatusTransitionRequest(BaseModel):
-    """PATCH /visits/{id}/transition — IN_PROGRESS / COMPLETED."""
+    """PATCH /visits/{id}/transition — walks the 5-state lifecycle.
+
+    Allowed edges only (service-layer enforced):
+      SCHEDULED → READY
+      READY     → IN_PROGRESS
+      IN_PROGRESS → AWAITING_SIGNATURE (gated: all activities + billing)
+      AWAITING_SIGNATURE → COMPLETED (gated: signature exists)
+      *         → CANCELLED / MISSED / REJECTED (per spec)
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -90,15 +95,7 @@ class VisitStatusTransitionRequest(BaseModel):
 
 
 class VisitLocationPingRequest(BaseModel):
-    """POST /visits/{id}/location-ping — staff device updates its live GPS.
-
-    Sent by the staff browser every ~15 seconds while the visit is in
-    progress and the user has opted into sharing. The server persists
-    only the most recent lat/lng + timestamp on the visit row (no
-    history table, per product decision). `accuracy_m` is optional
-    but recommended — the EVV page uses it to weight the freshness
-    indicator.
-    """
+    """POST /visits/{id}/location-ping — staff device updates its live GPS."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -117,13 +114,7 @@ class VisitLocationPingRequest(BaseModel):
 
 
 class VisitStartLocationSharingRequest(BaseModel):
-    """POST /visits/{id}/start-location-sharing — staff opts in to live GPS.
-
-    The staff mobile app sends this when the user toggles "Share my
-    location" on. The `initial_*` fields are optional — if the caller
-    already has a fresh fix, it can be seeded on the visit row to
-    avoid a "live but no position" gap on the EVV UI.
-    """
+    """POST /visits/{id}/start-location-sharing — staff opts in to live GPS."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -144,27 +135,35 @@ class VisitStartLocationSharingRequest(BaseModel):
         return self
 
 
+# --------------------------------------------------------------------------
+# Visit — response
+# --------------------------------------------------------------------------
 class VisitResponse(BaseModel):
-    """Single visit, optionally with nested service items / notes / issues."""
+    """Single visit with all joined display + nested children.
+
+    Populated by `GET /visits/{id}/with-items` (staff + admin). The
+    patient/guardian portal gets a slimmer shape via
+    `PortalVisitResponse`. Mirrors the staff Visit Summary mockup:
+
+      - patient card: patient_name, visit_date_label, time_range_label,
+        duration_label
+      - EVV record: evv_record (start + end + verification status)
+      - activities: VisitActivityDelivery list (status + name +
+        completed_time_label)
+      - notes: VisitNote list (note_time_label)
+      - signature: AppointmentSignature (signer_display_name, image, signed_at)
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
+    # ---- raw columns (kept for backward compat with FE) ----
     id: UUID
     appointment_id: UUID
     agency_id: UUID
     staff_id: UUID
     status: VisitStatus
-    check_in_time: datetime | None
-    check_in_lat: Decimal | None
-    check_in_lng: Decimal | None
-    check_in_accuracy_m: Decimal | None
-    check_in_device_id: str | None
-    check_out_time: datetime | None
-    check_out_lat: Decimal | None
-    check_out_lng: Decimal | None
-    check_out_accuracy_m: Decimal | None
-    duration_seconds: int | None
-    # Live GPS — staff opt-in. See VisitLocationPingRequest.
+    billing_confirmed_at: datetime | None
+    # Live GPS
     live_lat: Decimal | None
     live_lng: Decimal | None
     live_ping_at: datetime | None
@@ -172,19 +171,36 @@ class VisitResponse(BaseModel):
     sharing_location: bool
     created_at: datetime
     updated_at: datetime
-    # Joined from `users.full_name` via `visit.staff.user`. `null` if
-    # the staff profile / user row isn't loaded or the user is
-    # soft-deleted. Hydrated by `_to_response` in the visits router.
+
+    # ---- joined display fields (hydrated by _to_response) ----
     staff_name: str | None = None
-    # Optional nested — populated only by GET /visits/{id}/with-items
-    service_items: list[VisitServiceItemResponse] | None = None
+    staff_role_label: str | None = None  # "DSP" suffix
+    patient_name: str | None = None
+    patient_initials: str | None = None  # "JS"
+    program_name: str | None = None
+    service_type_label: str | None = None
+    location_label: str | None = None
+    # ---- derived (computed from evv_record) ----
+    duration_seconds: int | None = None
+    duration_label: str | None = None  # "2h 05m"
+    time_range_label: str | None = None  # "9:02 AM — 11:07 AM"
+    visit_date_label: str | None = None  # "Tuesday, May 5, 2026"
+    evv_passed: bool = False  # accuracy <= 100m threshold
+    gps_verified: bool = False  # start_lat/lng both present
+
+    # ---- nested (eager-loaded by load_visit_with_relations) ----
+    evv_record: EVVRecordResponse | None = None
+    activities: list[VisitActivityDeliveryResponse] | None = None
     notes: list[VisitNoteResponse] | None = None
-    verification: ServiceVerificationResponse | None = None
-    issues: list[VisitIssueResponse] | None = None
+    signature: AppointmentSignatureResponse | None = None
 
 
 class VisitSummaryResponse(BaseModel):
-    """Lighter shape for list endpoints — no nested children."""
+    """Lighter shape for the live-monitor list endpoint.
+
+    No nested children; only the joined fields the live EVV monitor
+    needs to render one card per visit.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -193,11 +209,7 @@ class VisitSummaryResponse(BaseModel):
     agency_id: UUID
     staff_id: UUID
     status: VisitStatus
-    check_in_time: datetime | None
-    check_out_time: datetime | None
-    duration_seconds: int | None
-    # Live GPS — staff opt-in. The EVV Live Monitor reads this from
-    # the list endpoint.
+    billing_confirmed_at: datetime | None
     live_lat: Decimal | None
     live_lng: Decimal | None
     live_ping_at: datetime | None
@@ -205,34 +217,48 @@ class VisitSummaryResponse(BaseModel):
     sharing_location: bool
     created_at: datetime
     updated_at: datetime
-    # Joined from `users.full_name` via `visit.staff.user`. Lets the
-    # EVV Live Monitor render "Sarah Johnson" instead of a UUID prefix
-    # on the right-hand cards and the map pin tooltips. `null` if
-    # the relationship isn't loaded or the user is soft-deleted.
+    # Joined display
     staff_name: str | None = None
+    patient_name: str | None = None
+    service_item_count: int = 0  # count of activities on the parent appt
+    duration_label: str | None = None
 
 
 # --------------------------------------------------------------------------
-# Visit service items
+# EVV
 # --------------------------------------------------------------------------
-class VisitServiceItemCreateRequest(BaseModel):
-    """POST /visits/{id}/service-items — attach an appointment_service_item.
+class EVVRecordResponse(BaseModel):
+    """Electronic Visit Verification record (start + end)."""
 
-    On creation the row is PENDING. Staff then PATCH /{item_id} to mark
-    it DONE / NOT_DONE / etc.
-    """
+    model_config = ConfigDict(from_attributes=True)
 
-    model_config = ConfigDict(extra="forbid")
+    id: UUID
+    visit_id: UUID
+    agency_id: UUID
+    # Start
+    start_time: datetime | None
+    start_lat: Decimal | None
+    start_lng: Decimal | None
+    start_accuracy_m: Decimal | None
+    start_device_id: str | None
+    start_verification_status: str | None  # PENDING | VERIFIED | FAILED
+    start_verified: bool = False  # derived: present + accuracy<=100m
+    # End
+    end_time: datetime | None
+    end_lat: Decimal | None
+    end_lng: Decimal | None
+    end_accuracy_m: Decimal | None
+    # Derived
+    duration_seconds: int | None = None  # end_time - start_time
 
-    appointment_service_item_id: UUID
-    note: Annotated[str, StringConstraints(max_length=4000)] | None = None
 
+# --------------------------------------------------------------------------
+# Activities
+# --------------------------------------------------------------------------
+class VisitActivityUpdateRequest(BaseModel):
+    """PATCH /visits/{id}/activities/{activity_id} — record the outcome.
 
-class VisitServiceItemUpdateRequest(BaseModel):
-    """PATCH /visits/{id}/service-items/{item_id} — update delivery status.
-
-    When `status` is NOT_DONE, `reason` becomes required — enforced by
-    the service layer (DB also has a CHECK constraint).
+    Per spec §5, `NOT_DONE` requires a reason (DB-enforced).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -242,7 +268,7 @@ class VisitServiceItemUpdateRequest(BaseModel):
     note: Annotated[str, StringConstraints(max_length=4000)] | None = None
 
     @model_validator(mode="after")
-    def _validate_not_done_has_reason(self) -> VisitServiceItemUpdateRequest:
+    def _validate_not_done_has_reason(self) -> VisitActivityUpdateRequest:
         if self.status == ServiceItemStatus.NOT_DONE and (
             self.reason is None or not self.reason.strip()
         ):
@@ -250,12 +276,20 @@ class VisitServiceItemUpdateRequest(BaseModel):
         return self
 
 
-class VisitServiceItemResponse(BaseModel):
+class VisitActivityDeliveryResponse(BaseModel):
+    """Per-visit delivery record for one parent activity.
+
+    `name` is joined from `appointment_activities.name` (the free-text
+    activity the admin typed at scheduling time — spec §2).
+    `service_type_label` is `humanize_enum(name)` if name is enum-shaped,
+    else None.
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
     visit_id: UUID
-    appointment_service_item_id: UUID
+    activity_id: UUID
     status: ServiceItemStatus
     reason: str | None
     note: str | None
@@ -263,10 +297,15 @@ class VisitServiceItemResponse(BaseModel):
     completed_by: UUID | None
     created_at: datetime
     updated_at: datetime
+    # Joined from parent activity
+    name: str | None = None
+    planned_minutes: int | None = None
+    # Display labels (computed by _to_response)
+    completed_time_label: str | None = None  # "10:24 AM"
 
 
 # --------------------------------------------------------------------------
-# Visit notes
+# Notes
 # --------------------------------------------------------------------------
 class VisitNoteCreateRequest(BaseModel):
     """POST /visits/{id}/notes — add a note."""
@@ -283,6 +322,8 @@ class VisitNoteCreateRequest(BaseModel):
 
 
 class VisitNoteResponse(BaseModel):
+    """A note posted during the visit."""
+
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
@@ -290,84 +331,50 @@ class VisitNoteResponse(BaseModel):
     author_user_id: UUID
     body: str
     created_at: datetime
+    # Display labels
+    note_time_label: str | None = None  # "9:35 AM"
+    author_name: str | None = None  # joined from author.full_name
 
 
 # --------------------------------------------------------------------------
-# Service verifications
+# Signature
 # --------------------------------------------------------------------------
-class ServiceVerificationCreateRequest(BaseModel):
-    """POST /visits/{id}/verify — patient or guardian verifies the visit.
+class VisitSignRequest(BaseModel):
+    """POST /visits/{id}/sign — file a signature (multipart in the router).
 
-    When `status` is DISPUTED, `dispute_reason_code` is required.
+    Per spec §8-9, signing is mandatory. Signer may be PATIENT or
+    GUARDIAN. `signer_role` is derived from the caller's role when the
+    router authenticates; this body only carries the rendered display
+    name override for legacy back-compat.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    status: VerificationStatus
-    dispute_reason_code: DisputeReasonCode | None = None
-    comment: Annotated[str, StringConstraints(max_length=4000)] | None = None
-
-    @model_validator(mode="after")
-    def _validate_dispute_has_reason(self) -> ServiceVerificationCreateRequest:
-        if (
-            self.status == VerificationStatus.DISPUTED
-            and self.dispute_reason_code is None
-        ):
-            raise ValueError("dispute_reason_code is required when status = DISPUTED")
-        return self
+    signer_display_name_override: (
+        Annotated[str, StringConstraints(max_length=255)] | None
+    ) = None  # only used if the FE has a custom rendering
 
 
-class ServiceVerificationResponse(BaseModel):
+class AppointmentSignatureResponse(BaseModel):
+    """The required patient-or-guardian signature on the visit.
+
+    `signer_display_name` follows the spec format `"J. Smith"` (first
+    letter + last name) — see `signer_display_name()` in
+    `src.shared.utils.labels`.
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
     visit_id: UUID
     agency_id: UUID
-    verified_by: UUID
-    verifier_role: UserRole
-    status: VerificationStatus
-    dispute_reason_code: DisputeReasonCode | None
-    comment: str | None
-    created_at: datetime
-
-
-# --------------------------------------------------------------------------
-# Visit issues
-# --------------------------------------------------------------------------
-class VisitIssueCreateRequest(BaseModel):
-    """POST /visits/{id}/issues — file a non-blocking issue.
-
-    Free-form `issue_type` (e.g. "noise_complaint", "late_arrival") +
-    required `comment`. The DB CHECK constraints enforce non-empty
-    strings; we mirror them here with min_length.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    issue_type: Annotated[str, StringConstraints(min_length=1, max_length=255)]
-    comment: Annotated[str, StringConstraints(min_length=1, max_length=4000)]
-
-
-class VisitIssueResolveRequest(BaseModel):
-    """PATCH /visits/{id}/issues/{issue_id}/resolve — mark an issue resolved."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    resolution_note: Annotated[str, StringConstraints(min_length=1, max_length=4000)]
-
-
-class VisitIssueResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: UUID
-    visit_id: UUID
-    agency_id: UUID
-    reported_by: UUID
-    issue_type: str
-    comment: str
-    resolved_at: datetime | None
-    resolved_by: UUID | None
-    resolution_note: str | None
+    signer_user_id: UUID
+    signer_role: UserRole
+    signer_display_name: str  # "J. Smith"
+    signature_image_url: str
+    signed_at: datetime
+    ip_address: str | None
+    user_agent: str | None
     created_at: datetime
 
 
@@ -375,24 +382,23 @@ class VisitIssueResponse(BaseModel):
 # Forward refs
 # --------------------------------------------------------------------------
 VisitResponse.model_rebuild()
+AppointmentSignatureResponse.model_rebuild()
+EVVRecordResponse.model_rebuild()
 
 
 __all__ = [
-    "ServiceVerificationCreateRequest",
-    "ServiceVerificationResponse",
-    "VisitCheckInRequest",
-    "VisitCheckOutRequest",
+    "AppointmentSignatureResponse",
+    "EVVRecordResponse",
+    "VisitActivityDeliveryResponse",
+    "VisitActivityUpdateRequest",
+    "VisitConfirmBillingRequest",
     "VisitCreateRequest",
-    "VisitIssueCreateRequest",
-    "VisitIssueResolveRequest",
-    "VisitIssueResponse",
+    "VisitEndRequest",
     "VisitLocationPingRequest",
     "VisitNoteCreateRequest",
     "VisitNoteResponse",
     "VisitResponse",
-    "VisitServiceItemCreateRequest",
-    "VisitServiceItemResponse",
-    "VisitServiceItemUpdateRequest",
+    "VisitSignRequest",
     "VisitStartLocationSharingRequest",
     "VisitStatusTransitionRequest",
     "VisitSummaryResponse",

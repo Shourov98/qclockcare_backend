@@ -1,33 +1,29 @@
 """Visits router — `/visits` and `/visits/{id}/...` endpoints.
 
-All routes require authentication. State-mutating routes (check-in/out,
-item delivery, verification, issues) follow the RLS rules: AGENCY_ADMIN
-and the assigned STAFF can modify; PATIENT and linked GUARDIAN can file
-verifications and issues (their own); read access follows the same
-visibility rules as the visit itself.
+All routes require authentication. State-mutating routes follow the
+spec's 5-state lifecycle. The caregiver app POSTs `/visits` (start),
+`/end` (EVV end), `/confirm-billing`, `/sign` (multipart), and
+`/transition` (state-machine walker). The legacy `/verify`, `/dispute`,
+`/issues` endpoints are gone — verification is replaced by the
+`AppointmentSignature` row; visit issues are out of scope.
 
 Endpoints:
-  POST   /visits                                     — create on check-in
+  POST   /visits                                     — create (READY → IN_PROGRESS)
   GET    /visits                                     — list (paginated, filterable)
   GET    /visits/{id}                                — fetch (summary)
   GET    /visits/{id}/with-items                     — fetch + nested children
-  PATCH  /visits/{id}/check-in                       — update check-in fields
-  PATCH  /visits/{id}/check-out                      — record check-out
-  PATCH  /visits/{id}/transition                     — walk state machine
+  PATCH  /visits/{id}/end                            — record EVV end (caregiver departure)
+  PATCH  /visits/{id}/transition                     — walk state machine (spec §5/§6/§8)
 
-  GET    /visits/{id}/service-items                  — list
-  POST   /visits/{id}/service-items                  — attach appointment item
-  PATCH  /visits/{id}/service-items/{item_id}        — update delivery
-  DELETE /visits/{id}/service-items/{item_id}        — delete (PENDING only)
+  POST   /visits/{id}/confirm-billing                — caregiver ticks billing checkbox
 
-  GET    /visits/{id}/notes                          — list
-  POST   /visits/{id}/notes                          — add
+  POST   /visits/{id}/sign                           — multipart: file a signature (spec §8)
 
-  POST   /visits/{id}/verify                         — file/update verification
+  GET    /visits/{id}/activities
+  PATCH  /visits/{id}/activities/{activity_id}      — record delivery outcome
 
-  GET    /visits/{id}/issues                         — list
-  POST   /visits/{id}/issues                         — file
-  PATCH  /visits/{id}/issues/{issue_id}/resolve      — mark resolved
+  GET    /visits/{id}/notes
+  POST   /visits/{id}/notes
 
   POST   /visits/{id}/start-location-sharing         — opt-in: live GPS
   POST   /visits/{id}/location-ping                  — staff device ping
@@ -36,6 +32,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import os
 import uuid
 from typing import Annotated
 
@@ -43,14 +40,21 @@ from fastapi import (
     APIRouter,
     BackgroundTasks,
     Depends,
+    File,
+    Form,
     Query,
     Request,
-    Response,
     status,
+    UploadFile,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.exceptions import CrossAgencyAccessDeniedError, ForbiddenError
+from src.core.config import settings
+from src.core.exceptions import (
+    CrossAgencyAccessDeniedError,
+    ForbiddenError,
+    ValidationError,
+)
 from src.core.logging import get_logger
 from src.modules.audit_logs import service as audit_logs_service
 from src.modules.identity.dependencies import (
@@ -61,21 +65,16 @@ from src.modules.identity.dependencies import (
 from src.modules.notifications import integrations as notif_integrations
 from src.modules.visits import service as visits_service
 from src.modules.visits.schemas import (
-    ServiceVerificationCreateRequest,
-    ServiceVerificationResponse,
-    VisitCheckInRequest,
-    VisitCheckOutRequest,
+    AppointmentSignatureResponse,
+    VisitActivityDeliveryResponse,
+    VisitActivityUpdateRequest,
+    VisitConfirmBillingRequest,
     VisitCreateRequest,
-    VisitIssueCreateRequest,
-    VisitIssueResolveRequest,
-    VisitIssueResponse,
+    VisitEndRequest,
     VisitLocationPingRequest,
     VisitNoteCreateRequest,
     VisitNoteResponse,
     VisitResponse,
-    VisitServiceItemCreateRequest,
-    VisitServiceItemResponse,
-    VisitServiceItemUpdateRequest,
     VisitStartLocationSharingRequest,
     VisitStatusTransitionRequest,
     VisitSummaryResponse,
@@ -102,7 +101,7 @@ def _require_agency(ctx: CurrentAuth) -> uuid.UUID:
 
 
 def _ensure_can_view_visit(ctx: CurrentAuth, staff_user_id: uuid.UUID) -> None:
-    """Visit-level visibility: AGENCY_ADMIN / STAFF (if assigned) / patient / linked guardian."""
+    """Visit-level visibility: AGENCY_ADMIN / STAFF / patient / linked guardian."""
     if ctx.role in {UserRole.AGENCY_ADMIN, UserRole.STAFF}:
         return
     if ctx.role in {UserRole.PATIENT, UserRole.GUARDIAN}:
@@ -111,16 +110,38 @@ def _ensure_can_view_visit(ctx: CurrentAuth, staff_user_id: uuid.UUID) -> None:
     raise CrossAgencyAccessDeniedError()
 
 
-def _require_modify(ctx: CurrentAuth, staff_user_id: uuid.UUID) -> None:
-    """Visit-level modify: AGENCY_ADMIN or the assigned staff member."""
+def _require_modify_visit(ctx: CurrentAuth) -> None:
+    """Visit-level modify: AGENCY_ADMIN or assigned staff only."""
     if ctx.role == UserRole.AGENCY_ADMIN:
         return
     if ctx.role == UserRole.STAFF:
-        # Service-layer check: is this user actually the assigned staff?
-        # We can't easily check that here without an extra DB query, so
-        # we defer to RLS — which enforces `sp.user_id = current_user_id()`.
+        # Service-layer RLS narrows to the assigned staff_user_id.
         return
     raise ForbiddenError("Only AGENCY_ADMIN or the assigned staff may modify a visit.")
+
+
+def _save_signature_locally(
+    visit_id: uuid.UUID,
+    *,
+    content: bytes,
+    mime_type: str,
+) -> str:
+    """Persist the signature image to local disk and return a relative
+    URL path (e.g. `/static/signatures/{visit_id}.png`) that the FE can
+    resolve against the API base.
+
+    Storage layout: `{SIGNATURE_STORAGE_PATH}/{visit_id}.{ext}` where
+    `ext` is derived from `mime_type` (png / jpeg). Idempotent — a
+    re-sign overwrites the previous file.
+    """
+    storage_dir = settings.SIGNATURE_STORAGE_PATH
+    os.makedirs(storage_dir, exist_ok=True)
+    ext = "png" if mime_type.endswith("png") else "jpg"
+    fname = f"{visit_id}.{ext}"
+    path = os.path.join(storage_dir, fname)
+    with open(path, "wb") as fh:
+        fh.write(content)
+    return f"{settings.SIGNATURE_PUBLIC_URL_PREFIX}/{fname}"
 
 
 def _to_response(
@@ -128,39 +149,37 @@ def _to_response(
     *,
     with_relations: bool = False,
 ) -> VisitResponse:
-    # Hydrate `staff_name` from the joined `visit.staff.user.full_name`
-    # when the relationship is loaded. `_get_visit_or_404` doesn't
-    # pre-load `staff`; only `GET /visits/{id}/with-items` and a few
-    # list paths do (see the service layer). The `getattr(..., None)`
-    # chain means an unloaded relationship simply yields `None` instead
-    # of raising — mirrors the existing `service_items` / `notes`
-    # pattern below.
+    """Build a `VisitResponse`, hydrating every joined display field the
+    staff Visit Summary screen needs in one round trip.
+    """
     staff_name: str | None = None
+    staff_role_label: str | None = None
     try:
         staff = getattr(visit, "staff", None)
         if staff is not None:
             user = getattr(staff, "user", None)
             if user is not None:
                 staff_name = getattr(user, "full_name", None)
+            # StaffProfile doesn't currently have a `role_label` column;
+            # render the raw role enum if any. Falls back to None on
+            # unmapped roles so the FE shows "Staff" by default.
+            role = getattr(staff, "role", None)
+            if role is not None and hasattr(role, "value"):
+                staff_role_label = str(role.value)
     except Exception:
         staff_name = None
 
     data: dict = {
+        # raw columns
         "id": visit.id,
         "appointment_id": visit.appointment_id,
         "agency_id": visit.agency_id,
         "staff_id": visit.staff_id,
         "status": visit.status,
-        "check_in_time": visit.check_in_time,
-        "check_in_lat": visit.check_in_lat,
-        "check_in_lng": visit.check_in_lng,
-        "check_in_accuracy_m": visit.check_in_accuracy_m,
-        "check_in_device_id": visit.check_in_device_id,
-        "check_out_time": visit.check_out_time,
-        "check_out_lat": visit.check_out_lat,
-        "check_out_lng": visit.check_out_lng,
-        "check_out_accuracy_m": visit.check_out_accuracy_m,
-        "duration_seconds": visit.duration_seconds,
+        "billing_confirmed_at": getattr(visit, "billing_confirmed_at", None),
+        "billing_confirmed_by_user_id": getattr(
+            visit, "billing_confirmed_by_user_id", None
+        ),
         "live_lat": getattr(visit, "live_lat", None),
         "live_lng": getattr(visit, "live_lng", None),
         "live_ping_at": getattr(visit, "live_ping_at", None),
@@ -168,30 +187,32 @@ def _to_response(
         "sharing_location": getattr(visit, "sharing_location", False),
         "created_at": visit.created_at,
         "updated_at": visit.updated_at,
+        # joined display
         "staff_name": staff_name,
+        "staff_role_label": staff_role_label,
     }
     if with_relations:
         try:
-            data["service_items"] = list(visit.service_items)
+            data["activities"] = list(visit.activity_deliveries)
         except Exception:
-            data["service_items"] = None
+            data["activities"] = None
         try:
             data["notes"] = list(visit.notes)
         except Exception:
             data["notes"] = None
         try:
-            data["verification"] = visit.verification
+            data["signature"] = visit.signature
         except Exception:
-            data["verification"] = None
+            data["signature"] = None
         try:
-            data["issues"] = list(visit.issues)
+            data["evv_record"] = visit.evv_record
         except Exception:
-            data["issues"] = None
+            data["evv_record"] = None
     else:
-        data["service_items"] = None
+        data["activities"] = None
         data["notes"] = None
-        data["verification"] = None
-        data["issues"] = None
+        data["signature"] = None
+        data["evv_record"] = None
     return VisitResponse.model_validate(data)
 
 
@@ -211,7 +232,13 @@ async def create_visit_endpoint(
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> VisitResponse:
-    """Create a visit (typically called by the staff app on check-in)."""
+    """Create a visit (READY → IN_PROGRESS on the underlying appointment).
+
+    Called by the staff mobile app on caregiver arrival. The visit row
+    starts in `IN_PROGRESS`; an `EVVRecord.start_*` is stamped from the
+    supplied GPS; one `VisitActivityDelivery` per parent activity is
+    seeded.
+    """
     agency_id = _require_agency(ctx)
     visit = await visits_service.create_visit(
         session,
@@ -220,15 +247,15 @@ async def create_visit_endpoint(
         created_by_user_id=ctx.user_id,
     )
     await session.commit()
-    await session.refresh(visit, attribute_names=["service_items"])
-    # Audit (best-effort) — visit creation
+    await session.refresh(visit)
+    # Best-effort audit log.
     try:
         ip, ua = audit_logs_service.request_ip_ua(request)
         await audit_logs_service.audit_log(
             session,
             agency_id=agency_id,
             actor_user_id=ctx.user_id,
-            action=AuditAction.VISIT_CHECKED_IN,
+            action=AuditAction.VISIT_STARTED,
             entity_type="VISIT",
             entity_id=visit.id,
             new_data={
@@ -242,11 +269,9 @@ async def create_visit_endpoint(
         await session.commit()
     except Exception:
         pass
-    # Fan-out notification to patient + guardians (best-effort).
-    # In-app row + PENDING delivery rows are inserted synchronously;
-    # provider network calls (SMTP/Twilio) run on BackgroundTasks
-    # so an unreachable SMTP server cannot block the response.
-    await notif_integrations.notify_visit_checked_in(
+    # Fan-out VISIT_STARTED to patient + guardians. In-app row written
+    # synchronously; provider network calls deferred to BackgroundTasks.
+    await notif_integrations.notify_visit_started(
         background_tasks,
         session,
         actor_user_id=ctx.user_id,
@@ -323,7 +348,7 @@ async def get_visit_with_items_endpoint(
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> VisitResponse:
-    """Fetch a visit eagerly loaded with its service items, notes, verification, and issues."""
+    """Fetch a visit eagerly loaded with activities, notes, signature, and EVV."""
     agency_id = _require_agency(ctx)
     visit = await visits_service.get_visit(
         session, visit_id=visit_id, agency_id=agency_id, with_relations=True
@@ -333,51 +358,33 @@ async def get_visit_with_items_endpoint(
 
 
 @router.patch(
-    "/{visit_id}/check-in",
+    "/{visit_id}/end",
     response_model=VisitResponse,
     dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN, UserRole.STAFF))],
 )
-async def check_in_visit_endpoint(
+async def end_visit_endpoint(
     visit_id: uuid.UUID,
-    payload: VisitCheckInRequest,
-    ctx: CurrentAuth,
-    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
-) -> VisitResponse:
-    """Update check-in fields (typically no-op after create)."""
-    agency_id = _require_agency(ctx)
-    visit = await visits_service.check_in_visit(
-        session, visit_id=visit_id, agency_id=agency_id, payload=payload
-    )
-    await session.commit()
-    await session.refresh(visit)
-    return _to_response(visit)
-
-
-@router.patch(
-    "/{visit_id}/check-out",
-    response_model=VisitResponse,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN, UserRole.STAFF))],
-)
-async def check_out_visit_endpoint(
-    visit_id: uuid.UUID,
-    payload: VisitCheckOutRequest,
+    payload: VisitEndRequest,
     request: Request,
     background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> VisitResponse:
-    """Record the actual check-out."""
+    """Record the EVV End block (caregiver departure).
+
+    Per spec §10, the visit's `EVVRecord.end_*` fields are stamped.
+    This does NOT auto-progress the visit status — the caregiver must
+    call `/confirm-billing` then `/transition` to AWAITING_SIGNATURE.
+    """
     agency_id = _require_agency(ctx)
-    visit = await visits_service.check_out_visit(
+    ip, ua = audit_logs_service.request_ip_ua(request)
+    visit = await visits_service.end_visit(
         session, visit_id=visit_id, agency_id=agency_id, payload=payload
     )
     await session.commit()
     await session.refresh(visit)
-    # Fan-out notification to patient + guardians (best-effort).
-    # In-app row + PENDING delivery rows are inserted synchronously;
-    # provider network calls (SMTP/Twilio) run on BackgroundTasks
-    # so an unreachable SMTP server cannot block the response.
-    await notif_integrations.notify_visit_checked_out(
+    # Fan-out VISIT_ENDED to patient + guardians.
+    await notif_integrations.notify_visit_ended(
         background_tasks,
         session,
         actor_user_id=ctx.user_id,
@@ -388,25 +395,21 @@ async def check_out_visit_endpoint(
     )
     # Audit
     try:
-        ip, ua = audit_logs_service.request_ip_ua(request)
         await audit_logs_service.audit_log(
             session,
             agency_id=agency_id,
             actor_user_id=ctx.user_id,
-            action=AuditAction.VISIT_CHECKED_OUT,
+            action=AuditAction.UPDATE,
             entity_type="VISIT",
             entity_id=visit.id,
-            new_data={
-                "duration_seconds": visit.duration_seconds,
-                "status": visit.status.value,
-            },
+            new_data={"event": "EVV_END", "end_time_set": True},
             ip_address=ip,
             user_agent=ua,
         )
     except Exception:
         pass
     await session.commit()
-    return _to_response(visit)
+    return _to_response(visit, with_relations=True)
 
 
 @router.patch(
@@ -417,17 +420,107 @@ async def check_out_visit_endpoint(
 async def transition_visit_endpoint(
     visit_id: uuid.UUID,
     payload: VisitStatusTransitionRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> VisitResponse:
-    """Walk the visit state machine (IN_PROGRESS / COMPLETED)."""
+    """Walk the visit through the 5-state lifecycle with spec gates.
+
+    `IN_PROGRESS → AWAITING_SIGNATURE` requires all activities resolved
+    AND `billing_confirmed_at` set. `AWAITING_SIGNATURE → COMPLETED`
+    requires an `AppointmentSignature` row.
+    """
     agency_id = _require_agency(ctx)
+    ip, ua = audit_logs_service.request_ip_ua(request)
     visit = await visits_service.transition_visit_status(
         session, visit_id=visit_id, agency_id=agency_id, payload=payload
     )
     await session.commit()
     await session.refresh(visit)
-    return _to_response(visit)
+    # Best-effort audit + side-effect notifications on the
+    # transition-into-AWAITING_SIGNATURE edge.
+    try:
+        if payload.status == VisitStatus.AWAITING_SIGNATURE:
+            await audit_logs_service.audit_log(
+                session,
+                agency_id=agency_id,
+                actor_user_id=ctx.user_id,
+                action=AuditAction.VISIT_SUBMITTED_FOR_SIGNATURE,
+                entity_type="VISIT",
+                entity_id=visit.id,
+                new_data={"status": visit.status.value},
+                ip_address=ip,
+                user_agent=ua,
+            )
+            await session.commit()
+        elif payload.status == VisitStatus.COMPLETED:
+            await audit_logs_service.audit_log(
+                session,
+                agency_id=agency_id,
+                actor_user_id=ctx.user_id,
+                action=AuditAction.VISIT_COMPLETED,
+                entity_type="VISIT",
+                entity_id=visit.id,
+                new_data={"status": visit.status.value},
+                ip_address=ip,
+                user_agent=ua,
+            )
+            await session.commit()
+    except Exception:
+        pass
+    return _to_response(visit, with_relations=True)
+
+
+# --------------------------------------------------------------------------
+# Billing confirmation (spec §6)
+# --------------------------------------------------------------------------
+@router.post(
+    "/{visit_id}/confirm-billing",
+    response_model=VisitResponse,
+    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN, UserRole.STAFF))],
+)
+async def confirm_billing_endpoint(
+    visit_id: uuid.UUID,
+    request: Request,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> VisitResponse:
+    """Caregiver ticks "I confirm the visit and billing information is correct".
+
+    Spec §6 — required before the `IN_PROGRESS → AWAITING_SIGNATURE`
+    transition. Idempotent.
+    """
+    agency_id = _require_agency(ctx)
+    ip, ua = audit_logs_service.request_ip_ua(request)
+    visit = await visits_service.confirm_billing(
+        session,
+        visit_id=visit_id,
+        agency_id=agency_id,
+        payload=VisitConfirmBillingRequest(),
+        confirmed_by_user_id=ctx.user_id,
+    )
+    await session.commit()
+    await session.refresh(visit)
+    # Best-effort audit.
+    try:
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.BILLING_CONFIRMED,
+            entity_type="VISIT",
+            entity_id=visit.id,
+            new_data={"billing_confirmed_at": visit.billing_confirmed_at.isoformat()}
+            if visit.billing_confirmed_at is not None
+            else {},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
+    return _to_response(visit, with_relations=True)
 
 
 # --------------------------------------------------------------------------
@@ -444,11 +537,7 @@ async def start_location_sharing_endpoint(
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> VisitResponse:
-    """Opt in to live GPS sharing for an active visit.
-
-    Called by the staff mobile app when sharing starts. The request may
-    include the device's current position to seed the first EVV marker.
-    """
+    """Opt in to live GPS sharing for an active visit."""
     agency_id = _require_agency(ctx)
     visit = await visits_service.start_location_sharing(
         session,
@@ -460,7 +549,7 @@ async def start_location_sharing_endpoint(
     )
     await session.commit()
     await session.refresh(visit)
-    return _to_response(visit)
+    return _to_response(visit, with_relations=True)
 
 
 @router.post(
@@ -474,13 +563,7 @@ async def record_location_ping_endpoint(
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> VisitResponse:
-    """Persist the most recent GPS ping for an actively sharing visit.
-
-    Staff apps should call this approximately every 15 seconds. The
-    endpoint intentionally stores only the latest coordinate, not a
-    location history. Pings received after sharing stops or the visit
-    ends are accepted as idempotent no-ops.
-    """
+    """Persist the most recent GPS ping for an actively sharing visit."""
     agency_id = _require_agency(ctx)
     visit = await visits_service.record_location_ping(
         session,
@@ -490,7 +573,7 @@ async def record_location_ping_endpoint(
     )
     await session.commit()
     await session.refresh(visit)
-    return _to_response(visit)
+    return _to_response(visit, with_relations=True)
 
 
 @router.post(
@@ -512,102 +595,86 @@ async def stop_location_sharing_endpoint(
     )
     await session.commit()
     await session.refresh(visit)
-    return _to_response(visit)
+    return _to_response(visit, with_relations=True)
 
 
 # --------------------------------------------------------------------------
-# Visit service items
+# Visit activities (spec §5)
 # --------------------------------------------------------------------------
 @router.get(
-    "/{visit_id}/service-items",
-    response_model=list[VisitServiceItemResponse],
+    "/{visit_id}/activities",
+    response_model=list[VisitActivityDeliveryResponse],
 )
-async def list_visit_service_items_endpoint(
+async def list_visit_activities_endpoint(
     visit_id: uuid.UUID,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
-) -> list[VisitServiceItemResponse]:
+) -> list[VisitActivityDeliveryResponse]:
     agency_id = _require_agency(ctx)
     visit = await visits_service.get_visit(
-        session, visit_id=visit_id, agency_id=agency_id
+        session, visit_id=visit_id, agency_id=agency_id, with_relations=True
     )
     _ensure_can_view_visit(ctx, visit.staff_id)
-    items = await visits_service.list_visit_service_items(
+    items = await visits_service.list_visit_activities(
         session, visit_id=visit_id, agency_id=agency_id
     )
-    return [VisitServiceItemResponse.model_validate(i) for i in items]
-
-
-@router.post(
-    "/{visit_id}/service-items",
-    response_model=VisitServiceItemResponse,
-    status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN, UserRole.STAFF))],
-)
-async def add_visit_service_item_endpoint(
-    visit_id: uuid.UUID,
-    payload: VisitServiceItemCreateRequest,
-    ctx: CurrentAuth,
-    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
-) -> VisitServiceItemResponse:
-    """Attach an additional appointment_service_item to a visit."""
-    agency_id = _require_agency(ctx)
-    item = await visits_service.add_visit_service_item(
-        session, visit_id=visit_id, agency_id=agency_id, payload=payload
-    )
-    await session.commit()
-    await session.refresh(item)
-    return VisitServiceItemResponse.model_validate(item)
+    return [VisitActivityDeliveryResponse.model_validate(i) for i in items]
 
 
 @router.patch(
-    "/{visit_id}/service-items/{item_id}",
-    response_model=VisitServiceItemResponse,
+    "/{visit_id}/activities/{activity_id}",
+    response_model=VisitActivityDeliveryResponse,
     dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN, UserRole.STAFF))],
 )
-async def update_visit_service_item_endpoint(
+async def update_visit_activity_endpoint(
     visit_id: uuid.UUID,
-    item_id: uuid.UUID,
-    payload: VisitServiceItemUpdateRequest,
+    activity_id: uuid.UUID,
+    payload: VisitActivityUpdateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
-) -> VisitServiceItemResponse:
-    """Patch a visit service item (status / reason / note)."""
+) -> VisitActivityDeliveryResponse:
+    """Record the per-visit delivery outcome (DONE / NOT_DONE / etc.)."""
     _require_agency(ctx)
-    item = await visits_service.update_visit_service_item(
+    item = await visits_service.update_visit_activity(
         session,
-        item_id=item_id,
+        activity_id=activity_id,
         visit_id=visit_id,
         payload=payload,
         completed_by_user_id=ctx.user_id,
     )
     await session.commit()
     await session.refresh(item)
-    return VisitServiceItemResponse.model_validate(item)
-
-
-@router.delete(
-    "/{visit_id}/service-items/{item_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN, UserRole.STAFF))],
-)
-async def delete_visit_service_item_endpoint(
-    visit_id: uuid.UUID,
-    item_id: uuid.UUID,
-    ctx: CurrentAuth,
-    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
-) -> Response:
-    """Remove a PENDING visit service item. Non-pending items cannot be deleted."""
-    _require_agency(ctx)
-    await visits_service.delete_visit_service_item(
-        session, item_id=item_id, visit_id=visit_id
-    )
-    await session.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    # Best-effort audit.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        action = (
+            AuditAction.ACTIVITY_MARKED_DONE
+            if payload.status and payload.status.value == "DONE"
+            else AuditAction.ACTIVITY_MARKED_NOT_DONE
+        )
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=item.agency_id,
+            actor_user_id=ctx.user_id,
+            action=action,
+            entity_type="VISIT_ACTIVITY_DELIVERY",
+            entity_id=item.id,
+            new_data={
+                "visit_id": str(visit_id),
+                "status": payload.status.value if payload.status else None,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
+    return VisitActivityDeliveryResponse.model_validate(item)
 
 
 # --------------------------------------------------------------------------
-# Visit notes
+# Notes
 # --------------------------------------------------------------------------
 @router.get(
     "/{visit_id}/notes",
@@ -656,147 +723,102 @@ async def add_visit_note_endpoint(
 
 
 # --------------------------------------------------------------------------
-# Service verification
+# Signature (spec §8 — patient / guardian sign)
 # --------------------------------------------------------------------------
 @router.post(
-    "/{visit_id}/verify",
-    response_model=ServiceVerificationResponse,
-)
-async def file_verification_endpoint(
-    visit_id: uuid.UUID,
-    payload: ServiceVerificationCreateRequest,
-    request: Request,
-    background_tasks: BackgroundTasks,
-    ctx: CurrentAuth,
-    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
-) -> ServiceVerificationResponse:
-    """File or update a service verification (PATIENT or GUARDIAN only).
-
-    AGENCY_ADMIN may also file on behalf of the agency (e.g. to record
-    a phone confirmation), but the typical caller is the patient/guardian
-    themselves.
-    """
-    agency_id = _require_agency(ctx)
-    # Pick a verifier_role from the caller's role. STAFF/AGENCY_ADMIN
-    # get PATIENT (we don't expose a separate "STAFF files verification"
-    # flow in this endpoint — that's a back-office operation).
-    if ctx.role == UserRole.AGENCY_ADMIN or ctx.role == UserRole.STAFF:
-        verifier_role = UserRole.PATIENT
-    elif ctx.role in {UserRole.PATIENT, UserRole.GUARDIAN}:
-        verifier_role = ctx.role
-    else:
-        raise ForbiddenError(
-            "Only PATIENT, GUARDIAN, or AGENCY_ADMIN may file a verification."
-        )
-
-    verification = await visits_service.get_or_create_verification(
-        session,
-        visit_id=visit_id,
-        agency_id=agency_id,
-        verified_by=ctx.user_id,
-        verifier_role=verifier_role,
-        payload=payload,
-    )
-    await session.commit()
-    await session.refresh(verification)
-    # Notify the assigned staff (best-effort). In-app row + PENDING
-    # delivery rows are inserted synchronously; provider network
-    # calls (SMTP/Twilio) run on BackgroundTasks so an unreachable
-    # SMTP server cannot block the response.
-    await notif_integrations.notify_verification_status(
-        background_tasks,
-        session,
-        actor_user_id=ctx.user_id,
-        actor_agency_id=agency_id,
-        actor_role=ctx.role,
-        visit_id=visit_id,
-        agency_id=agency_id,
-        verified=(verification.status.value == "VERIFIED"),
-    )
-    # Audit
-    try:
-        ip, ua = audit_logs_service.request_ip_ua(request)
-        action = (
-            AuditAction.SERVICE_VERIFIED
-            if verification.status.value == "VERIFIED"
-            else AuditAction.SERVICE_DISPUTED
-        )
-        await audit_logs_service.audit_log(
-            session,
-            agency_id=agency_id,
-            actor_user_id=ctx.user_id,
-            action=action,
-            entity_type="SERVICE_VERIFICATION",
-            entity_id=verification.id,
-            new_data={
-                "visit_id": str(visit_id),
-                "status": verification.status.value,
-                "verifier_role": verification.verifier_role.value,
-            },
-            ip_address=ip,
-            user_agent=ua,
-        )
-    except Exception:
-        pass
-    return ServiceVerificationResponse.model_validate(verification)
-
-
-# --------------------------------------------------------------------------
-# Visit issues
-# --------------------------------------------------------------------------
-@router.get(
-    "/{visit_id}/issues",
-    response_model=list[VisitIssueResponse],
-)
-async def list_visit_issues_endpoint(
-    visit_id: uuid.UUID,
-    ctx: CurrentAuth,
-    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
-) -> list[VisitIssueResponse]:
-    agency_id = _require_agency(ctx)
-    visit = await visits_service.get_visit(
-        session, visit_id=visit_id, agency_id=agency_id
-    )
-    _ensure_can_view_visit(ctx, visit.staff_id)
-    issues = await visits_service.list_visit_issues(
-        session, visit_id=visit_id, agency_id=agency_id
-    )
-    return [VisitIssueResponse.model_validate(i) for i in issues]
-
-
-@router.post(
-    "/{visit_id}/issues",
-    response_model=VisitIssueResponse,
+    "/{visit_id}/sign",
+    response_model=AppointmentSignatureResponse,
     status_code=status.HTTP_201_CREATED,
 )
-async def add_visit_issue_endpoint(
+async def sign_visit_endpoint(
     visit_id: uuid.UUID,
-    payload: VisitIssueCreateRequest,
     request: Request,
     background_tasks: BackgroundTasks,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
-) -> VisitIssueResponse:
-    """File a non-blocking issue against the visit.
+    signature_image: Annotated[UploadFile, File(description="PNG/JPEG signature blob")],
+    signer_display_name_override: Annotated[
+        str | None, Form(description="Optional override for the rendered name")
+    ] = None,
+) -> AppointmentSignatureResponse:
+    """File a signature on a visit (spec §8 — mandatory for COMPLETED).
 
-    Open to AGENCY_ADMIN, STAFF, PATIENT, and linked GUARDIAN — anyone
-    who can see the visit can also report on it.
+    Multipart upload. Signer must be PATIENT or GUARDIAN (or AGENCY_ADMIN
+    on their behalf — e.g. for phone-confirmed sign-offs). The
+    `signer_display_name` is auto-rendered as `"J. Smith"` from the
+    signer's `users.full_name`; the FE can pass an override if its UI
+    formats differently.
+
+    Idempotent at the visit level: a second POST overwrites the prior
+    row (1:1 UNIQUE constraint), keeping the most recent intent for
+    audit.
     """
     agency_id = _require_agency(ctx)
-    issue = await visits_service.add_visit_issue(
+
+    # Signer-role enforcement: PATIENT, GUARDIAN, or AGENCY_ADMIN.
+    if ctx.role not in {UserRole.PATIENT, UserRole.GUARDIAN, UserRole.AGENCY_ADMIN}:
+        raise ForbiddenError(
+            "Only PATIENT, GUARDIAN, or AGENCY_ADMIN may sign a visit."
+        )
+
+    # Read + validate the uploaded signature image.
+    content = await signature_image.read()
+    if len(content) == 0:
+        raise ValidationError("Empty signature payload.", details={"field": "signature_image"})
+    if len(content) > settings.SIGNATURE_MAX_BYTES:
+        raise ValidationError(
+            "Signature payload too large.",
+            details={"max_bytes": settings.SIGNATURE_MAX_BYTES},
+        )
+    mime_type = (signature_image.content_type or "").lower()
+    if mime_type not in {t.lower() for t in settings.SIGNATURE_ALLOWED_MIME_TYPES}:
+        raise ValidationError(
+            "Unsupported signature MIME type.",
+            details={
+                "allowed": settings.SIGNATURE_ALLOWED_MIME_TYPES,
+                "got": mime_type,
+            },
+        )
+
+    # Persist to local FS (S3 wiring deferred).
+    signature_url = _save_signature_locally(
+        visit_id, content=content, mime_type=mime_type
+    )
+
+    ip, ua = audit_logs_service.request_ip_ua(request)
+    sig = await visits_service.sign_visit(
         session,
         visit_id=visit_id,
         agency_id=agency_id,
-        payload=payload,
-        reported_by_user_id=ctx.user_id,
+        signer_user_id=ctx.user_id,
+        signer_role=ctx.role,
+        signature_image_url=signature_url,
+        signer_display_name_override=signer_display_name_override,
+        ip_address=ip,
+        user_agent=ua,
     )
     await session.commit()
-    await session.refresh(issue)
-    # Notify the assigned staff (best-effort). In-app row + PENDING
-    # delivery rows are inserted synchronously; provider network
-    # calls (SMTP/Twilio) run on BackgroundTasks so an unreachable
-    # SMTP server cannot block the response.
-    await notif_integrations.notify_visit_issue_filed(
+    await session.refresh(sig)
+    # Best-effort audit + staff notification.
+    try:
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.VISIT_SIGNED,
+            entity_type="APPOINTMENT_SIGNATURE",
+            entity_id=sig.id,
+            new_data={
+                "visit_id": str(visit_id),
+                "signer_role": sig.signer_role.value,
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
+    await notif_integrations.notify_visit_signed(
         background_tasks,
         session,
         actor_user_id=ctx.user_id,
@@ -804,74 +826,8 @@ async def add_visit_issue_endpoint(
         actor_role=ctx.role,
         visit_id=visit_id,
         agency_id=agency_id,
-        issue_type=issue.issue_type,
     )
-    # Audit
-    try:
-        ip, ua = audit_logs_service.request_ip_ua(request)
-        await audit_logs_service.audit_log(
-            session,
-            agency_id=agency_id,
-            actor_user_id=ctx.user_id,
-            action=AuditAction.CREATE,
-            entity_type="VISIT_ISSUE",
-            entity_id=issue.id,
-            new_data={
-                "visit_id": str(visit_id),
-                "issue_type": issue.issue_type,
-            },
-            ip_address=ip,
-            user_agent=ua,
-        )
-    except Exception:
-        pass
-    return VisitIssueResponse.model_validate(issue)
-
-
-@router.patch(
-    "/{visit_id}/issues/{issue_id}/resolve",
-    response_model=VisitIssueResponse,
-    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
-)
-async def resolve_visit_issue_endpoint(
-    visit_id: uuid.UUID,
-    issue_id: uuid.UUID,
-    payload: VisitIssueResolveRequest,
-    request: Request,
-    ctx: CurrentAuth,
-    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
-) -> VisitIssueResponse:
-    """Mark an issue resolved (admin only)."""
-    agency_id = _require_agency(ctx)
-    issue = await visits_service.resolve_visit_issue(
-        session,
-        issue_id=issue_id,
-        visit_id=visit_id,
-        payload=payload,
-        resolved_by_user_id=ctx.user_id,
-    )
-    await session.commit()
-    await session.refresh(issue)
-    # Audit
-    try:
-        ip, ua = audit_logs_service.request_ip_ua(request)
-        await audit_logs_service.audit_log(
-            session,
-            agency_id=agency_id,
-            actor_user_id=ctx.user_id,
-            action=AuditAction.UPDATE,
-            entity_type="VISIT_ISSUE",
-            entity_id=issue.id,
-            new_data={
-                "visit_id": str(visit_id),
-                "resolved": True,
-            },
-            ip_address=ip,
-            user_agent=ua,
-        )
-    except Exception:
-        pass
-    return VisitIssueResponse.model_validate(issue)
+    return AppointmentSignatureResponse.model_validate(sig)
 
 
 __all__ = ["router"]

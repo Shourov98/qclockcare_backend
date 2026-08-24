@@ -20,13 +20,9 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from src.shared.domain.enums import (
-    AppointmentEventType,
     AppointmentStatus,
-    ConfirmationStatus,
     ProgramType,
     ServiceItemStatus,
-    ServiceType,
-    UserRole,
 )
 
 
@@ -45,8 +41,8 @@ class AppointmentCreateRequest(BaseModel):
     scheduled_end: datetime
     location: Annotated[str, StringConstraints(max_length=512)] | None = None
     notes: Annotated[str, StringConstraints(max_length=4000)] | None = None
-    # Optional initial set of service items
-    service_items: list[AppointmentServiceItemCreateRequest] = Field(
+    # Optional initial set of activities (free-text per spec §2)
+    activities: list[AppointmentActivityCreateRequest] = Field(
         default_factory=list
     )
 
@@ -86,25 +82,16 @@ class AppointmentUpdateRequest(BaseModel):
 
 
 class AppointmentStatusTransitionRequest(BaseModel):
-    """Generic status / confirmation update endpoint payload."""
+    """Generic status update endpoint payload."""
 
     model_config = ConfigDict(extra="forbid")
 
     status: AppointmentStatus
-    confirmation_status: ConfirmationStatus | None = None
     note: Annotated[str, StringConstraints(max_length=4000)] | None = None
 
 
-class AppointmentCancelRequest(BaseModel):
-    """POST /appointments/{id}/cancel — cancellation payload."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    reason: Annotated[str, StringConstraints(min_length=1, max_length=4000)]
-
-
 class AppointmentResponse(BaseModel):
-    """Single appointment, optionally with nested service items."""
+    """Single appointment, optionally with nested activities."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -116,12 +103,6 @@ class AppointmentResponse(BaseModel):
     scheduled_start: datetime
     scheduled_end: datetime
     status: AppointmentStatus
-    confirmation_status: ConfirmationStatus | None
-    confirmed_at: datetime | None
-    confirmation_note: str | None
-    checked_in_at: datetime | None
-    checked_out_at: datetime | None
-    completed_at: datetime | None
     location: str | None
     notes: str | None
     cancelled_reason: str | None
@@ -129,17 +110,17 @@ class AppointmentResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     # Optional nested — populated only by GET /appointments/{id}/with-items
-    service_items: list[AppointmentServiceItemResponse] | None = None
+    activities: list[AppointmentActivityResponse] | None = None
 
 
 class AppointmentSummaryResponse(BaseModel):
     """Lighter shape for list endpoints — eagerly joins caregiver name,
-    staff phone, program label, first service-item label, and the
-    free-text location so the patient mobile app can render a fully
-    populated card in a single round trip.
+    staff phone, program label, first activity name, and the free-text
+    location so the patient mobile app can render a fully populated
+    card in a single round trip.
 
     All joined fields are nullable because the underlying relations
-    may not exist (e.g. an unassigned `DRAFT` appointment has no
+    may not exist (e.g. an unassigned `SCHEDULED` appointment has no
     staff). The FE should treat them as optional.
     """
 
@@ -153,7 +134,6 @@ class AppointmentSummaryResponse(BaseModel):
     scheduled_start: datetime
     scheduled_end: datetime
     status: AppointmentStatus
-    confirmation_status: ConfirmationStatus | None
     created_at: datetime
     updated_at: datetime
     # ----- Joined caregiver info -----
@@ -176,114 +156,78 @@ class AppointmentSummaryResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# Service items
+# Activity items (renamed from service items)
 # --------------------------------------------------------------------------
-class AppointmentServiceItemCreateRequest(BaseModel):
-    """POST /appointments/{id}/service-items — add a service item."""
+class AppointmentActivityCreateRequest(BaseModel):
+    """POST /appointments/{id}/activities — add a free-text activity.
+
+    Per spec §2, activities are free-text names entered by the admin at
+    scheduling time ("Check blood pressure", "Prepare meal", etc.). The
+    legacy `service_type` enum is replaced by the `name` string.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    service_type: ServiceType
+    name: Annotated[str, StringConstraints(min_length=1, max_length=255)]
     planned_minutes: Annotated[int, Field(gt=0, le=24 * 60)] | None = None
     notes: Annotated[str, StringConstraints(max_length=4000)] | None = None
 
 
-class AppointmentServiceItemUpdateRequest(BaseModel):
-    """PATCH /appointments/{id}/service-items/{item_id}."""
+class AppointmentActivityUpdateRequest(BaseModel):
+    """PATCH /appointments/{id}/activities/{activity_id}."""
 
     model_config = ConfigDict(extra="forbid")
 
-    service_type: ServiceType | None = None
+    name: Annotated[
+        str, StringConstraints(min_length=1, max_length=255)
+    ] | None = None
     planned_minutes: Annotated[int, Field(gt=0, le=24 * 60)] | None = None
     status: ServiceItemStatus | None = None
     notes: Annotated[str, StringConstraints(max_length=4000)] | None = None
 
 
-class AppointmentServiceItemResponse(BaseModel):
+class AppointmentActivityResponse(BaseModel):
+    """One activity row (admin view, no delivery record)."""
+
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
     appointment_id: UUID
     agency_id: UUID
-    service_type: ServiceType
+    name: str
     planned_minutes: int | None
     status: ServiceItemStatus
     notes: str | None
+    completed_at: datetime | None
+    completed_by_user_id: UUID | None
     created_at: datetime
     updated_at: datetime
 
 
 # --------------------------------------------------------------------------
-# Lifecycle — confirm / request-reschedule / request-cancellation
+# Lifecycle — ready (admin marks appointment ready for the caregiver)
 # --------------------------------------------------------------------------
-class AppointmentConfirmRequest(BaseModel):
-    """POST /appointments/{id}/confirm — patient/guardian confirms or declines.
+class AppointmentReadyRequest(BaseModel):
+    """POST /appointments/{id}/ready — admin marks the appointment as
+    ready for the assigned caregiver to start the visit.
 
-    `declined=True` records the confirmation with `status=DECLINED` (the
-    appointment itself stays in its current state — admin must call
-    `/cancel` to finalise). Default = confirmed.
+    Transitions `SCHEDULED → READY`. The caregiver is then expected to
+    call `POST /visits` to actually start the visit (which transitions
+    `READY → IN_PROGRESS`).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    declined: bool = False
-    comment: Annotated[str, StringConstraints(max_length=4000)] | None = None
 
-
-class AppointmentRescheduleRequest(BaseModel):
-    """POST /appointments/{id}/request-reschedule — patient proposes a new window."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    proposed_start: datetime
-    proposed_end: datetime
-    comment: Annotated[str, StringConstraints(max_length=4000)] | None = None
-
-    @model_validator(mode="after")
-    def _validate_window(self) -> AppointmentRescheduleRequest:
-        if self.proposed_end <= self.proposed_start:
-            raise ValueError("proposed_end must be after proposed_start")
-        return self
-
-
-class AppointmentCancellationRequest(BaseModel):
-    """POST /appointments/{id}/request-cancellation — patient asks to cancel."""
+# --------------------------------------------------------------------------
+# Lifecycle — cancel
+# --------------------------------------------------------------------------
+class AppointmentCancelRequest(BaseModel):
+    """POST /appointments/{id}/cancel — cancellation payload."""
 
     model_config = ConfigDict(extra="forbid")
 
     reason: Annotated[str, StringConstraints(min_length=1, max_length=4000)]
-
-
-class AppointmentConfirmationResponse(BaseModel):
-    """One confirmation row — returned by GET /confirmations and POST /confirm."""
-
-    model_config = ConfigDict(from_attributes=True)
-
-    id: UUID
-    appointment_id: UUID
-    confirmed_by: UUID
-    confirmation_role: UserRole
-    status: ConfirmationStatus
-    comment: str | None
-    created_at: datetime
-
-
-class AppointmentEventResponse(BaseModel):
-    """Single event row — returned by GET /appointments/{id}/events."""
-
-    model_config = ConfigDict(from_attributes=True)
-
-    id: UUID
-    appointment_id: UUID
-    agency_id: UUID
-    actor_user_id: UUID | None
-    event_type: AppointmentEventType
-    from_status: AppointmentStatus | None
-    to_status: AppointmentStatus | None
-    metadata_: dict = Field(default_factory=dict, alias="metadata")
-    ip_address: str | None
-    user_agent: str | None
-    created_at: datetime
 
 
 # --------------------------------------------------------------------------
@@ -294,17 +238,13 @@ AppointmentResponse.model_rebuild()
 
 
 __all__ = [
+    "AppointmentActivityCreateRequest",
+    "AppointmentActivityResponse",
+    "AppointmentActivityUpdateRequest",
     "AppointmentCancelRequest",
-    "AppointmentCancellationRequest",
-    "AppointmentConfirmRequest",
-    "AppointmentConfirmationResponse",
     "AppointmentCreateRequest",
-    "AppointmentEventResponse",
-    "AppointmentRescheduleRequest",
+    "AppointmentReadyRequest",
     "AppointmentResponse",
-    "AppointmentServiceItemCreateRequest",
-    "AppointmentServiceItemResponse",
-    "AppointmentServiceItemUpdateRequest",
     "AppointmentStatusTransitionRequest",
     "AppointmentSummaryResponse",
     "AppointmentUpdateRequest",

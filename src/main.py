@@ -39,7 +39,7 @@ from src.modules.compliance.models import AgencyDocument, AgencyLicense  # noqa:
 from src.modules.compliance.router import router as compliance_router
 from src.modules.appointments.models import (  # noqa: F401
     Appointment,
-    AppointmentServiceItem,
+    AppointmentActivity,
 )
 from src.modules.appointments.router import router as appointments_router
 from src.modules.audit_logs.models import AuditLog  # noqa: F401
@@ -84,11 +84,11 @@ from src.modules.staff.router import router as staff_router
 from src.modules.tickets.models import Ticket, TicketComment  # noqa: F401
 from src.modules.tickets.router import router as tickets_router
 from src.modules.visits.models import (  # noqa: F401
-    ServiceVerification,
+    AppointmentSignature,
+    EVVRecord,
     Visit,
-    VisitIssue,
+    VisitActivityDelivery,
     VisitNote,
-    VisitServiceItem,
 )
 from src.modules.visits.router import router as visits_router
 from src.shared.schemas.docs import (

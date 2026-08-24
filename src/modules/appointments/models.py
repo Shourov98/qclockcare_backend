@@ -1,14 +1,20 @@
-"""Appointments module — ORM models for appointments + service items.
+"""Appointments module — ORM models for appointments + activities.
 
 Tables:
-- `appointments`                  — scheduled visit linking patient ↔ staff
-- `appointment_service_items`     — line items under one appointment
+- `appointments`            — scheduled visit linking patient ↔ staff
+- `appointment_activities`  — checklist of free-text activities the
+                              caregiver must complete during the visit
 
-Both tables are agency-scoped; RLS policies are defined in migration 0006.
+Both tables are agency-scoped; RLS policies live in
+`alembic/versions/0027_appointment_flow_alignment.py`.
 
-Status lifecycle (enforced at service layer; see `service.py`):
-  DRAFT → SCHEDULED → CONFIRMED → ASSIGNED → IN_PROGRESS → COMPLETED → PAID
-                  ↘ CANCELLED   ↘ NO_SHOW   ↘ REJECTED
+Lifecycle (see `AppointmentStatus`):
+  SCHEDULED → READY → IN_PROGRESS → AWAITING_SIGNATURE → COMPLETED
+              ↘  CANCELLED, MISSED, REJECTED  ↙
+
+Visit-side artifacts (`evv_records`, `appointment_signatures`,
+`visit.billing_confirmed_at`) live under `src/modules/visits/models.py`.
+This module owns only the appointment and its activities.
 """
 
 from __future__ import annotations
@@ -24,22 +30,19 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    String,
     Text,
     text,
 )
-from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.shared.domain.base_entity import Base, IdMixin, TimestampedMixin
 from src.shared.domain.enum_mapping import pg_name
 from src.shared.domain.enums import (
-    AppointmentEventType,
     AppointmentStatus,
-    ConfirmationStatus,
     ProgramType,
     ServiceItemStatus,
-    ServiceType,
-    UserRole,
 )
 
 if TYPE_CHECKING:
@@ -55,30 +58,20 @@ if TYPE_CHECKING:
 class Appointment(IdMixin, TimestampedMixin, Base):
     """A scheduled visit by a staff member for a patient at one agency.
 
-    Lifecycle statuses (see `AppointmentStatus`):
-      - DRAFT              — created but not yet sent for confirmation
-      - SCHEDULED          — sent, awaiting confirmation
-      - NOTIFICATION_SENT  — patient/guardian notified
-      - AWAITING_CONFIRMATION
-      - CONFIRMED
-      - RESCHEDULE_REQUESTED / CANCELLATION_REQUESTED
-      - ASSIGNED           — staff confirmed/assigned to perform
-      - CHECKED_IN
-      - IN_PROGRESS
-      - CHECKED_OUT
-      - COMPLETED          — visit done; awaiting service verification
-      - AWAITING_SERVICE_VERIFICATION
-      - SERVICE_VERIFIED
-      - DISPUTED
-      - UNDER_REVIEW
-      - APPROVED_FOR_BILLING
-      - PAID
-      - CANCELLED / NO_SHOW / REJECTED
+    Lifecycle (see `AppointmentStatus`):
+      - SCHEDULED          — created + staff assigned, not yet active
+      - READY              — admin marked it ready (caregiver notified)
+      - IN_PROGRESS        — caregiver started the visit (POST /visits)
+      - AWAITING_SIGNATURE — caregiver submitted End Task; awaiting
+                             patient/guardian signature
+      - COMPLETED          — signature received
+      - CANCELLED / MISSED / REJECTED — exception edges
 
-    `staff_id` is nullable up to ASSIGNED (DRAFT / SCHEDULED may have no
-    assignee yet). `confirmation_status` tracks the patient / guardian
-    confirmation; `checked_in_at` / `checked_out_at` track the actual
-    visit; `completed_at` records service completion.
+    `staff_id` is required from `READY` onward (DB-enforced via RLS +
+    service-layer check). The signature flow replaces the legacy
+    confirmation flow; the patient/guardian signs at the visit end, not
+    at scheduling time. EVV start/end records live on
+    `evv_records` (1:1 with the materialized visit).
     """
 
     __tablename__ = "appointments"
@@ -103,7 +96,8 @@ class Appointment(IdMixin, TimestampedMixin, Base):
         nullable=True,
     )
 
-    # Window
+    # Window — duration is derived (scheduled_end - scheduled_start) per
+    # spec §1. The DB enforces the ordering.
     scheduled_start: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -111,40 +105,19 @@ class Appointment(IdMixin, TimestampedMixin, Base):
         DateTime(timezone=True), nullable=False
     )
 
-    # Status
+    # Status (5-state lifecycle per spec).
     status: Mapped[AppointmentStatus] = mapped_column(
         Enum(AppointmentStatus, name=pg_name(AppointmentStatus)),
         nullable=False,
-        default=AppointmentStatus.DRAFT,
-        server_default=AppointmentStatus.DRAFT.value,
-    )
-
-    # Confirmation flow
-    confirmation_status: Mapped[ConfirmationStatus | None] = mapped_column(
-        Enum(ConfirmationStatus, name=pg_name(ConfirmationStatus)),
-        nullable=True,
-    )
-    confirmed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    confirmation_note: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    # Visit timestamps
-    checked_in_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    checked_out_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    completed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
+        default=AppointmentStatus.SCHEDULED,
+        server_default=AppointmentStatus.SCHEDULED.value,
     )
 
     # Context
     location: Mapped[str | None] = mapped_column(Text, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # Cancellation
+    # Cancellation (exception edge)
     cancelled_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -160,9 +133,10 @@ class Appointment(IdMixin, TimestampedMixin, Base):
     staff: Mapped[StaffProfile | None] = relationship(
         "StaffProfile", back_populates="appointments"
     )
-    service_items: Mapped[list[AppointmentServiceItem]] = relationship(
+    activities: Mapped[list[AppointmentActivity]] = relationship(
         back_populates="appointment",
         cascade="all, delete-orphan",
+        order_by="AppointmentActivity.created_at",
     )
     visit: Mapped[Visit | None] = relationship(
         "Visit",
@@ -181,38 +155,46 @@ class Appointment(IdMixin, TimestampedMixin, Base):
         ),
         Index("idx_appointments_scheduled_start", "scheduled_start"),
         Index(
-            "idx_appointments_status",
+            "idx_appointments_status_active",
             "status",
             postgresql_where=text(
-                "status IN ('SCHEDULED', 'CONFIRMED', 'ASSIGNED')"
+                "status IN ('SCHEDULED', 'READY', 'IN_PROGRESS', "
+                "'AWAITING_SIGNATURE')"
             ),
         ),
         CheckConstraint(
             "scheduled_end > scheduled_start",
             name="ck_appointment_end_after_start",
         ),
-        CheckConstraint(
-            "(checked_in_at IS NULL) OR (checked_out_at IS NULL) OR "
-            "(checked_out_at >= checked_in_at)",
-            name="ck_appointment_checkout_after_checkin",
-        ),
     )
 
 
 # --------------------------------------------------------------------------
-# appointment_service_items
+# appointment_activities
 # --------------------------------------------------------------------------
-class AppointmentServiceItem(IdMixin, TimestampedMixin, Base):
-    """A line item: one specific service to deliver during an appointment.
+class AppointmentActivity(IdMixin, TimestampedMixin, Base):
+    """A free-text activity the caregiver must complete during the visit.
 
-    `status` tracks per-item delivery (`PENDING → DONE / NOT_DONE /
-    NOT_APPLICABLE / NEEDS_FOLLOW_UP`). When a visit is verified, the
-    item statuses feed the billable line items. Service verification
-    itself (the patient disputing an item) lives on a separate table
-    in a later migration.
+    Per the spec (`QlockCare_appointemnt_flow.md` §2), activities are
+    free-text names entered by the Agency Admin at scheduling time:
+      - "Check blood pressure"
+      - "Assist with medication"
+      - "Prepare meal"
+      - "Help patient walk"
+      - "Perform hygiene assistance"
+      - "Record patient condition"
+
+    The caregiver cannot submit "End Task" until every activity is in
+    `DONE` (or `NOT_APPLICABLE`) — enforced by the service layer on
+    the IN_PROGRESS → AWAITING_SIGNATURE transition.
+
+    Replaces the legacy `appointment_service_items` table (which used
+    an enum `service_type`); the rename is handled by migration 0027
+    plus a backfill that renders the old enum into the new `name`
+    column via `humanize_enum`.
     """
 
-    __tablename__ = "appointment_service_items"
+    __tablename__ = "appointment_activities"
 
     appointment_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -224,10 +206,7 @@ class AppointmentServiceItem(IdMixin, TimestampedMixin, Base):
         ForeignKey("agencies.id", ondelete="CASCADE"),
         nullable=False,
     )
-    service_type: Mapped[ServiceType] = mapped_column(
-        Enum(ServiceType, name=pg_name(ServiceType)),
-        nullable=False,
-    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
     planned_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[ServiceItemStatus] = mapped_column(
         Enum(ServiceItemStatus, name=pg_name(ServiceItemStatus)),
@@ -236,152 +215,39 @@ class AppointmentServiceItem(IdMixin, TimestampedMixin, Base):
         server_default=ServiceItemStatus.PENDING.value,
     )
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # When the caregiver marked it DONE / NOT_DONE.
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     # Relationships
-    appointment: Mapped[Appointment] = relationship(back_populates="service_items")
+    appointment: Mapped[Appointment] = relationship(back_populates="activities")
 
     __table_args__ = (
-        Index("idx_service_items_appointment_id", "appointment_id"),
-        Index("idx_service_items_agency_id", "agency_id"),
+        Index("idx_activities_appointment_id", "appointment_id"),
+        Index("idx_activities_agency_id", "agency_id"),
+        Index(
+            "idx_activities_pending",
+            "appointment_id",
+            postgresql_where=text("status = 'PENDING'"),
+        ),
         CheckConstraint(
             "(planned_minutes IS NULL) OR (planned_minutes > 0)",
-            name="ck_service_item_planned_minutes_positive",
+            name="ck_activity_planned_minutes_positive",
+        ),
+        CheckConstraint(
+            "length(trim(name)) > 0",
+            name="ck_activity_name_non_empty",
         ),
     )
 
 
 __all__ = [
     "Appointment",
-    "AppointmentConfirmation",
-    "AppointmentEvent",
-    "AppointmentServiceItem",
+    "AppointmentActivity",
 ]
-
-
-# --------------------------------------------------------------------------
-# appointment_confirmations (1:1 with appointments)
-# --------------------------------------------------------------------------
-class AppointmentConfirmation(IdMixin, Base):
-    """One row per confirmed appointment — captures WHO confirmed + HOW.
-
-    Schema doc §10.3. The row is upserted on every confirmation attempt
-    so a patient can re-confirm after a reschedule and the latest action
-    wins. `confirmation_role` is captured at the time of the action
-    (a guardian may confirm on behalf of the patient — the role is
-    recorded so we can render an audit-quality timeline).
-    """
-
-    __tablename__ = "appointment_confirmations"
-
-    appointment_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("appointments.id", ondelete="CASCADE"),
-        nullable=False,
-        unique=True,
-    )
-    confirmed_by: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="RESTRICT"),
-        nullable=False,
-    )
-    confirmation_role: Mapped[UserRole] = mapped_column(
-        Enum(UserRole, name=pg_name(UserRole)),
-        nullable=False,
-    )
-    status: Mapped[ConfirmationStatus] = mapped_column(
-        Enum(ConfirmationStatus, name=pg_name(ConfirmationStatus)),
-        nullable=False,
-    )
-    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=text("now()"),
-    )
-
-    __table_args__ = (
-        CheckConstraint(
-            "confirmation_role IN ('PATIENT', 'GUARDIAN')",
-            name="ck_appointment_confirmations_role",
-        ),
-        Index(
-            "idx_appointment_confirmations_confirmed_by",
-            "confirmed_by",
-        ),
-    )
-
-
-# --------------------------------------------------------------------------
-# appointment_events (append-only domain timeline)
-# --------------------------------------------------------------------------
-class AppointmentEvent(IdMixin, Base):
-    """Immutable per-action event row for an appointment.
-
-    Schema doc §10.4. Append-only at the application layer; the DB also
-    enforces no UPDATE/DELETE via trigger (`trg_appointment_events_no_modify`).
-
-    `event_type` is `text` (not a Postgres enum) so adding new event types
-    doesn't require a migration. The app-layer enum `AppointmentEventType`
-    is the source of truth for valid values.
-    """
-
-    __tablename__ = "appointment_events"
-
-    appointment_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("appointments.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    agency_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("agencies.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    event_type: Mapped[AppointmentEventType] = mapped_column(
-        Enum(AppointmentEventType, name=pg_name(AppointmentEventType), create_type=False),
-        nullable=False,
-    )
-    from_status: Mapped[AppointmentStatus | None] = mapped_column(
-        Enum(AppointmentStatus, name=pg_name(AppointmentStatus)),
-        nullable=True,
-    )
-    to_status: Mapped[AppointmentStatus | None] = mapped_column(
-        Enum(AppointmentStatus, name=pg_name(AppointmentStatus)),
-        nullable=True,
-    )
-    metadata_: Mapped[dict] = mapped_column(
-        "metadata",
-        JSONB,
-        nullable=False,
-        default=dict,
-        server_default=text("'{}'::jsonb"),
-    )
-    ip_address: Mapped[str | None] = mapped_column(INET, nullable=True)
-    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=text("now()"),
-    )
-
-    __table_args__ = (
-        Index(
-            "idx_appointment_events_appointment",
-            "appointment_id",
-            text("created_at"),
-        ),
-        Index(
-            "idx_appointment_events_agency_date",
-            "agency_id",
-            text("created_at DESC"),
-        ),
-        CheckConstraint(
-            "length(trim(event_type)) > 0",
-            name="ck_appointment_events_type_non_empty",
-        ),
-    )
