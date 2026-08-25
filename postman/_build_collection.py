@@ -169,8 +169,16 @@ def make_request(
     auth: dict[str, Any] | None = None,
     extract: list[tuple[str, str]] | None = None,
     extra_tests: str | None = None,
+    multipart: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Build one Postman request item."""
+    """Build one Postman request item.
+
+    `multipart` is used for file-upload endpoints (e.g. signature upload).
+    Each entry is a formdata item: either a `text` field (`{"key", "type":
+    "text", "value": "..."}`) or a `file` field (`{"key", "type": "file",
+    "src": []}`). When `multipart` is provided, the JSON `Content-Type`
+    header is dropped because the multipart boundary header takes its place.
+    """
     auth = auth if auth is not None else _bearer_auth()
     scripts: dict[str, list[str]] = {
         "test": [standard_tests(name)],
@@ -180,11 +188,17 @@ def make_request(
     if extra_tests:
         scripts["test"].append(extra_tests)
 
+    headers = _common_headers()
+    if multipart is not None:
+        # multipart/form-data sets its own Content-Type with the boundary
+        # — drop our JSON Content-Type header.
+        headers = [h for h in headers if h.get("key") != "Content-Type"]
+
     item: dict[str, Any] = {
         "name": name,
         "request": {
             "method": method,
-            "header": _common_headers(),
+            "header": headers,
             "url": _url(path),
             "auth": auth,
         },
@@ -195,7 +209,18 @@ def make_request(
     }
     if body is not None:
         item["request"]["body"] = _example_body(body)
+    elif multipart is not None:
+        item["request"]["body"] = {"mode": "formdata", "formdata": multipart}
     return item
+
+
+# Reusable multipart body for /visits/{id}/sign — signature image upload
+# + optional override for the signer's display name. Postman will prompt
+# the user to pick a file when this request is run.
+SIGN_VISIT_MULTIPART: list[dict[str, Any]] = [
+    {"key": "signature_image", "type": "file", "src": []},
+    {"key": "signer_display_name_override", "type": "text", "value": ""},
+]
 
 
 def folder(name: str, items: list[dict[str, Any]], description: str = "") -> dict[str, Any]:
@@ -566,7 +591,7 @@ PATIENTS_FOLDER = folder(
 )
 
 # --------------------------------------------------------------------------
-# 4. Appointments (17 routes)
+# 4. Appointments (spec-aligned: SCHEDULED→READY→IN_PROGRESS→AWAITING_SIGNATURE→COMPLETED)
 # --------------------------------------------------------------------------
 APPOINTMENTS_FOLDER = folder(
     "appointments",
@@ -615,7 +640,7 @@ APPOINTMENTS_FOLDER = folder(
             name="Transition appointment state",
             method="POST",
             path="/appointments/{{appointment_id}}/transition",
-            body={"to_status": "CONFIRMED"},
+            body={"to_status": "READY"},
         ),
         make_request(
             name="Assign staff to appointment",
@@ -624,66 +649,48 @@ APPOINTMENTS_FOLDER = folder(
             body={"staff_id": "{{staff_id}}", "role": "PRIMARY"},
         ),
         make_request(
-            name="Confirm appointment (patient)",
+            name="Mark appointment ready",
             method="POST",
-            path="/appointments/{{appointment_id}}/confirm",
+            path="/appointments/{{appointment_id}}/ready",
             body={},
         ),
         make_request(
-            name="Request reschedule (patient)",
-            method="POST",
-            path="/appointments/{{appointment_id}}/request-reschedule",
-            body={"requested_start": "2026-07-02T10:00:00Z"},
-        ),
-        make_request(
-            name="Request cancellation (patient)",
-            method="POST",
-            path="/appointments/{{appointment_id}}/request-cancellation",
-            body={"reason": "Family emergency"},
-        ),
-        make_request(
-            name="List appointment events",
+            name="List activities for appointment",
             method="GET",
-            path="/appointments/{{appointment_id}}/events",
+            path="/appointments/{{appointment_id}}/activities",
         ),
         make_request(
-            name="Get appointment confirmation",
-            method="GET",
-            path="/appointments/{{appointment_id}}/confirmation",
-        ),
-        make_request(
-            name="List service items for appointment",
-            method="GET",
-            path="/appointments/{{appointment_id}}/service-items",
-        ),
-        make_request(
-            name="Add service item",
+            name="Add activity",
             method="POST",
-            path="/appointments/{{appointment_id}}/service-items",
+            path="/appointments/{{appointment_id}}/activities",
             body={
-                "service_type": "PERSONAL_CARE",
-                "duration_minutes": 60,
-                "notes": "Bathing assistance",
+                "name": "Check blood pressure",
+                "planned_minutes": 5,
+                "notes": "Use the wrist cuff on the nightstand.",
             },
-            extract=[("service_item_id", "id")],
+            extract=[("activity_id", "id")],
         ),
         make_request(
-            name="Update service item",
+            name="Update activity",
             method="PATCH",
-            path="/appointments/{{appointment_id}}/service-items/{{service_item_id}}",
-            body={"status": "APPROVED"},
+            path="/appointments/{{appointment_id}}/activities/{{activity_id}}",
+            body={"status": "DONE", "notes": "BP 128/82"},
         ),
         make_request(
-            name="Delete service item",
+            name="Delete activity",
             method="DELETE",
-            path="/appointments/{{appointment_id}}/service-items/{{service_item_id}}",
+            path="/appointments/{{appointment_id}}/activities/{{activity_id}}",
         ),
     ],
-    description="Care appointments — scheduling, state machine, service items, patient-side actions.",
+    description=(
+        "Care appointments — scheduling + 5-state lifecycle "
+        "(SCHEDULED→READY→IN_PROGRESS→AWAITING_SIGNATURE→COMPLETED) "
+        "plus free-text activities (renamed from enum service-items)."
+    ),
 )
 
 # --------------------------------------------------------------------------
-# 5. Visits (17 routes)
+# 5. Visits (spec-aligned — EVV split into start/end, signature replaces verify)
 # --------------------------------------------------------------------------
 VISITS_FOLDER = folder(
     "visits",
@@ -714,52 +721,61 @@ VISITS_FOLDER = folder(
             path="/visits?page=1&page_size=20",
         ),
         make_request(
-            name="Check in to visit",
-            method="POST",
-            path="/visits/{{visit_id}}/check-in",
-            body={
-                "actual_start": "2026-07-01T10:05:00Z",
-                "location": {"lat": 44.98, "lng": -93.27},
-            },
-        ),
-        make_request(
-            name="Check out of visit",
-            method="POST",
-            path="/visits/{{visit_id}}/check-out",
-            body={"actual_end": "2026-07-01T11:02:00Z"},
-        ),
-        make_request(
             name="Transition visit state",
             method="POST",
             path="/visits/{{visit_id}}/transition",
             body={"to_status": "IN_PROGRESS"},
         ),
         make_request(
-            name="List visit service items",
-            method="GET",
-            path="/visits/{{visit_id}}/service-items",
-        ),
-        make_request(
-            name="Add visit service item",
+            name="Confirm visit billing",
             method="POST",
-            path="/visits/{{visit_id}}/service-items",
-            body={
-                "service_type": "PERSONAL_CARE",
-                "duration_minutes": 55,
-                "notes": "Completed at 11:00",
-            },
-            extract=[("service_item_id", "id")],
+            path="/visits/{{visit_id}}/confirm-billing",
+            body={},
         ),
         make_request(
-            name="Update visit service item",
+            name="End visit (record EVV end)",
             method="PATCH",
-            path="/visits/{{visit_id}}/service-items/{{service_item_id}}",
-            body={"status": "COMPLETED"},
+            path="/visits/{{visit_id}}/end",
+            body={
+                "end_time": "2026-07-01T11:02:00Z",
+                "end_lat": 44.9778,
+                "end_lng": -93.2650,
+                "end_accuracy_m": 12.5,
+            },
         ),
         make_request(
-            name="Delete visit service item",
+            name="Sign visit (upload signature)",
+            method="POST",
+            path="/visits/{{visit_id}}/sign",
+            multipart=SIGN_VISIT_MULTIPART,
+            extract=[("signature_id", "id")],
+        ),
+        make_request(
+            name="List visit activities",
+            method="GET",
+            path="/visits/{{visit_id}}/activities",
+        ),
+        make_request(
+            name="Add visit activity",
+            method="POST",
+            path="/visits/{{visit_id}}/activities",
+            body={
+                "name": "Bathing assistance",
+                "planned_minutes": 30,
+                "notes": "Patient requested warm water.",
+            },
+            extract=[("activity_id", "id")],
+        ),
+        make_request(
+            name="Update visit activity",
+            method="PATCH",
+            path="/visits/{{visit_id}}/activities/{{activity_id}}",
+            body={"status": "DONE", "notes": "Completed at 11:00"},
+        ),
+        make_request(
+            name="Delete visit activity",
             method="DELETE",
-            path="/visits/{{visit_id}}/service-items/{{service_item_id}}",
+            path="/visits/{{visit_id}}/activities/{{activity_id}}",
         ),
         make_request(
             name="List visit notes",
@@ -774,35 +790,6 @@ VISITS_FOLDER = folder(
                 "note_text": "Patient in good spirits. Vital signs normal.",
                 "category": "CLINICAL",
             },
-        ),
-        make_request(
-            name="Verify visit (PATIENT role)",
-            method="POST",
-            path="/visits/{{visit_id}}/verify",
-            body={"verified": True, "feedback": "Great visit"},
-        ),
-        make_request(
-            name="Dispute visit (PATIENT role)",
-            method="POST",
-            path="/visits/{{visit_id}}/dispute",
-            body={"reason": "Visit was shorter than scheduled"},
-        ),
-        make_request(
-            name="List visit issues",
-            method="GET",
-            path="/visits/{{visit_id}}/issues",
-        ),
-        make_request(
-            name="Report visit issue",
-            method="POST",
-            path="/visits/{{visit_id}}/issues",
-            body={"severity": "MEDIUM", "description": "Medication was missed"},
-        ),
-        make_request(
-            name="Resolve visit issue",
-            method="POST",
-            path="/visits/{{visit_id}}/issues/00000000-0000-0000-0000-000000000000/resolve",
-            body={"resolution": "Patient took medication at 10:30"},
         ),
         # Live GPS — staff opt-in EVV location sharing. The staff mobile
         # app calls `start-location-sharing` once when the user toggles
@@ -839,13 +826,14 @@ VISITS_FOLDER = folder(
         ),
     ],
     description=(
-        "Field visits by care staff — check-in/out, notes, patient "
-        "verification, issue reporting, and live GPS sharing."
+        "Field visits by care staff — start/end via EVV records, "
+        "billing confirmation, signature upload, free-text activities, "
+        "notes, and live GPS sharing."
     ),
 )
 
 # --------------------------------------------------------------------------
-# 6. Portal (5 routes — PATIENT role)
+# 6. Portal (3 routes — PATIENT role, spec-aligned)
 # --------------------------------------------------------------------------
 PORTAL_FOLDER = folder(
     "portal",
@@ -861,25 +849,18 @@ PORTAL_FOLDER = folder(
             path="/portal/visits/{{visit_id}}",
         ),
         make_request(
-            name="Verify my visit (PATIENT)",
-            method="POST",
-            path="/portal/visits/{{visit_id}}/verify",
-            body={"verified": True, "feedback": "All good"},
-        ),
-        make_request(
-            name="Dispute my visit (PATIENT)",
-            method="POST",
-            path="/portal/visits/{{visit_id}}/dispute",
-            body={"reason": "Caregiver left early"},
-        ),
-        make_request(
             name="Report issue on my visit (PATIENT)",
             method="POST",
             path="/portal/visits/{{visit_id}}/report-issue",
             body={"severity": "LOW", "description": "Caregiver was 15 min late"},
         ),
     ],
-    description="Patient-facing endpoints. Run 'auth > Login as PATIENT' first (after seeding via scripts/seed_test_user.py) — the request path will 403 with AGENCY_ADMIN.",
+    description=(
+        "Patient-facing endpoints. Run 'auth > Login as PATIENT' first "
+        "(after seeding via scripts/seed_test_user.py) — the request "
+        "path will 403 with AGENCY_ADMIN. Signature is submitted via "
+        "POST /visits/{id}/sign from any role."
+    ),
 )
 
 # --------------------------------------------------------------------------
@@ -1550,15 +1531,11 @@ AGENCY_ADMIN_FOLDER = folder(
             "Cancel appointment",
             "Transition appointment state",
             "Assign staff to appointment",
-            "Confirm appointment (patient)",
-            "Request reschedule (patient)",
-            "Request cancellation (patient)",
-            "List appointment events",
-            "Get appointment confirmation",
-            "List service items for appointment",
-            "Add service item",
-            "Update service item",
-            "Delete service item",
+            "Mark appointment ready",
+            "List activities for appointment",
+            "Add activity",
+            "Update activity",
+            "Delete activity",
         ),
         # Visits — agency admin can do everything
         *_requests(VISITS_FOLDER,
@@ -1566,20 +1543,16 @@ AGENCY_ADMIN_FOLDER = folder(
             "Get visit by id",
             "Get visit with items",
             "List visits (paginated)",
-            "Check in to visit",
-            "Check out of visit",
             "Transition visit state",
-            "List visit service items",
-            "Add visit service item",
-            "Update visit service item",
-            "Delete visit service item",
+            "Confirm visit billing",
+            "End visit (record EVV end)",
+            "Sign visit (upload signature)",
+            "List visit activities",
+            "Add visit activity",
+            "Update visit activity",
+            "Delete visit activity",
             "List visit notes",
             "Add visit note",
-            "Verify visit (PATIENT role)",
-            "Dispute visit (PATIENT role)",
-            "List visit issues",
-            "Report visit issue",
-            "Resolve visit issue",
             "Start location sharing for visit",
             "Send location ping for visit",
             "Stop location sharing for visit",
@@ -1647,27 +1620,25 @@ STAFF_FOLDER_RF = folder(
             "List appointments (paginated)",
             "Get appointment with items",
             "Get appointment by id",
-            "List appointment events",
-            "Get appointment confirmation",
-            "List service items for appointment",
+            "Mark appointment ready",
+            "List activities for appointment",
         ),
-        # Visits — staff check-in/out, notes, services
+        # Visits — staff create visit, run lifecycle, sign off
         *_requests(VISITS_FOLDER,
             "Create visit (from appointment)",
             "Get visit by id",
             "Get visit with items",
             "List visits (paginated)",
-            "Check in to visit",
-            "Check out of visit",
             "Transition visit state",
-            "List visit service items",
-            "Add visit service item",
-            "Update visit service item",
-            "Delete visit service item",
+            "Confirm visit billing",
+            "End visit (record EVV end)",
+            "Sign visit (upload signature)",
+            "List visit activities",
+            "Add visit activity",
+            "Update visit activity",
+            "Delete visit activity",
             "List visit notes",
             "Add visit note",
-            "List visit issues",
-            "Report visit issue",
             "Start location sharing for visit",
             "Send location ping for visit",
             "Stop location sharing for visit",
@@ -1714,29 +1685,19 @@ PATIENT_FOLDER = folder(
             "List appointments (paginated)",
             "Get appointment with items",
             "Get appointment by id",
-            "Confirm appointment (patient)",
-            "Request reschedule (patient)",
-            "Request cancellation (patient)",
-            "List appointment events",
-            "Get appointment confirmation",
-            "List service items for appointment",
+            "List activities for appointment",
         ),
-        # Visits — patient verify/dispute via regular visits endpoints
+        # Visits — patient reads visits + signs off via /sign
         *_requests(VISITS_FOLDER,
             "Get visit by id",
             "Get visit with items",
             "List visits (paginated)",
-            "Verify visit (PATIENT role)",
-            "Dispute visit (PATIENT role)",
-            "List visit issues",
-            "Report visit issue",
+            "Sign visit (upload signature)",
         ),
         # Patient portal — self-service
         *_requests(PORTAL_FOLDER,
             "List my visits (PATIENT)",
             "Get my visit detail (PATIENT)",
-            "Verify my visit (PATIENT)",
-            "Dispute my visit (PATIENT)",
             "Report issue on my visit (PATIENT)",
         ),
         # Locations — read-only
@@ -1757,8 +1718,8 @@ PATIENT_FOLDER = folder(
     ],
     description=(
         "Patient self-service (PATIENT role). Own profile + appointments, "
-        "visit verify / dispute / report-issue, and the `/portal/*` "
-        "self-service endpoints. "
+        "read visits, sign visits via POST /visits/{id}/sign, and the "
+        "`/portal/*` self-service endpoints. "
         "Log in as `patient@qlockcare.dev` before running these."
     ),
 )
@@ -1785,29 +1746,19 @@ GUARDIAN_FOLDER = folder(
             "List appointments (paginated)",
             "Get appointment with items",
             "Get appointment by id",
-            "Confirm appointment (patient)",
-            "Request reschedule (patient)",
-            "Request cancellation (patient)",
-            "List appointment events",
-            "Get appointment confirmation",
-            "List service items for appointment",
+            "List activities for appointment",
         ),
-        # Visits — guardian verify/dispute
+        # Visits — guardian reads visits + signs off via /sign
         *_requests(VISITS_FOLDER,
             "Get visit by id",
             "Get visit with items",
             "List visits (paginated)",
-            "Verify visit (PATIENT role)",
-            "Dispute visit (PATIENT role)",
-            "List visit issues",
-            "Report visit issue",
+            "Sign visit (upload signature)",
         ),
         # Portal — guardian sees same self-service endpoints
         *_requests(PORTAL_FOLDER,
             "List my visits (PATIENT)",
             "Get my visit detail (PATIENT)",
-            "Verify my visit (PATIENT)",
-            "Dispute my visit (PATIENT)",
             "Report issue on my visit (PATIENT)",
         ),
         # Locations — read-only
@@ -1827,8 +1778,8 @@ GUARDIAN_FOLDER = folder(
         ),
     ],
     description=(
-        "Guardian role (GUARDIAN). Linked patients, ward's appointment "
-        "lifecycle, visit verify / dispute / report-issue, and the "
+        "Guardian role (GUARDIAN). Linked patients, ward's appointments, "
+        "read visits, sign visits via POST /visits/{id}/sign, and the "
         "`/portal/*` self-service endpoints. "
         "Log in as a guardian (seed via `patients > Create guardian` "
         "under Agency Admin) before running these."
