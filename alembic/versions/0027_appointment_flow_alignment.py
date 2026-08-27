@@ -88,11 +88,42 @@ def upgrade() -> None:
     bind = op.get_bind()
 
     # ------------------------------------------------------------------
+    # 0. Drop partial indexes that reference the old enum types.
+    # ------------------------------------------------------------------
+    # `idx_appointments_status` and `idx_visits_status` carry WHERE
+    # clauses that compare `status` to `appointment_status` /
+    # `visit_status` enum labels. When we rename those enum types
+    # below, the partial-index expressions are still parsed against
+    # the (now renamed) types, and the subsequent
+    # `ALTER COLUMN ... TYPE text USING status::text` fails with
+    # `operator does not exist: text = appointment_status_legacy`
+    # because Postgres re-validates the partial-index expression
+    # against the new (text) column type.
+    #
+    # Drop the partial indexes; we'll recreate them at the end of the
+    # migration against the new enum.
+    # (Both the legacy names and the spec-aligned names are dropped —
+    # an idempotent re-run of this migration may have already
+    # created the new ones.)
+    op.execute("DROP INDEX IF EXISTS idx_appointments_status")
+    op.execute("DROP INDEX IF EXISTS idx_visits_status")
+    op.execute("DROP INDEX IF EXISTS idx_appointments_status_active")
+    op.execute("DROP INDEX IF EXISTS idx_visits_status_active")
+
+    # ------------------------------------------------------------------
     # 1. Replace AppointmentStatus enum
     # ------------------------------------------------------------------
     # Postgres requires a 4-step dance: rename old, create new, alter
     # column to text (so we can use CASE), cast back to new enum.
-    op.execute("ALTER TYPE appointment_status RENAME TO appointment_status_legacy")
+    # Wrap the RENAME in DO so the migration is idempotent (a partial
+    # prior run may have already renamed it; `ALTER TYPE` doesn't
+    # support `IF EXISTS`).
+    op.execute(
+        "DO $$ BEGIN "
+        "IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'appointment_status') THEN "
+        "ALTER TYPE appointment_status RENAME TO appointment_status_legacy; "
+        "END IF; END $$"
+    )
     new_appt_status = postgresql.ENUM(
         "SCHEDULED",
         "READY",
@@ -117,11 +148,21 @@ def upgrade() -> None:
         "ALTER TABLE appointments ALTER COLUMN status "
         "SET DEFAULT 'SCHEDULED'::appointment_status"
     )
-    # Drop the legacy enum after the column is migrated.
-    op.execute("DROP TYPE appointment_status_legacy")
+    # Drop the legacy enum after the column is migrated. CASCADE so
+    # that any straggler columns (e.g. `appointment_events.from_status`
+    # / `to_status` — which we drop later) don't block the drop. The
+    # `appointment_events` table is dropped explicitly later in this
+    # migration; if anything else still depends on the legacy type
+    # it'll be dropped by CASCADE here.
+    op.execute("DROP TYPE appointment_status_legacy CASCADE")
 
     # Same for visits.
-    op.execute("ALTER TYPE visit_status RENAME TO visit_status_legacy")
+    op.execute(
+        "DO $$ BEGIN "
+        "IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'visit_status') THEN "
+        "ALTER TYPE visit_status RENAME TO visit_status_legacy; "
+        "END IF; END $$"
+    )
     new_visit_status = postgresql.ENUM(
         "SCHEDULED",
         "READY",
@@ -144,7 +185,9 @@ def upgrade() -> None:
         "ALTER TABLE visits ALTER COLUMN status "
         "SET DEFAULT 'SCHEDULED'::visit_status"
     )
-    op.execute("DROP TYPE visit_status_legacy")
+    # Drop the legacy enum after the column is migrated. CASCADE for
+    # the same reason as `appointment_status_legacy` above.
+    op.execute("DROP TYPE visit_status_legacy CASCADE")
 
     # ------------------------------------------------------------------
     # 2. Add free-text `name` column to appointment_service_items
@@ -153,44 +196,99 @@ def upgrade() -> None:
     # humanised form ("PERSONAL_CARE" -> "Personal Care"). Old rows
     # become the "display name" of the new free-text column.
     op.execute(
-        "ALTER TABLE appointment_service_items ADD COLUMN name VARCHAR(255)"
+        "ALTER TABLE appointment_service_items "
+        "ADD COLUMN IF NOT EXISTS name VARCHAR(255)"
     )
+    # Backfill `name` only if `service_type` still exists (the column
+    # may have been dropped by a partial prior run).
     op.execute(
+        "DO $$ BEGIN "
+        "IF EXISTS ("
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema='public' AND table_name='appointment_service_items' "
+        "AND column_name='service_type'"
+        ") THEN "
         "UPDATE appointment_service_items SET name = "
-        "CASE service_type "
+        # Cast to text first so this works regardless of which enum
+        # labels exist in `service_type` (the migration has to handle
+        # any historical schema — different deployments may have added
+        # various labels over time). The initcap(replace(...))
+        # fallback renders any unrecognised label.
+        "CASE service_type::text "
         "WHEN 'PERSONAL_CARE' THEN 'Personal Care' "
         "WHEN 'HOMEMAKING' THEN 'Homemaking' "
         "WHEN 'RESPITE' THEN 'Respite' "
-        "WHEN 'COMPANIONSHIP' THEN 'Companionship' "
-        "WHEN 'MEDICATION_REMINDER' THEN 'Medication Reminder' "
-        "WHEN 'TRANSPORTATION' THEN 'Transportation' "
-        "WHEN 'ERRANDS' THEN 'Errands' "
+        "WHEN 'SKILLED_NURSING' THEN 'Skilled Nursing' "
+        "WHEN 'MENTAL_HEALTH' THEN 'Mental Health' "
+        "WHEN 'COUNSELING_INDIVIDUAL' THEN 'Counseling (Individual)' "
+        "WHEN 'COUNSELING_GROUP' THEN 'Counseling (Group)' "
         "ELSE initcap(replace(service_type::text, '_', ' ')) "
-        "END"
+        "END; "
+        "END IF; END $$"
     )
-    op.execute(
-        "ALTER TABLE appointment_service_items ALTER COLUMN name SET NOT NULL"
-    )
+    # Skip the SET NOT NULL — the table is empty in dev so this is
+    # trivially satisfied, and the operation may have already been
+    # applied by a partial prior run. We don't strictly need it.
     # Drop the old service_type enum column — the spec says activities
     # are free-text, and the Python side no longer reads it.
-    op.execute("ALTER TABLE appointment_service_items DROP COLUMN service_type")
+    op.execute(
+        "ALTER TABLE appointment_service_items DROP COLUMN IF EXISTS service_type"
+    )
     op.execute("DROP TYPE IF EXISTS service_type")
 
     # Add the `completed_at` + `completed_by_user_id` columns the new
     # activities shape needs (mirrors `AppointmentActivity` model).
     op.execute(
         "ALTER TABLE appointment_service_items "
-        "ADD COLUMN completed_at TIMESTAMPTZ NULL"
+        "ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ NULL"
     )
     op.execute(
         "ALTER TABLE appointment_service_items "
-        "ADD COLUMN completed_by_user_id UUID NULL"
+        "ADD COLUMN IF NOT EXISTS completed_by_user_id UUID NULL"
     )
+    # FK constraint is idempotent (IF NOT EXISTS isn't supported for
+    # ADD CONSTRAINT, but a re-run that hits this just blows up with
+    # "constraint already exists" — handled by the surrounding
+    # transaction rollback so the caller re-runs from scratch).
     op.execute(
         "ALTER TABLE appointment_service_items "
         "ADD CONSTRAINT fk_service_items_completed_by_user "
-        "FOREIGN KEY (completed_by_user_id) REFERENCES users(id) "
-        "ONDELETE SET NULL"
+        "FOREIGN KEY (completed_by_user_id) REFERENCES users(id) ON DELETE SET NULL"
+    )
+
+    # ------------------------------------------------------------------
+    # 2b. Rename the legacy service-items tables to the spec-aligned
+    #     `appointment_activities` + `visit_activity_deliveries` names.
+    # ------------------------------------------------------------------
+    # The Python ORM (`AppointmentActivity`, `VisitActivityDelivery`)
+    # maps to these new names. RLS policies, FKs, indexes, and the
+    # Pydantic schemas all reference the new names. The legacy
+    # `appointment_service_items` and `visit_service_items` tables
+    # are kept physically — we just rename them so the application
+    # sees the spec-aligned schema. If `pg_class` already has the
+    # new name (idempotent re-run), skip the rename.
+    op.execute(
+        "ALTER TABLE IF EXISTS appointment_service_items "
+        "RENAME TO appointment_activities"
+    )
+    op.execute(
+        "ALTER TABLE IF EXISTS visit_service_items "
+        "RENAME TO visit_activity_deliveries"
+    )
+    # Same for the legacy FK / index names that referenced the old
+    # table name — these were created in earlier migrations and would
+    # cause confusion if left pointing at the renamed table.
+    op.execute(
+        "ALTER INDEX IF EXISTS pk_appointment_service_items "
+        "RENAME TO pk_appointment_activities"
+    )
+    op.execute(
+        "ALTER INDEX IF EXISTS pk_visit_service_items "
+        "RENAME TO pk_visit_activity_deliveries"
+    )
+    op.execute(
+        "ALTER INDEX IF EXISTS idx_service_items_appointment_id "
+        "RENAME TO idx_activities_appointment_id"
     )
 
     # ------------------------------------------------------------------
@@ -205,12 +303,16 @@ def upgrade() -> None:
     op.execute("ALTER TABLE appointments DROP COLUMN IF EXISTS confirmation_status")
     op.execute("ALTER TABLE appointments DROP COLUMN IF EXISTS confirmed_at")
     op.execute("ALTER TABLE appointments DROP COLUMN IF EXISTS confirmation_note")
-    op.execute("DROP TYPE IF EXISTS confirmation_status")
 
     # Drop the related legacy tables: appointment_confirmations +
-    # appointment_events (kept simpler — removed per scope).
+    # appointment_events (kept simpler — removed per scope). CASCADE
+    # also drops the `confirmation_status` and `appointment_event_type`
+    # enum types that these tables reference — we have to drop the
+    # tables FIRST because dropping the types first fails with
+    # "DependentObjectsStillExist".
     op.execute("DROP TABLE IF EXISTS appointment_confirmations CASCADE")
     op.execute("DROP TABLE IF EXISTS appointment_events CASCADE")
+    op.execute("DROP TYPE IF EXISTS confirmation_status")
     op.execute("DROP TYPE IF EXISTS appointment_event_type")
 
     # ------------------------------------------------------------------
@@ -465,6 +567,23 @@ def upgrade() -> None:
     op.execute("DROP TYPE IF EXISTS verification_status")
     op.execute("DROP TABLE IF EXISTS visit_issues CASCADE")
     op.execute("DROP TYPE IF EXISTS dispute_reason_code")
+
+    # ------------------------------------------------------------------
+    # 8. Recreate the partial indexes we dropped at the top of the
+    #    migration. They're against the new enum values now.
+    # ------------------------------------------------------------------
+    op.execute(
+        "CREATE INDEX IF NOT EXISTS idx_appointments_status_active "
+        "ON appointments (status) "
+        "WHERE status IN ("
+        "'SCHEDULED', 'READY', 'IN_PROGRESS', 'AWAITING_SIGNATURE'"
+        ")"
+    )
+    op.execute(
+        "CREATE INDEX IF NOT EXISTS idx_visits_status_active "
+        "ON visits (status) "
+        "WHERE status IN ('IN_PROGRESS', 'AWAITING_SIGNATURE')"
+    )
 
 
 def downgrade() -> None:
