@@ -123,6 +123,28 @@ class Appointment(IdMixin, TimestampedMixin, Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # Billing — denormalized onto the appointment row so the agency-admin
+    # dashboard / visit-summary screen can render "Paid" / "Unpaid"
+    # without joining to `visits`. The visit row keeps its own
+    # `billing_confirmed_at` (timestamp of the staff confirmation); this
+    # promotion lets the FE render the badge straight off the appointment
+    # payload. `claim_id` is the durable, externally-rendered identifier
+    # generated at insert time as `CG-{agency_code_short}-{appt_short}`.
+    billing_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unpaid", server_default="unpaid"
+    )
+    billing_paid_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    billing_paid_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    claim_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, unique=True
+    )
+
     # Relationships
     agency: Mapped[Agency] = relationship(
         "Agency", back_populates="appointments"

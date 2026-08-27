@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from datetime import date, datetime, time, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -42,6 +43,8 @@ from src.modules.appointments.schemas import (
     AppointmentActivityUpdateRequest,
     AppointmentCancelRequest,
     AppointmentCreateRequest,
+    AppointmentMissedRequest,
+    AppointmentRejectedRequest,
     AppointmentStatusTransitionRequest,
     AppointmentUpdateRequest,
 )
@@ -50,7 +53,7 @@ from src.modules.patients.models import (
     PatientGuardianRelationship,
     PatientProfile,
 )
-from src.modules.staff.models import StaffProfile
+from src.modules.staff.models import StaffProfile, StaffQualification
 from src.shared.domain.enums import (
     AppointmentStatus,
     ServiceItemStatus,
@@ -310,6 +313,7 @@ async def create_appointment(
         location=payload.location,
         notes=payload.notes,
         status=AppointmentStatus.SCHEDULED,
+        billing_status="unpaid",
     )
     session.add(appt)
     try:
@@ -320,6 +324,24 @@ async def create_appointment(
             "Could not create appointment (constraint violation).",
             details={"constraint": _extract_constraint(exc)},
         ) from exc
+
+    # Generate the externally-rendered `claim_id`. Format:
+    # `CG-{agency_name_short}-{appt_id_short}` — e.g. `CG-QLOC-A1B2C3D4`.
+    # The `claim_id` is created here (not via DB default) so the agency
+    # tag is sourced from the freshly-fetched agency row (the router
+    # doesn't have to pass it through). The Agency table doesn't have a
+    # dedicated `code` column so we render the first 4 uppercase
+    # alphanumeric characters of `agency.name`.
+    agency = await session.get(Agency, agency_id)
+    if agency is not None and getattr(agency, "name", None):
+        # Strip non-alphanumeric and uppercase the first 4 chars.
+        tag = "".join(
+            ch for ch in agency.name.upper() if ch.isalnum()
+        )[:4] or "AGCY"
+    else:
+        tag = "AGCY"
+    appt.claim_id = f"CG-{tag}-{str(appt.id)[:8].upper()}"
+    await session.flush()
 
     # Inline activities (if any)
     for activity_payload in payload.activities:
@@ -368,14 +390,28 @@ async def list_appointments(
     patient_id: uuid.UUID | None = None,
     staff_id: uuid.UUID | None = None,
     status_filter: AppointmentStatus | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
     page: int = 1,
     page_size: int = 20,
 ) -> tuple[Sequence[Appointment], int]:
     """Paginated list of appointments at the caller's agency.
 
-    Eager-loads the caregiver (`staff.user`), staff profile, and the
-    parent activities so the patient mobile app can render a fully
-    populated card from a single round trip.
+    Eager-loads the caregiver (`staff.user`), staff profile (with first
+    qualification), patient identity, and parent activities so the
+    patient mobile app can render a fully populated card in a single
+    round trip.
+
+    Date filtering
+    --------------
+    `date_from` / `date_to` are *calendar dates* in the caller's locale
+    (the FE sends `YYYY-MM-DD`). They filter on `scheduled_start`:
+      - `date_from` only — `scheduled_start >= date_from 00:00:00`
+      - `date_to` only   — `scheduled_start < (date_to + 1 day)`
+      - both              — the inclusive window
+      - neither           — no date filter
+    The semantics are inclusive on both ends ("appointments scheduled
+    on Tuesday" passes both `date_from=date_to=Tuesday`).
     """
     page = max(1, page)
     page_size = max(1, min(100, page_size))
@@ -385,6 +421,12 @@ async def list_appointments(
         .where(Appointment.agency_id == agency_id)
         .options(
             selectinload(Appointment.staff).selectinload(StaffProfile.user),
+            selectinload(Appointment.staff).selectinload(
+                StaffProfile.qualifications
+            ),
+            selectinload(Appointment.patient).selectinload(
+                PatientProfile.user
+            ),
             selectinload(Appointment.activities),
         )
     )
@@ -402,6 +444,15 @@ async def list_appointments(
     if status_filter is not None:
         base = base.where(Appointment.status == status_filter)
         count_base = count_base.where(Appointment.status == status_filter)
+    if date_from is not None:
+        dt_from = datetime.combine(date_from, time.min)
+        base = base.where(Appointment.scheduled_start >= dt_from)
+        count_base = count_base.where(Appointment.scheduled_start >= dt_from)
+    if date_to is not None:
+        # Add one day so `date_to` is inclusive of the entire day.
+        dt_to_excl = datetime.combine(date_to + timedelta(days=1), time.min)
+        base = base.where(Appointment.scheduled_start < dt_to_excl)
+        count_base = count_base.where(Appointment.scheduled_start < dt_to_excl)
 
     base = (
         base.order_by(Appointment.scheduled_start.desc(), Appointment.id)
@@ -598,6 +649,148 @@ async def cancel_appointment(
     _ = actor_user_id
     await session.flush()
     return appt
+
+
+async def mark_appointment_missed(
+    session: AsyncSession,
+    *,
+    appointment_id: uuid.UUID,
+    agency_id: uuid.UUID,
+    payload: AppointmentMissedRequest,
+    actor_user_id: uuid.UUID | None = None,
+) -> Appointment:
+    """Mark an appointment as MISSED (caregiver no-show / patient unavailable).
+
+    Allowed from `SCHEDULED` or `READY`. If a visit has been started
+    (`IN_PROGRESS`), the visit-side transition should be used instead —
+    marking the *appointment* as MISSED here would orphan the in-flight
+    `Visit` row.
+    """
+    appt = await _get_appointment_or_404(
+        session, appointment_id=appointment_id, agency_id=agency_id
+    )
+
+    if appt.status == AppointmentStatus.MISSED:
+        return appt  # idempotent
+
+    if appt.status not in {
+        AppointmentStatus.SCHEDULED,
+        AppointmentStatus.READY,
+    }:
+        raise InvalidStateTransitionError(
+            "Only SCHEDULED or READY appointments can be marked MISSED.",
+            details={
+                "current_status": appt.status.value,
+                "requested_status": AppointmentStatus.MISSED.value,
+            },
+        )
+
+    appt.status = AppointmentStatus.MISSED
+    appt.cancelled_reason = payload.reason  # reuse the cancelled_reason field
+    appt.cancelled_at = utc_now()
+    _ = actor_user_id
+    await session.flush()
+    return appt
+
+
+async def mark_appointment_rejected(
+    session: AsyncSession,
+    *,
+    appointment_id: uuid.UUID,
+    agency_id: uuid.UUID,
+    payload: AppointmentRejectedRequest,
+    actor_user_id: uuid.UUID | None = None,
+) -> Appointment:
+    """Mark an appointment as REJECTED (patient/guardian declined).
+
+    Allowed only from `SCHEDULED`. After a visit has started the
+    appointment is locked in — patient disagreement at that stage is
+    surfaced via the signature / dispute flow, not REJECTED.
+    """
+    appt = await _get_appointment_or_404(
+        session, appointment_id=appointment_id, agency_id=agency_id
+    )
+
+    if appt.status == AppointmentStatus.REJECTED:
+        return appt  # idempotent
+
+    if appt.status != AppointmentStatus.SCHEDULED:
+        raise InvalidStateTransitionError(
+            "Only SCHEDULED appointments can be marked REJECTED.",
+            details={
+                "current_status": appt.status.value,
+                "requested_status": AppointmentStatus.REJECTED.value,
+            },
+        )
+
+    appt.status = AppointmentStatus.REJECTED
+    appt.cancelled_reason = payload.reason
+    appt.cancelled_at = utc_now()
+    _ = actor_user_id
+    await session.flush()
+    return appt
+
+
+async def mark_appointment_billing_paid(
+    session: AsyncSession,
+    *,
+    appointment_id: uuid.UUID,
+    agency_id: uuid.UUID,
+    by_user_id: uuid.UUID,
+) -> Appointment:
+    """Flip the denormalized billing toggle on the appointment row.
+
+    The visit-side `billing_confirmed_at` is the staff's *caregiver*
+    confirmation (timestamp of the clinical sign-off). This row is the
+    *billing-payment* flag the agency admin / staff toggles after the
+    payment is processed. Both can coexist: the FE renders one badge
+    (`Paid` once `billing_status = 'paid'`).
+
+    Idempotent — re-paying is a no-op (the original `billing_paid_at`
+    is preserved for audit).
+    """
+    appt = await _get_appointment_or_404(
+        session, appointment_id=appointment_id, agency_id=agency_id
+    )
+
+    if appt.billing_status == "paid":
+        return appt  # idempotent
+
+    appt.billing_status = "paid"
+    appt.billing_paid_at = utc_now()
+    appt.billing_paid_by_user_id = by_user_id
+    await session.flush()
+    return appt
+
+
+async def sync_appointment_status_from_visit(
+    session: AsyncSession,
+    *,
+    appointment_id: uuid.UUID,
+    new_status: AppointmentStatus,
+) -> None:
+    """Mirror a Visit status change onto the parent Appointment row.
+
+    Called from the visits service whenever a visit transitions. The
+    mirror is only applied when the transition is legal in the
+    appointment state machine; otherwise we silently keep the
+    appointment row as-is (the visit row is the source of truth for
+    in-flight activity).
+
+    RLS: this function is invoked from the visits service which
+    already opened a session under the caller's RLS context, so we
+    don't re-assert agency_id here — RLS will simply no-op the update
+    if the caller isn't permitted to see the row.
+    """
+    appt = await session.get(Appointment, appointment_id)
+    if appt is None:
+        return
+    if appt.status == new_status:
+        return
+    if not _is_transition_allowed(appt.status, new_status):
+        return  # appointment doesn't follow the same path; skip silently
+    appt.status = new_status
+    await session.flush()
 
 
 async def assign_staff(
@@ -797,12 +990,31 @@ def _summarize_to_dict(appt: Appointment) -> dict:
     """Project a (eager-loaded) Appointment ORM row into the dict shape
     expected by `AppointmentSummaryResponse`.
 
-    Safe to call even if `appt.staff` or `appt.activities` aren't
-    eagerly loaded — all joined fields default to None.
+    Safe to call even if `appt.staff` / `appt.patient` / `appt.activities`
+    aren't eagerly loaded — all joined fields default to None.
     """
+    from src.shared.utils.labels import (
+        duration_label as _duration_label,
+        patient_initials as _patient_initials,
+    )
+
+    # ----- Patient identity -----
+    patient_name: str | None = None
+    patient_initials: str | None = None
+    patient_code: str | None = None
+    patient = getattr(appt, "patient", None)
+    if patient is not None:
+        patient_code = getattr(patient, "patient_code", None)
+        user = getattr(patient, "user", None)
+        if user is not None:
+            patient_name = getattr(user, "full_name", None)
+            patient_initials = _patient_initials(patient_name)
+
+    # ----- Caregiver -----
     staff_name: str | None = None
     staff_phone: str | None = None
     staff_code: str | None = None
+    staff_credential: str | None = None
     staff = getattr(appt, "staff", None)
     if staff is not None:
         user = getattr(staff, "user", None)
@@ -810,7 +1022,21 @@ def _summarize_to_dict(appt: Appointment) -> dict:
             staff_name = getattr(user, "full_name", None)
             staff_phone = getattr(user, "phone", None)
         staff_code = getattr(staff, "staff_code", None)
+        quals = getattr(staff, "qualifications", None) or []
+        for q in quals:
+            # First non-expired, non-rejected credential label.
+            status = getattr(q, "status", None)
+            label = getattr(q, "label", None) or getattr(q, "name", None)
+            if label and (status is None or str(status).endswith("VERIFIED")):
+                staff_credential = label
+                break
+        if staff_credential is None and quals:
+            staff_credential = (
+                getattr(quals[0], "label", None)
+                or getattr(quals[0], "name", None)
+            )
 
+    # ----- Program + activity label -----
     program_name = _humanize_enum(getattr(appt, "program_type", None))
     activity_label: str | None = None
     activities = getattr(appt, "activities", None)
@@ -819,6 +1045,14 @@ def _summarize_to_dict(appt: Appointment) -> dict:
         activity_label = getattr(first, "name", None)
 
     location_label = getattr(appt, "location", None)
+
+    # ----- Duration (planned; actual EVV fallback done by the router) -----
+    duration_str: str | None = None
+    start = getattr(appt, "scheduled_start", None)
+    end = getattr(appt, "scheduled_end", None)
+    if start is not None and end is not None:
+        delta = (end - start).total_seconds()
+        duration_str = _duration_label(int(delta))
 
     return {
         "id": appt.id,
@@ -834,9 +1068,17 @@ def _summarize_to_dict(appt: Appointment) -> dict:
         "staff_name": staff_name,
         "staff_phone": staff_phone,
         "staff_code": staff_code,
+        "staff_credential": staff_credential,
         "program_name": program_name,
         "service_type_label": activity_label,
         "location_label": location_label,
+        "patient_name": patient_name,
+        "patient_initials": patient_initials,
+        "patient_code": patient_code,
+        "duration_label": duration_str,
+        "billing_status": getattr(appt, "billing_status", None) or "unpaid",
+        "billing_paid_at": getattr(appt, "billing_paid_at", None),
+        "claim_id": getattr(appt, "claim_id", None),
     }
 
 
@@ -849,7 +1091,11 @@ __all__ = [
     "get_appointment",
     "list_activities",
     "list_appointments",
+    "mark_appointment_billing_paid",
+    "mark_appointment_missed",
     "mark_appointment_ready",
+    "mark_appointment_rejected",
+    "sync_appointment_status_from_visit",
     "transition_status",
     "update_activity",
     "update_appointment",

@@ -39,6 +39,7 @@ from src.core.exceptions import (
     NotFoundError,
     ValidationError,
 )
+from src.modules.appointments import service as appointments_service
 from src.modules.appointments.models import Appointment, AppointmentActivity
 from src.modules.staff.models import StaffProfile
 from src.modules.visits.models import (
@@ -57,6 +58,7 @@ from src.modules.visits.schemas import (
     VisitStatusTransitionRequest,
 )
 from src.shared.domain.enums import (
+    AppointmentStatus,
     ServiceItemStatus,
     UserRole,
     VisitStatus,
@@ -328,6 +330,18 @@ async def create_visit(
             details={"constraint": _extract_constraint(exc)},
         ) from exc
 
+    # Mirror the visit-side `IN_PROGRESS` to the parent appointment row
+    # so the agency-admin dashboard reflects the live status. The
+    # helper silently no-ops if the appointment's current state doesn't
+    # legally allow the transition (e.g. an admin force-cancelled the
+    # appointment between the SELECT and the INSERT — rare, but
+    # possible).
+    await appointments_service.sync_appointment_status_from_visit(
+        session,
+        appointment_id=appt.id,
+        new_status=AppointmentStatus.IN_PROGRESS,
+    )
+
     return visit
 
 
@@ -518,6 +532,26 @@ async def transition_visit_status(
     if payload.status == VisitStatus.COMPLETED:
         visit.sharing_location = False
     await session.flush()
+
+    # Mirror the visit-side status change to the parent appointment so
+    # the agency-admin dashboard reflects the live lifecycle. The helper
+    # silently no-ops on illegal transitions (e.g. visit-side MISSED
+    # doesn't always make sense at the appointment level — see
+    # `_ALLOWED_TRANSITIONS`).
+    if hasattr(VisitStatus, "_appointment_mirror_map"):
+        target_appt_status = VisitStatus._appointment_mirror_map.get(
+            payload.status
+        )
+    else:
+        # Default mirror — every visit status has an equivalent
+        # appointment status (the 8-state lifecycle is mirrored 1:1).
+        target_appt_status = AppointmentStatus(payload.status.value)
+    if target_appt_status is not None:
+        await appointments_service.sync_appointment_status_from_visit(
+            session,
+            appointment_id=visit.appointment_id,
+            new_status=target_appt_status,
+        )
     return visit
 
 

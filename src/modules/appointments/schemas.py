@@ -141,6 +141,10 @@ class AppointmentSummaryResponse(BaseModel):
     staff_name: str | None = None
     staff_phone: str | None = None
     staff_code: str | None = None
+    # First non-expired qualification label (e.g. "CNA", "LPN"). Useful
+    # for the patient-facing card so the family knows the caregiver's
+    # credential before they arrive.
+    staff_credential: str | None = None
     # ----- Joined program + service info -----
     # `program_name` is a human-readable rendering of the `program_type`
     # enum ("CFSS"); `service_type_label` is the first service item's
@@ -153,6 +157,26 @@ class AppointmentSummaryResponse(BaseModel):
     # summary so the patient mobile app doesn't need a second round trip
     # to display "123 Oak St, Saint Paul MN".
     location_label: str | None = None
+    # ----- Patient identity (header card) -----
+    # `patient_name` is the full name; `patient_initials` is the avatar
+    # initials ("JS"); `patient_code` is the per-agency patient code
+    # ("PAT-001"). All three are needed so the patient app renders the
+    # card with one round trip.
+    patient_name: str | None = None
+    patient_initials: str | None = None
+    patient_code: str | None = None
+    # ----- Duration label -----
+    # Computed: planned (`scheduled_end - scheduled_start`) when no
+    # visit yet, actual (from `evv_record`) once one exists. Renders as
+    # "1h 00m" or "45m" via `duration_label()`.
+    duration_label: str | None = None
+    # ----- Billing (denormalized onto the appointment) -----
+    # `billing_status` is `unpaid | paid`. `billing_paid_at` is the
+    # timestamp of the staff/caregiver confirmation; `claim_id` is the
+    # externally-rendered identifier (CG-{agency}-{appt}).
+    billing_status: str = "unpaid"
+    billing_paid_at: datetime | None = None
+    claim_id: str | None = None
 
 
 # --------------------------------------------------------------------------
@@ -187,7 +211,12 @@ class AppointmentActivityUpdateRequest(BaseModel):
 
 
 class AppointmentActivityResponse(BaseModel):
-    """One activity row (admin view, no delivery record)."""
+    """One activity row (admin view, no delivery record).
+
+    `completed_at` / `completed_by_user_id` are stored on the row for the
+    audit trail but intentionally not surfaced here — the activity card
+    only renders the name, planned minutes, status, and notes.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -198,8 +227,6 @@ class AppointmentActivityResponse(BaseModel):
     planned_minutes: int | None
     status: ServiceItemStatus
     notes: str | None
-    completed_at: datetime | None
-    completed_by_user_id: UUID | None
     created_at: datetime
     updated_at: datetime
 
@@ -231,6 +258,53 @@ class AppointmentCancelRequest(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Lifecycle — missed (exception edge)
+# --------------------------------------------------------------------------
+class AppointmentMissedRequest(BaseModel):
+    """POST /appointments/{id}/missed — admin marks an appointment missed.
+
+    Distinct from `CANCELLED`: a MISSED appointment is one where the
+    caregiver was a no-show (or the patient was unavailable without
+    prior notice). The reason is required for audit and FE display.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str, StringConstraints(min_length=1, max_length=4000)]
+
+
+# --------------------------------------------------------------------------
+# Lifecycle — rejected (exception edge)
+# --------------------------------------------------------------------------
+class AppointmentRejectedRequest(BaseModel):
+    """POST /appointments/{id}/rejected — patient/guardian rejected the
+    appointment before it was performed.
+
+    Distinct from `CANCELLED` (which is an admin-side action): a REJECTED
+    appointment is one where the patient or guardian actively declined.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str, StringConstraints(min_length=1, max_length=4000)]
+
+
+# --------------------------------------------------------------------------
+# Lifecycle — billing confirmation
+# --------------------------------------------------------------------------
+class AppointmentMarkBillingPaidRequest(BaseModel):
+    """POST /appointments/{id}/billing/paid — staff/admin flips the
+    billing toggle to `paid`. No payload needed (the timestamp + actor
+    are derived server-side).
+
+    Kept as a typed model so future fields (e.g. payment reference)
+    can be added without a breaking change.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+
+# --------------------------------------------------------------------------
 # Forward refs
 # --------------------------------------------------------------------------
 AppointmentCreateRequest.model_rebuild()
@@ -243,7 +317,10 @@ __all__ = [
     "AppointmentActivityUpdateRequest",
     "AppointmentCancelRequest",
     "AppointmentCreateRequest",
+    "AppointmentMarkBillingPaidRequest",
+    "AppointmentMissedRequest",
     "AppointmentReadyRequest",
+    "AppointmentRejectedRequest",
     "AppointmentResponse",
     "AppointmentStatusTransitionRequest",
     "AppointmentSummaryResponse",

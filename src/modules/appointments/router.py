@@ -1,9 +1,10 @@
 """Appointments router — `/appointments` and `/appointments/{id}/...`.
 
 All routes require authentication. State-mutating routes (create, update,
-cancel, transition, ready, activity writes) require AGENCY_ADMIN. Read
-routes are open to AGENCY_ADMIN, STAFF, the patient themselves, and
-authorised guardians (RLS narrows the rows).
+cancel, transition, ready, missed, rejected, billing, activity writes)
+require AGENCY_ADMIN (with `STAFF` permitted on the billing toggle).
+Read routes are open to AGENCY_ADMIN, STAFF, the patient themselves,
+and authorised guardians (RLS narrows the rows).
 
 Endpoints:
   POST   /appointments                                — schedule visit
@@ -14,7 +15,10 @@ Endpoints:
   POST   /appointments/{id}/cancel                    — cancel (pre-visit only)
   POST   /appointments/{id}/transition                — status transition (state machine)
   POST   /appointments/{id}/ready                     — admin marks READY (SCHEDULED→READY)
+  POST   /appointments/{id}/missed                    — mark MISSED (SCHEDULED/READY)
+  POST   /appointments/{id}/rejected                  — mark REJECTED (SCHEDULED)
   POST   /appointments/{id}/assign                    — assign staff
+  POST   /appointments/{id}/billing/paid              — flip billing toggle to paid
 
   GET    /appointments/{id}/activities
   POST   /appointments/{id}/activities
@@ -25,6 +29,7 @@ Endpoints:
 from __future__ import annotations
 
 import uuid
+from datetime import date
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
@@ -39,6 +44,10 @@ from src.modules.appointments.schemas import (
     AppointmentActivityUpdateRequest,
     AppointmentCancelRequest,
     AppointmentCreateRequest,
+    AppointmentMarkBillingPaidRequest,
+    AppointmentMissedRequest,
+    AppointmentReadyRequest,  # noqa: F401 — re-exported below
+    AppointmentRejectedRequest,
     AppointmentResponse,
     AppointmentStatusTransitionRequest,
     AppointmentSummaryResponse,
@@ -201,12 +210,27 @@ async def list_appointments_endpoint(
     patient_id: uuid.UUID | None = Query(default=None),
     staff_id: uuid.UUID | None = Query(default=None),
     status_filter: AppointmentStatus | None = Query(default=None, alias="status"),
+    date_from: date | None = Query(
+        default=None,
+        description="Calendar date (YYYY-MM-DD) — only appointments at or after this date are returned.",
+    ),
+    date_to: date | None = Query(
+        default=None,
+        description="Calendar date (YYYY-MM-DD, inclusive) — only appointments on or before this date are returned.",
+    ),
     page: int = Query(default=1, ge=1, le=10000),
     page_size: int = Query(default=20, ge=1, le=100),
 ) -> dict:
     """Paginated list of appointments at the caller's agency.
 
-    Optional filters: patient_id, staff_id, status.
+    Optional filters:
+      - patient_id (PATIENT role forces this to their own profile id)
+      - staff_id   (STAFF role: useful for "my day" / "my week" views)
+      - status     — one of the 8 lifecycle values
+      - date_from / date_to — calendar-date filters on `scheduled_start`,
+                              both inclusive (so `date_from == date_to`
+                              means "appointments on that day")
+
     RLS automatically restricts PATIENT/GUARDIAN rows to their own
     appointments; here we additionally force PATIENT to filter by
     themselves so the SQL is stable.
@@ -235,12 +259,14 @@ async def list_appointments_endpoint(
         patient_id=patient_id,
         staff_id=staff_id,
         status_filter=status_filter,
+        date_from=date_from,
+        date_to=date_to,
         page=page,
         page_size=page_size,
     )
-    # `list_appointments` eager-loads `staff.user` and `activities`
-    # so `_summarize_to_dict` can populate the joined display fields
-    # (caregiver name, program label, etc.) without N+1 queries.
+    # `list_appointments` eager-loads `staff.user`, `staff.qualifications`,
+    # `patient.user`, and `activities` so `_summarize_to_dict` can populate
+    # the joined display fields without N+1 queries.
     data = [
         AppointmentSummaryResponse.model_validate(
             appointments_service._summarize_to_dict(r)
@@ -520,6 +546,163 @@ async def assign_staff_endpoint(
             entity_type="APPOINTMENT",
             entity_id=appt.id,
             new_data={"staff_id": str(staff_id)},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
+    return _to_response(appt, with_items=False)
+
+
+@router.post(
+    "/{appointment_id}/missed",
+    response_model=AppointmentResponse,
+    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+)
+async def mark_appointment_missed_endpoint(
+    appointment_id: uuid.UUID,
+    payload: AppointmentMissedRequest,
+    request: Request,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> AppointmentResponse:
+    """Mark an appointment as MISSED (caregiver no-show / patient unavailable).
+
+    Allowed from `SCHEDULED` or `READY`. After a visit has started
+    (`IN_PROGRESS`) the visit-side transition should be used instead.
+    """
+    agency_id = _require_agency(ctx)
+    ip, ua = audit_logs_service.request_ip_ua(request)
+    appt = await appointments_service.mark_appointment_missed(
+        session,
+        appointment_id=appointment_id,
+        agency_id=agency_id,
+        payload=payload,
+        actor_user_id=ctx.user_id,
+    )
+    await session.commit()
+    await session.refresh(appt)
+    try:
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.STATUS_TRANSITION,
+            entity_type="APPOINTMENT",
+            entity_id=appt.id,
+            new_data={
+                "from_status": "PRE_VISIT",
+                "to_status": appt.status.value,
+                "reason": payload.reason,
+                "transition": "missed",
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
+    return _to_response(appt, with_items=False)
+
+
+@router.post(
+    "/{appointment_id}/rejected",
+    response_model=AppointmentResponse,
+    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+)
+async def mark_appointment_rejected_endpoint(
+    appointment_id: uuid.UUID,
+    payload: AppointmentRejectedRequest,
+    request: Request,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> AppointmentResponse:
+    """Mark an appointment as REJECTED (patient/guardian declined).
+
+    Allowed only from `SCHEDULED`. After the visit has started the
+    patient disagreement is surfaced via the signature / dispute flow,
+    not REJECTED.
+    """
+    agency_id = _require_agency(ctx)
+    ip, ua = audit_logs_service.request_ip_ua(request)
+    appt = await appointments_service.mark_appointment_rejected(
+        session,
+        appointment_id=appointment_id,
+        agency_id=agency_id,
+        payload=payload,
+        actor_user_id=ctx.user_id,
+    )
+    await session.commit()
+    await session.refresh(appt)
+    try:
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.STATUS_TRANSITION,
+            entity_type="APPOINTMENT",
+            entity_id=appt.id,
+            new_data={
+                "from_status": "SCHEDULED",
+                "to_status": appt.status.value,
+                "reason": payload.reason,
+                "transition": "rejected",
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
+    return _to_response(appt, with_items=False)
+
+
+@router.post(
+    "/{appointment_id}/billing/paid",
+    response_model=AppointmentResponse,
+    dependencies=[
+        Depends(require_role(UserRole.AGENCY_ADMIN, UserRole.STAFF))
+    ],
+)
+async def mark_appointment_billing_paid_endpoint(
+    appointment_id: uuid.UUID,
+    payload: AppointmentMarkBillingPaidRequest,
+    request: Request,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> AppointmentResponse:
+    """Flip the billing toggle to `paid` (idempotent).
+
+    The visit-side `billing_confirmed_at` is the caregiver's
+    clinical sign-off; this endpoint flips the *payment* flag the
+    agency-admin / staff toggles after payment is processed.
+    """
+    agency_id = _require_agency(ctx)
+    ip, ua = audit_logs_service.request_ip_ua(request)
+    appt = await appointments_service.mark_appointment_billing_paid(
+        session,
+        appointment_id=appointment_id,
+        agency_id=agency_id,
+        by_user_id=ctx.user_id,
+    )
+    await session.commit()
+    await session.refresh(appt)
+    try:
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.BILLING_CONFIRMED,
+            entity_type="APPOINTMENT",
+            entity_id=appt.id,
+            new_data={
+                "billing_status": appt.billing_status,
+                "billing_paid_at": appt.billing_paid_at.isoformat()
+                if appt.billing_paid_at
+                else None,
+                "claim_id": appt.claim_id,
+            },
             ip_address=ip,
             user_agent=ua,
         )

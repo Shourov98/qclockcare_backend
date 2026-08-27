@@ -1,14 +1,16 @@
 """Demo seed for the appointment + visit lifecycle tables.
 
-Matches the legacy 21-status lifecycle that the current DB ships with
-(so this works against migrations 0001-0026 — the spec-aligned 5-status
-lifecycle in `QlockCare_appointemnt_flow.md` is not yet applied).
-
 Creates one appointment per major lifecycle phase so the agency-admin
 dashboard, the patient portal, and the staff app all have meaningful
-data on first load. Visits that are in-flight or completed get a
-materialized `Visit` row + per-activity deliveries + (for completed
-visits) a `ServiceVerification`.
+data on first load.
+
+For each in-flight or completed visit the seed populates:
+  - One materialized `Visit` row + per-activity `VisitActivityDelivery`
+  - One `EVVRecord` row (start + end + GPS + verification_status)
+  - 1-2 `VisitNote` rows with realistic free-text bodies
+  - (For COMPLETED visits) one `AppointmentSignature` row
+  - (For the COMPLETED-and-paid A5) the denormalized `billing_status`,
+    `billing_paid_at`, `billing_paid_by_user_id`, and `claim_id` columns
 
 Re-running the script wipes its own rows and re-seeds them with a
 deterministic dataset so the dev experience is reproducible.
@@ -17,16 +19,16 @@ Run:
 
     uv run python scripts/seed_appointments.py
 
-What gets created (8 appointments, each with 3 service items):
+What gets created (8 appointments, each with 3 activities):
 
-  A1  SCHEDULED         today 14:00 - 15:00    Morning meds
-  A2  SCHEDULED/ASSIGNED today 16:00 - 17:00   Vitals check
-  A3  CHECKED_IN / IN_PROGRESS   now-30m       Bathing assistance
-  A4  CHECKED_OUT                now-2h        Evening routine
-  A5  COMPLETED + VERIFIED       yesterday 10  Personal care
-  A6  CANCELLED                  2 days ago    Rescheduled by family
-  A7  NO_SHOW                    3 days ago    Caregiver no-show
-  A8  COMPLETED + DISPUTED       4 days ago    Patient disputed duration
+  A1  SCHEDULED                 today 14:00 - 15:00    Morning meds
+  A2  READY                     today 16:00 - 17:00   Vitals check
+  A3  IN_PROGRESS               now-30m               Bathing assistance
+  A4  AWAITING_SIGNATURE        now-2h                Evening routine
+  A5  COMPLETED + paid          yesterday 10          Personal care
+  A6  CANCELLED                 2 days ago            Rescheduled by family
+  A7  MISSED                    3 days ago            Caregiver no-show
+  A8  COMPLETED + disputed      4 days ago            Patient disputed duration
 
 Dependencies:
   - Run `scripts/seed_test_user.py` first. This script looks up the
@@ -57,24 +59,20 @@ AGENCY_ADMIN_EMAIL = "admin@qlockcare.dev"
 STAFF_EMAIL = "staff@qlockcare.dev"
 PATIENT_EMAIL = "patient@qlockcare.dev"
 
-# Default service-item checklist. Every appointment gets 3 of these;
-# the visit-level deliveries then mark each as DONE / NOT_DONE / PENDING
+# Default activity checklist. Every appointment gets 3 of these; the
+# visit-level deliveries then mark each as DONE / NOT_DONE / PENDING
 # based on which lifecycle state we're in.
-#
-# `service_type` is the legacy ENUM column. The available labels are:
-#   PERSONAL_CARE, HOMEMAKING, RESPITE, SKILLED_NURSING,
-#   MENTAL_HEALTH, COUNSELING_INDIVIDUAL, COUNSELING_GROUP
-DEFAULT_SERVICE_ITEMS: list[tuple[str, int, str | None]] = [
-    # (service_type, planned_minutes, notes)
-    ("PERSONAL_CARE", 15, "Bathing + dressing assistance."),
-    ("SKILLED_NURSING", 10, "Vitals + medication pass."),
-    ("HOMEMAKING", 20, "Light meal prep + tidying."),
+DEFAULT_ACTIVITIES: list[tuple[str, int, str]] = [
+    ("Check vitals + record", 10, "BP, HR, temp documented."),
+    ("Assist with personal hygiene", 20, "Bathing + dressing."),
+    ("Prepare light meal", 15, "Per dietary plan on file."),
 ]
 
 
 @dataclass(frozen=True)
 class SeededIds:
     agency_id: uuid.UUID
+    agency_name: str
     patient_profile_id: uuid.UUID
     patient_user_id: uuid.UUID
     staff_profile_id: uuid.UUID
@@ -85,10 +83,12 @@ class SeededIds:
 @dataclass(frozen=True)
 class SeedResult:
     appointments: int
-    service_items: int
+    activities: int
     visits: int
     deliveries: int
-    verifications: int
+    notes: int
+    signatures: int
+    evv_records: int
 
 
 # --------------------------------------------------------------------------
@@ -98,6 +98,16 @@ class SeedResult:
 
 def _now() -> datetime:
     return datetime.now(tz=UTC)
+
+
+def _make_claim_id(agency_name: str, appt_id: uuid.UUID) -> str:
+    """Format `CG-{agency_tag}-{appt_short}` for the appointment's `claim_id`.
+
+    Mirrors the runtime generation in
+    `src.modules.appointments.service.create_appointment`.
+    """
+    tag = "".join(ch for ch in (agency_name or "").upper() if ch.isalnum())[:4] or "AGCY"
+    return f"CG-{tag}-{str(appt_id)[:8].upper()}"
 
 
 async def _require_seeded_ids(engine: AsyncEngine) -> SeededIds:
@@ -110,7 +120,6 @@ async def _require_seeded_ids(engine: AsyncEngine) -> SeededIds:
     user. This is the agency whose `/appointments`, `/visits`, and
     `/portal/visits` responses will surface the rows we insert.
     """
-    # Use a real transaction (`begin`) so the cleanup DELETE below commits.
     async with engine.begin() as conn:
         # Resolve the three seeded users.
         user_rows = (
@@ -176,10 +185,6 @@ async def _require_seeded_ids(engine: AsyncEngine) -> SeededIds:
 
         # Sanity fix: the admin user can have AGENCY_ADMIN role rows at
         # multiple agencies (e.g. leftover rows from earlier dev runs).
-        # The auth middleware's `_pick_primary_role` picks one via
-        # stable-sort tiebreak — which can return the wrong agency.
-        # Delete any duplicate AGENCY_ADMIN role rows that aren't at
-        # our resolved agency so the JWT for this admin lands here.
         deleted = await conn.execute(
             text(
                 "DELETE FROM user_roles "
@@ -220,6 +225,7 @@ async def _require_seeded_ids(engine: AsyncEngine) -> SeededIds:
 
         return SeededIds(
             agency_id=agency_id,
+            agency_name=agency_name,
             patient_profile_id=patient_profile_row[0],
             patient_user_id=patient_user_id,
             staff_profile_id=staff_profile_row[0],
@@ -236,16 +242,18 @@ async def _wipe(engine: AsyncEngine) -> None:
     clear the appointment-side rows.
     """
     # Each statement runs in its own short transaction so a missing
-    # optional table (e.g. `appointment_confirmations` on legacy schemas)
-    # doesn't poison the rest of the wipe.
+    # optional table doesn't poison the rest of the wipe.
     required = (
-        "service_verifications",
+        "appointment_signatures",
+        "visit_notes",
+        "evv_records",
         "visit_activity_deliveries",
         "visits",
         "appointment_activities",
         "appointments",
     )
     optional = (
+        "service_verifications",
         "appointment_confirmations",
         "appointment_events",
         "appointment_charges",
@@ -263,8 +271,6 @@ async def _wipe(engine: AsyncEngine) -> None:
 
 
 async def _seed() -> SeedResult:
-    # Supabase pooler (port 6543) doesn't support prepared statements
-    # across transactions, so disable asyncpg's cache.
     engine = create_async_engine(
         settings.effective_database_url,
         pool_pre_ping=True,
@@ -290,21 +296,12 @@ async def _seed() -> SeedResult:
         print(f"  staff={ids.staff_profile_id} "
               f"patient={ids.patient_profile_id}")
 
-        print("Wiping existing appointments + visits + service items…")
+        print("Wiping existing appointments + visits + signatures + EVV + notes…")
         await _wipe(engine)
 
         print("Inserting 8 appointments across the lifecycle…")
-        appt_n, item_n, visit_n, delivery_n, verif_n = await _insert_appointments(
-            engine, ids=ids
-        )
-
-        return SeedResult(
-            appointments=appt_n,
-            service_items=item_n,
-            visits=visit_n,
-            deliveries=delivery_n,
-            verifications=verif_n,
-        )
+        result = await _insert_appointments(engine, ids=ids)
+        return result
     finally:
         await engine.dispose()
 
@@ -313,10 +310,10 @@ async def _insert_appointments(
     engine: AsyncEngine,
     *,
     ids: SeededIds,
-) -> tuple[int, int, int, int, int]:
-    """Insert 8 appointments + their service items + (for active/completed
-    states) a materialized Visit row + per-activity deliveries + (for
-    completed states) a ServiceVerification.
+) -> SeedResult:
+    """Insert 8 appointments + activities + (for active/completed states)
+    a materialized `Visit` row + per-activity deliveries + EVVRecord +
+    visit notes + signature + billing.
     """
     now = _now()
 
@@ -325,10 +322,6 @@ async def _insert_appointments(
         {
             "code": "A1",
             "status": "SCHEDULED",
-            "confirmation_status": None,
-            "checked_in_at": None,
-            "checked_out_at": None,
-            "completed_at": None,
             "start_delta_h": 4,
             "duration_h": 1,
             "title": "Morning medication",
@@ -341,10 +334,6 @@ async def _insert_appointments(
         {
             "code": "A2",
             "status": "READY",
-            "confirmation_status": "CONFIRMED",
-            "checked_in_at": None,
-            "checked_out_at": None,
-            "completed_at": None,
             "start_delta_h": 6,
             "duration_h": 1,
             "title": "Vitals check + wound inspection",
@@ -357,10 +346,6 @@ async def _insert_appointments(
         {
             "code": "A3",
             "status": "IN_PROGRESS",
-            "confirmation_status": "CONFIRMED",
-            "checked_in_at": now - timedelta(minutes=30),
-            "checked_out_at": None,
-            "completed_at": None,
             "start_delta_h": -0.5,
             "duration_h": 1,
             "title": "Bathing assistance + vitals",
@@ -371,16 +356,18 @@ async def _insert_appointments(
             "visit_started_min_ago": 30,
             "visit_duration_min": 60,
             "delivery_statuses": ["DONE", "DONE", "PENDING"],
+            "evv_start_verification": "VERIFIED",
+            "evv_end_verification": None,  # not yet ended
+            "notes_payload": [
+                "Arrived on time. Patient was awake and in good spirits. "
+                "Bathing assistance provided without incident.",
+            ],
             "program_type": "PCA",
         },
         # A4 — visit ended, awaiting signature
         {
             "code": "A4",
             "status": "AWAITING_SIGNATURE",
-            "confirmation_status": "CONFIRMED",
-            "checked_in_at": now - timedelta(minutes=180),
-            "checked_out_at": now - timedelta(minutes=120),
-            "completed_at": None,
             "start_delta_h": -3,
             "duration_h": 1,
             "title": "Evening routine + dinner prep",
@@ -391,16 +378,20 @@ async def _insert_appointments(
             "visit_started_min_ago": 180,
             "visit_duration_min": 60,
             "delivery_statuses": ["DONE", "DONE", "DONE"],
+            "evv_start_verification": "VERIFIED",
+            "evv_end_verification": "VERIFIED",
+            "billing_confirmed": True,
+            "notes_payload": [
+                "All activities delivered as planned. Patient ate a full "
+                "dinner and was comfortable at handoff.",
+                "Caregiver arrived 5 minutes early; weather was clear.",
+            ],
             "program_type": "PCA",
         },
-        # A5 — fully completed + verified
+        # A5 — fully completed + verified + paid
         {
             "code": "A5",
             "status": "COMPLETED",
-            "confirmation_status": "CONFIRMED",
-            "checked_in_at": now - timedelta(hours=26),
-            "checked_out_at": now - timedelta(hours=25),
-            "completed_at": now - timedelta(hours=25),
             "start_delta_h": -26,
             "duration_h": 1,
             "title": "Personal care visit",
@@ -411,19 +402,24 @@ async def _insert_appointments(
             "visit_started_min_ago": 60 * 26,
             "visit_duration_min": 60,
             "delivery_statuses": ["DONE", "DONE", "DONE"],
-            "with_verification": True,
-            "verification_status": "VERIFIED",
-            "verification_comment": "All activities delivered as planned.",
+            "evv_start_verification": "VERIFIED",
+            "evv_end_verification": "VERIFIED",
+            "billing_confirmed": True,
+            "billing_paid": True,  # sets billing_status='paid'
+            "with_signature": True,
+            "signer_role": "PATIENT",
+            "notes_payload": [
+                "Visit completed per plan. Patient was cooperative; "
+                "BP 128/82, normal range.",
+                "Light meal prepared (oatmeal + fruit). Hydration "
+                "encouraged. No concerns to report.",
+            ],
             "program_type": "PCA",
         },
         # A6 — cancelled
         {
             "code": "A6",
             "status": "CANCELLED",
-            "confirmation_status": "DECLINED",
-            "checked_in_at": None,
-            "checked_out_at": None,
-            "completed_at": None,
             "start_delta_h": -48,
             "duration_h": 1,
             "title": "Rescheduled by family",
@@ -433,30 +429,23 @@ async def _insert_appointments(
             "cancelled_reason": "Family requested cancellation — patient at clinic.",
             "program_type": "PCA",
         },
-        # A7 — no-show (legacy enum value) → MISSED in spec enum
+        # A7 — missed (caregiver no-show)
         {
             "code": "A7",
             "status": "MISSED",
-            "confirmation_status": "CONFIRMED",
-            "checked_in_at": None,
-            "checked_out_at": None,
-            "completed_at": None,
             "start_delta_h": -72,
             "duration_h": 1,
             "title": "Caregiver no-show",
             "notes": "Caregiver did not arrive. Family contacted the office.",
             "location": "Patient residence — 123 Oak St, Springfield",
             "with_visit": False,
+            "cancelled_reason": "Caregiver no-show — assigned backup.",
             "program_type": "PCA",
         },
-        # A8 — disputed visit, marked COMPLETED but verification disputed
+        # A8 — disputed visit, completed but billing contested
         {
             "code": "A8",
             "status": "COMPLETED",
-            "confirmation_status": "CONFIRMED",
-            "checked_in_at": now - timedelta(hours=97),
-            "checked_out_at": now - timedelta(hours=96),
-            "completed_at": now - timedelta(hours=96),
             "start_delta_h": -96,
             "duration_h": 1,
             "title": "Visit duration disputed",
@@ -467,39 +456,51 @@ async def _insert_appointments(
             "visit_started_min_ago": 60 * 97,
             "visit_duration_min": 30,  # short — patient disputes this
             "delivery_statuses": ["DONE", "DONE", "NOT_DONE"],
-            "with_verification": True,
-            "verification_status": "DISPUTED",
-            "verification_dispute_reason": "SERVICE_NOT_COMPLETED",
-            "verification_comment": "Family says only 30 minutes were billed vs 60 scheduled.",
+            "evv_start_verification": "PENDING",  # location accuracy was poor
+            "evv_end_verification": "FAILED",  # signed off outside geofence
+            "billing_confirmed": False,  # billing NOT confirmed (disputed)
+            "notes_payload": [
+                "Caregiver arrived at scheduled time but left after only "
+                "30 minutes. Family called to dispute duration.",
+            ],
             "program_type": "PCA",
         },
     ]
 
     appt_n = 0
-    item_n = 0
+    activity_n = 0
     visit_n = 0
     delivery_n = 0
-    verif_n = 0
+    note_n = 0
+    signature_n = 0
+    evv_n = 0
 
     async with engine.begin() as conn:
         for spec in appt_specs:
             appt_id = uuid.uuid4()
             scheduled_start = now + timedelta(hours=spec["start_delta_h"])
             scheduled_end = scheduled_start + timedelta(hours=spec["duration_h"])
+            claim_id = _make_claim_id(ids.agency_name, appt_id)
 
             cancelled_at = None
             cancelled_reason = None
             if spec["status"] == "CANCELLED":
                 cancelled_at = scheduled_start
                 cancelled_reason = spec.get("cancelled_reason")
+            elif spec["status"] == "MISSED":
+                cancelled_at = scheduled_start + timedelta(minutes=15)
+                cancelled_reason = spec.get("cancelled_reason")
 
-            confirmed_at = None
-            if spec.get("confirmation_status") == "CONFIRMED":
-                confirmed_at = scheduled_start - timedelta(hours=12)
-            # DECLINED appointments also have a confirmed_at (the
-            # timestamp of the decline decision).
-            elif spec.get("confirmation_status") == "DECLINED":
-                confirmed_at = scheduled_start - timedelta(hours=12)
+            billing_status = "unpaid"
+            billing_paid_at = None
+            billing_paid_by_user_id = None
+            if spec.get("billing_paid"):
+                billing_status = "paid"
+                # "Admin" processed the payment — use admin_user_id so the
+                # audit trail shows the agency-admin (the role that
+                # actually flips the toggle in production).
+                billing_paid_at = scheduled_end + timedelta(minutes=2)
+                billing_paid_by_user_id = ids.admin_user_id
 
             await conn.execute(
                 text(
@@ -507,17 +508,19 @@ async def _insert_appointments(
                     "id, agency_id, patient_id, staff_id, "
                     "program_type, "
                     "scheduled_start, scheduled_end, status, "
-                    "confirmation_status, confirmed_at, confirmation_note, "
-                    "checked_in_at, checked_out_at, completed_at, "
-                    "location, notes, cancelled_reason, cancelled_at, "
+                    "location, notes, "
+                    "cancelled_reason, cancelled_at, "
+                    "billing_status, billing_paid_at, billing_paid_by_user_id, "
+                    "claim_id, "
                     "created_at, updated_at"
                     ") VALUES ("
                     ":id, :agency, :patient, :staff, "
                     ":program, "
                     ":start, :end, :status, "
-                    ":conf_status, :confirmed_at, :conf_note, "
-                    ":ci_at, :co_at, :completed_at, "
-                    ":location, :notes, :cancelled_reason, :cancelled_at, "
+                    ":location, :notes, "
+                    ":cancelled_reason, :cancelled_at, "
+                    ":billing_status, :billing_paid_at, :billing_paid_by, "
+                    ":claim_id, "
                     "now(), now()"
                     ")"
                 ),
@@ -530,178 +533,292 @@ async def _insert_appointments(
                     "start": scheduled_start,
                     "end": scheduled_end,
                     "status": spec["status"],
-                    "conf_status": spec.get("confirmation_status"),
-                    "confirmed_at": confirmed_at,
-                    "conf_note": None,
-                    "ci_at": spec.get("checked_in_at"),
-                    "co_at": spec.get("checked_out_at"),
-                    "completed_at": spec.get("completed_at"),
                     "location": spec["location"],
                     "notes": spec["notes"],
                     "cancelled_reason": cancelled_reason,
                     "cancelled_at": cancelled_at,
+                    "billing_status": billing_status,
+                    "billing_paid_at": billing_paid_at,
+                    "billing_paid_by": billing_paid_by_user_id,
+                    "claim_id": claim_id,
                 },
             )
             appt_n += 1
 
-            # ----- service items (legacy ENUM-based checklist) -----
-            service_item_ids: list[uuid.UUID] = []
-            for service_type, planned_minutes, notes in DEFAULT_SERVICE_ITEMS:
-                si_id = uuid.uuid4()
-                service_item_ids.append(si_id)
+            # ----- activities (free-text per spec) -----
+            activity_ids: list[uuid.UUID] = []
+            for name, planned_minutes, notes in DEFAULT_ACTIVITIES:
+                aid = uuid.uuid4()
+                activity_ids.append(aid)
                 await conn.execute(
                     text(
                         "INSERT INTO appointment_activities ("
                         "id, appointment_id, agency_id, "
-                        "service_type, planned_minutes, status, notes, "
-                        "name, created_at, updated_at"
-                        ") VALUES ("
-                        ":id, :appt, :agency, "
-                        ":stype, :planned, 'PENDING', :notes, "
-                        ":name, now(), now()"
-                        ")"
-                    ),
-                    {
-                        "id": si_id,
-                        "appt": appt_id,
-                        "agency": ids.agency_id,
-                        "stype": service_type,
-                        "planned": planned_minutes,
-                        "notes": notes,
-                        # The runtime ORM reads `name` (free-text per
-                        # the spec) so set it from the legacy enum label.
-                        "name": service_type.replace("_", " ").title(),
-                    },
-                )
-                item_n += 1
-
-            # ----- materialized visit (in-progress / completed states) -----
-            if spec.get("with_visit"):
-                visit_id = uuid.uuid4()
-                started_at = now - timedelta(
-                    minutes=spec["visit_started_min_ago"]
-                )
-                ended_at = started_at + timedelta(
-                    minutes=spec["visit_duration_min"]
-                )
-                duration_seconds = int(
-                    (ended_at - started_at).total_seconds()
-                )
-
-                await conn.execute(
-                    text(
-                        "INSERT INTO visits ("
-                        "id, appointment_id, agency_id, staff_id, "
-                        "status, "
-                        "check_in_time, check_in_lat, check_in_lng, "
-                        "check_in_accuracy_m, check_in_device_id, "
-                        "check_in_address_match, check_in_distance_from_location_m, "
-                        "check_out_time, check_out_lat, check_out_lng, "
-                        "check_out_accuracy_m, "
-                        "duration_seconds, "
+                        "name, planned_minutes, status, notes, "
+                        # `service_type` is a legacy NOT-NULL column the
+                        # spec-aligned runtime ORM no longer reads, but
+                        # the constraint is still enforced. We pass a
+                        # placeholder so the INSERT doesn't blow up. The
+                        # new free-text `name` column carries the
+                        # human-readable label going forward.
+                        "service_type, "
                         "created_at, updated_at"
                         ") VALUES ("
-                        ":id, :appt, :agency, :staff, "
-                        ":status, "
-                        ":ci_time, 44.9778, -93.2650, "
-                        "12.5, 'seed-device-001', "
-                        "true, 25, "
-                        ":co_time, 44.9778, -93.2650, "
-                        "12.5, "
-                        ":duration, "
+                        ":id, :appt, :agency, "
+                        ":name, :planned, 'PENDING', :notes, "
+                        ":service_type, "
                         "now(), now()"
                         ")"
                     ),
                     {
-                        "id": visit_id,
+                        "id": aid,
                         "appt": appt_id,
                         "agency": ids.agency_id,
-                        "staff": ids.staff_profile_id,
-                        "status": spec["visit_status"],
-                        "ci_time": started_at,
-                        "co_time": ended_at if spec["visit_status"] != "IN_PROGRESS" else None,
-                        "duration": duration_seconds if spec["visit_status"] != "IN_PROGRESS" else None,
+                        "name": name,
+                        "planned": planned_minutes,
+                        "notes": notes,
+                        "service_type": "PERSONAL_CARE",
                     },
                 )
-                visit_n += 1
+                activity_n += 1
 
-                # ----- per-activity delivery records (visit_service_items) -----
-                statuses = spec.get("delivery_statuses", [])
-                for si_id, status in zip(service_item_ids, statuses):
-                    completed_at = (
-                        ended_at
-                        if status in ("DONE", "NOT_DONE", "NOT_APPLICABLE")
+            # ----- materialized visit (in-progress / completed states) -----
+            if not spec.get("with_visit"):
+                continue
+
+            visit_id = uuid.uuid4()
+            started_at = now - timedelta(minutes=spec["visit_started_min_ago"])
+            visit_minutes = spec["visit_duration_min"]
+            ended_at = started_at + timedelta(minutes=visit_minutes)
+
+            # Visits table: keep the minimal mirror columns (status,
+            # billing_confirmed_at, sharing_location). The GPS / device
+            # data lives on `evv_records` (1:1 with the visit).
+            await conn.execute(
+                text(
+                    "INSERT INTO visits ("
+                    "id, appointment_id, agency_id, staff_id, "
+                    "status, billing_confirmed_at, billing_confirmed_by_user_id, "
+                    "sharing_location, "
+                    "created_at, updated_at"
+                    ") VALUES ("
+                    ":id, :appt, :agency, :staff, "
+                    ":status, "
+                    ":billing_confirmed_at, :billing_confirmed_by, "
+                    ":sharing, "
+                    "now(), now()"
+                    ")"
+                ),
+                {
+                    "id": visit_id,
+                    "appt": appt_id,
+                    "agency": ids.agency_id,
+                    "staff": ids.staff_profile_id,
+                    "status": spec["visit_status"],
+                    "billing_confirmed_at": (
+                        ended_at + timedelta(minutes=1)
+                        if spec.get("billing_confirmed")
                         else None
-                    )
-                    completed_by = ids.staff_user_id if completed_at else None
-                    reason = (
-                        "Patient asleep during this step."
-                        if status == "NOT_DONE"
+                    ),
+                    "billing_confirmed_by": (
+                        ids.staff_user_id
+                        if spec.get("billing_confirmed")
                         else None
-                    )
-                    note = None
-                    if (
-                        status == "DONE"
-                        and spec["code"] == "A5"
-                        and si_id == service_item_ids[0]
-                    ):
-                        # Annotate the COMPLETED visit's first activity
-                        note = "BP 128/82, normal range."
+                    ),
+                    "sharing": True if spec["visit_status"] == "IN_PROGRESS" else False,
+                },
+            )
+            visit_n += 1
+
+            # ----- EVV record (start + end GPS, one row per visit) -----
+            # GPS coordinates: Springfield, MN approximate (matches the
+            # legacy seed's lat/lng so existing dashboards don't jump).
+            start_lat = 44.9778
+            start_lng = -93.2650
+            end_lat = 44.9778
+            end_lng = -93.2650
+            # A8: end coords "outside geofence" (so verification=FAILED).
+            if spec["code"] == "A8":
+                end_lat = 44.9900
+                end_lng = -93.2500
+
+            await conn.execute(
+                text(
+                    "INSERT INTO evv_records ("
+                    "id, visit_id, agency_id, "
+                    "start_time, start_lat, start_lng, "
+                    "start_accuracy_m, start_device_id, "
+                    "start_verification_status, "
+                    "end_time, end_lat, end_lng, "
+                    "end_accuracy_m, "
+                    "created_at, updated_at"
+                    ") VALUES ("
+                    ":id, :visit, :agency, "
+                    ":start_time, :start_lat, :start_lng, "
+                    ":start_acc, :device_id, "
+                    ":start_verif, "
+                    ":end_time, :end_lat, :end_lng, "
+                    ":end_acc, "
+                    "now(), now()"
+                    ")"
+                ),
+                {
+                    "id": uuid.uuid4(),
+                    "visit": visit_id,
+                    "agency": ids.agency_id,
+                    "start_time": started_at,
+                    "start_lat": start_lat,
+                    "start_lng": start_lng,
+                    "start_acc": 12.5,
+                    "device_id": "seed-device-001",
+                    "start_verif": spec.get("evv_start_verification"),
+                    "end_time": ended_at
+                    if spec["visit_status"] != "IN_PROGRESS"
+                    else None,
+                    "end_lat": end_lat
+                    if spec["visit_status"] != "IN_PROGRESS"
+                    else None,
+                    "end_lng": end_lng
+                    if spec["visit_status"] != "IN_PROGRESS"
+                    else None,
+                    "end_acc": 12.5
+                    if spec["visit_status"] != "IN_PROGRESS"
+                    else None,
+                },
+            )
+            evv_n += 1
+
+            # ----- per-activity delivery records -----
+            for aid, status_label in zip(activity_ids, spec.get("delivery_statuses", [])):
+                completed_at = (
+                    ended_at
+                    if status_label in ("DONE", "NOT_DONE", "NOT_APPLICABLE")
+                    else None
+                )
+                completed_by = ids.staff_user_id if completed_at else None
+                reason = (
+                    "Patient asleep during this step."
+                    if status_label == "NOT_DONE"
+                    else None
+                )
+                note = None
+                if status_label == "DONE" and spec["code"] == "A5" and aid == activity_ids[0]:
+                    note = "BP 128/82, normal range."
+                await conn.execute(
+                    text(
+                        "INSERT INTO visit_activity_deliveries ("
+                        "id, visit_id, appointment_service_item_id, "
+                        "status, reason, note, "
+                        "completed_at, completed_by, "
+                        "created_at, updated_at"
+                        ") VALUES ("
+                        ":id, :visit, :activity, "
+                        ":status, :reason, :note, "
+                        ":completed_at, :completed_by, "
+                        "now(), now()"
+                        ")"
+                    ),
+                    {
+                        "id": uuid.uuid4(),
+                        "visit": visit_id,
+                        "activity": aid,
+                        "status": status_label,
+                        "reason": reason,
+                        "note": note,
+                        "completed_at": completed_at,
+                        "completed_by": completed_by,
+                    },
+                )
+                delivery_n += 1
+
+            # ----- visit notes (1-2 per in-flight / completed visit) -----
+            for i, body in enumerate(spec.get("notes_payload", [])):
+                # Spread notes across the visit window.
+                offset_min = (i + 1) * (visit_minutes // (len(spec["notes_payload"]) + 1))
+                created_at = started_at + timedelta(minutes=offset_min)
+                await conn.execute(
+                    text(
+                        "INSERT INTO visit_notes ("
+                        "id, visit_id, author_user_id, body, created_at"
+                        ") VALUES ("
+                        ":id, :visit, :author, :body, :created_at"
+                        ")"
+                    ),
+                    {
+                        "id": uuid.uuid4(),
+                        "visit": visit_id,
+                        "author": ids.staff_user_id,
+                        "body": body,
+                        "created_at": created_at,
+                    },
+                )
+                note_n += 1
+
+            # ----- appointment signature (COMPLETED visits only) -----
+            if spec.get("with_signature"):
+                # Render signer display name from the patient's full name
+                # so the wire value matches the runtime helper.
+                patient_name_row = (
                     await conn.execute(
                         text(
-                            "INSERT INTO visit_activity_deliveries ("
-                            "id, visit_id, appointment_service_item_id, "
-                            "status, reason, note, completed_at, "
-                            "completed_by, created_at, updated_at"
-                            ") VALUES ("
-                            ":id, :visit, :si, "
-                            ":status, :reason, :note, :completed_at, "
-                            ":completed_by, now(), now()"
-                            ")"
+                            "SELECT u.full_name FROM users u "
+                            "JOIN patient_profiles pp ON pp.user_id = u.id "
+                            "WHERE pp.id = :p"
                         ),
-                        {
-                            "id": uuid.uuid4(),
-                            "visit": visit_id,
-                            "si": si_id,
-                            "status": status,
-                            "reason": reason,
-                            "note": note,
-                            "completed_at": completed_at,
-                            "completed_by": completed_by,
-                        },
+                        {"p": ids.patient_profile_id},
                     )
-                    delivery_n += 1
+                ).first()
+                full_name = patient_name_row[0] if patient_name_row else None
+                # Spec §9 format: "J. Smith"
+                if full_name:
+                    parts = full_name.strip().split()
+                    if len(parts) >= 2:
+                        signer_display = f"{parts[0][0]}. {parts[-1]}"
+                    else:
+                        signer_display = parts[0] if parts else "Patient"
+                else:
+                    signer_display = "D. Patient"
 
-                # ----- service verification (COMPLETED + verified/disputed) -----
-                if spec.get("with_verification"):
-                    await conn.execute(
-                        text(
-                            "INSERT INTO service_verifications ("
-                            "id, visit_id, agency_id, "
-                            "verified_by, verifier_role, "
-                            "status, dispute_reason_code, comment, "
-                            "created_at"
-                            ") VALUES ("
-                            ":id, :visit, :agency, "
-                            ":verifier, 'PATIENT', "
-                            ":status, :reason, :comment, "
-                            ":created_at"
-                            ")"
-                        ),
-                        {
-                            "id": uuid.uuid4(),
-                            "visit": visit_id,
-                            "agency": ids.agency_id,
-                            "verifier": ids.patient_user_id,
-                            "status": spec["verification_status"],
-                            "reason": spec.get("verification_dispute_reason"),
-                            "comment": spec.get("verification_comment"),
-                            "created_at": ended_at + timedelta(minutes=10),
-                        },
-                    )
-                    verif_n += 1
+                await conn.execute(
+                    text(
+                        "INSERT INTO appointment_signatures ("
+                        "id, visit_id, agency_id, "
+                        "signer_user_id, signer_role, "
+                        "signer_display_name, signature_image_url, "
+                        "signed_at, ip_address, user_agent, "
+                        "created_at"
+                        ") VALUES ("
+                        ":id, :visit, :agency, "
+                        ":signer_user, :signer_role, "
+                        ":signer_name, :img_url, "
+                        ":signed_at, :ip, :ua, "
+                        "now()"
+                        ")"
+                    ),
+                    {
+                        "id": uuid.uuid4(),
+                        "visit": visit_id,
+                        "agency": ids.agency_id,
+                        "signer_user": ids.patient_user_id,
+                        "signer_role": spec.get("signer_role", "PATIENT"),
+                        "signer_name": signer_display,
+                        "img_url": f"https://storage.qlockcare.dev/signatures/{visit_id}.png",
+                        "signed_at": ended_at + timedelta(minutes=5),
+                        "ip": "127.0.0.1",
+                        "ua": "seed-script/1.0",
+                    },
+                )
+                signature_n += 1
 
-    return appt_n, item_n, visit_n, delivery_n, verif_n
+    return SeedResult(
+        appointments=appt_n,
+        activities=activity_n,
+        visits=visit_n,
+        deliveries=delivery_n,
+        notes=note_n,
+        signatures=signature_n,
+        evv_records=evv_n,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -715,15 +832,17 @@ def main() -> None:
     print(
         f"\nDone.\n"
         f"  appointments              = {result.appointments}\n"
-        f"  appointment_service_items = {result.service_items}\n"
+        f"  appointment_activities    = {result.activities}\n"
         f"  visits                    = {result.visits}\n"
-        f"  visit_service_items       = {result.deliveries}\n"
-        f"  service_verifications     = {result.verifications}\n"
+        f"  visit_activity_deliveries = {result.deliveries}\n"
+        f"  visit_notes               = {result.notes}\n"
+        f"  appointment_signatures    = {result.signatures}\n"
+        f"  evv_records               = {result.evv_records}\n"
     )
     print("Now hit these endpoints to see the data:")
     print("  GET /appointments")
     print("  GET /appointments?status=SCHEDULED")
-    print("  GET /appointments?status=ASSIGNED")
+    print("  GET /appointments?date_from=2026-08-27&date_to=2026-08-27")
     print("  GET /visits")
     print("  GET /portal/visits                (login as patient@qlockcare.dev)")
 
