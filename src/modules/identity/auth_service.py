@@ -38,6 +38,8 @@ from src.core.exceptions import (
     InvitationAlreadyConsumedError,
     NotFoundError,
     OtpResendCooldownError,
+    TokenExpiredError,
+    TokenInvalidError,
     UnauthorizedError,
 )
 from src.core.logging import get_logger
@@ -415,61 +417,179 @@ async def refresh(
     ip_address: str | None = None,
     user_agent: str | None = None,
 ) -> IssuedTokens:
-    """Verify refresh token, check it's still active, rotate the pair."""
-    payload = jwt_service.verify_refresh_token(refresh_token)
+    """Verify refresh token, check it's still active, rotate the pair.
 
-    # Set RLS context for this user so we can see their refresh_tokens rows.
-    # We don't yet know the user's role — load them first then come back to
-    # this if needed. For now, set user_id so the SELECT policy passes.
+    Every branch logs a structured `auth.refresh` event so an operator
+    tailing logs can see *why* a refresh was rejected (the FE surfaces
+    these as silent logouts). `outcome` is one of:
+        success            — token rotated, new pair returned
+        token_invalid      — JWT signature/audience/issuer failed
+        token_expired      — JWT `exp` claim elapsed
+        refresh_unknown    — JTI not in `refresh_tokens` (likely the FE
+                             never persisted the rotated pair)
+        refresh_revoked    — row has `revoked_at IS NOT NULL` (logout,
+                             password change, admin force)
+        refresh_expired    — row's `expires_at` elapsed (true inactivity)
+        account_disabled   — user moved to INACTIVE / ARCHIVED
+        agency_suspended   — agency gate (`assert_agency_allows_auth`)
+    """
     from src.core.database import set_session_context
 
-    await set_session_context(session, user_id=str(payload.user_id))
+    payload: jwt_service.RefreshTokenPayload | None = None
+    jti_hint: str | None = None
 
-    row = (
-        await session.execute(
-            select(RefreshToken).where(RefreshToken.jti == payload.jti)
+    try:
+        try:
+            payload = jwt_service.verify_refresh_token(refresh_token)
+            jti_hint = payload.jti
+        except TokenExpiredError:
+            logger.info(
+                "auth.refresh",
+                outcome="token_expired",
+                ip_address=ip_address,
+            )
+            raise
+        except Exception as exc:  # TokenInvalidError + any jwt errors
+            logger.info(
+                "auth.refresh",
+                outcome="token_invalid",
+                ip_address=ip_address,
+                error=type(exc).__name__,
+                message=str(exc),
+            )
+            raise
+
+        # Set RLS context for this user so we can see their refresh_tokens
+        # rows. We don't yet know the user's role — load them first then
+        # come back to this if needed. For now, set user_id so the SELECT
+        # policy passes.
+        await set_session_context(session, user_id=str(payload.user_id))
+
+        row = (
+            await session.execute(
+                select(RefreshToken).where(RefreshToken.jti == payload.jti)
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            logger.info(
+                "auth.refresh",
+                outcome="refresh_unknown",
+                jti=jti_hint,
+                user_id=str(payload.user_id),
+                ip_address=ip_address,
+            )
+            raise UnauthorizedError(details={"reason": "refresh_token_unknown"})
+
+        now = datetime.now(tz=UTC)
+        if row.revoked_at is not None:
+            logger.info(
+                "auth.refresh",
+                outcome="refresh_revoked",
+                jti=jti_hint,
+                user_id=str(payload.user_id),
+                ip_address=ip_address,
+                revoked_reason=row.revoked_reason,
+                revoked_at=row.revoked_at.isoformat(),
+                token_age_seconds=int(
+                    (now - row.issued_at).total_seconds()
+                ),
+            )
+            raise UnauthorizedError(details={"reason": "refresh_token_revoked"})
+
+        if row.expires_at <= now:
+            logger.info(
+                "auth.refresh",
+                outcome="refresh_expired",
+                jti=jti_hint,
+                user_id=str(payload.user_id),
+                ip_address=ip_address,
+                expires_at=row.expires_at.isoformat(),
+                now=now.isoformat(),
+                seconds_past_expiry=int(
+                    (now - row.expires_at).total_seconds()
+                ),
+            )
+            raise UnauthorizedError(details={"reason": "refresh_token_expired"})
+
+        user = await _load_user_with_roles(session, payload.user_id)
+        if user.status in {UserStatus.INACTIVE, UserStatus.ARCHIVED}:
+            logger.info(
+                "auth.refresh",
+                outcome="account_disabled",
+                jti=jti_hint,
+                user_id=str(payload.user_id),
+                ip_address=ip_address,
+                user_status=user.status.value,
+            )
+            raise AccountDisabledError()
+
+        # Update the session context now that we have role + agency.
+        role, agency_id = _pick_primary_role(user.roles, user_id=user.id)
+        await set_session_context(
+            session,
+            user_id=str(payload.user_id),
+            agency_id=str(agency_id) if agency_id else None,
+            user_role=role.value,
         )
-    ).scalar_one_or_none()
-    if row is None:
-        raise UnauthorizedError(details={"reason": "refresh_token_unknown"})
-    now = datetime.now(tz=UTC)
-    if row.revoked_at is not None:
-        raise UnauthorizedError(details={"reason": "refresh_token_revoked"})
-    if row.expires_at <= now:
-        raise UnauthorizedError(details={"reason": "refresh_token_expired"})
+        try:
+            await assert_agency_allows_auth(session, agency_id=agency_id)
+        except AgencySuspendedError as exc:
+            logger.info(
+                "auth.refresh",
+                outcome="agency_suspended",
+                jti=jti_hint,
+                user_id=str(payload.user_id),
+                agency_id=str(agency_id),
+                ip_address=ip_address,
+                agency_status=str(exc.details.get("status", "UNKNOWN")),
+            )
+            raise
 
-    user = await _load_user_with_roles(session, payload.user_id)
-    if user.status in {UserStatus.INACTIVE, UserStatus.ARCHIVED}:
-        raise AccountDisabledError()
+        # Rotate: revoke the old, issue a new pair
+        row.revoked_at = now
+        row.revoked_reason = "rotated"
 
-    # Update the session context now that we have role + agency.
-    role, agency_id = _pick_primary_role(user.roles, user_id=user.id)
-    await set_session_context(
-        session,
-        user_id=str(payload.user_id),
-        agency_id=str(agency_id) if agency_id else None,
-        user_role=role.value,
-    )
-    await assert_agency_allows_auth(session, agency_id=agency_id)
+        tokens = await _issue_pair(
+            session,
+            user=user,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+        await _record_audit(
+            session,
+            user_id=user.id,
+            event_type=AuthAuditEventType.TOKEN_REFRESHED,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
 
-    # Rotate: revoke the old, issue a new pair
-    row.revoked_at = now
-    row.revoked_reason = "rotated"
-
-    tokens = await _issue_pair(
-        session,
-        user=user,
-        ip_address=ip_address,
-        user_agent=user_agent,
-    )
-    await _record_audit(
-        session,
-        user_id=user.id,
-        event_type=AuthAuditEventType.TOKEN_REFRESHED,
-        ip_address=ip_address,
-        user_agent=user_agent,
-    )
-    return tokens
+        logger.info(
+            "auth.refresh",
+            outcome="success",
+            jti=jti_hint,
+            user_id=str(payload.user_id),
+            new_jti=tokens.refresh_token[-12:],  # tail only — full JTI
+            # never leaves the log on disk
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+        return tokens
+    except Exception as exc:
+        # Catch-all: anything that bubbles out without a more-specific
+        # log line above gets a generic `error` outcome so the operator
+        # still has *something* to grep for.
+        if not isinstance(exc, (TokenExpiredError, TokenInvalidError,
+                                UnauthorizedError, AccountDisabledError,
+                                AgencySuspendedError)):
+            logger.exception(
+                "auth.refresh",
+                outcome="error",
+                jti=jti_hint,
+                user_id=str(payload.user_id) if payload else None,
+                ip_address=ip_address,
+                error=type(exc).__name__,
+            )
+        raise
 
 
 # --------------------------------------------------------------------------
