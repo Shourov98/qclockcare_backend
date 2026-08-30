@@ -153,6 +153,14 @@ class CurrentUser(BaseModel):
     id: str = Field(description="Stable user UUID.")
     email: EmailStr = Field(description="Verified email address.")
     full_name: str = Field(description="Display name (first + last).")
+    phone: str | None = Field(
+        default=None,
+        description=(
+            "Phone number (E.164 or local format). Nullable for users "
+            "who haven't set one. Editable via PATCH /auth/me — email "
+            "is intentionally NOT editable on the same endpoint."
+        ),
+    )
     status: str = Field(
         description=(
             "Lifecycle status (`INVITED`, `EMAIL_VERIFICATION_PENDING`, "
@@ -568,6 +576,40 @@ class MeResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Edit profile (PATCH /auth/me)
+# --------------------------------------------------------------------------
+class UpdateProfileRequest(BaseModel):
+    """PATCH /auth/me body — caller updates their own profile.
+
+    Email is intentionally NOT editable here. Email is the login
+    identity and the stable identifier every audit row keys off; if
+    a user needs a new email, they go through a support workflow
+    (out of band). This avoids the case where an attacker who steals
+    a bearer token can silently rebind the account to an attacker-
+    controlled email.
+
+    All fields optional — only the ones the caller sets are applied.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    full_name: Annotated[
+        str | None,
+        StringConstraints(min_length=1, max_length=255, strip_whitespace=True),
+    ] = Field(
+        default=None,
+        description="Display name (first + last). 1-255 chars after stripping whitespace.",
+    )
+    phone: Annotated[
+        str | None,
+        StringConstraints(min_length=1, max_length=32, strip_whitespace=True),
+    ] = Field(
+        default=None,
+        description="Phone number (E.164 preferred). 1-32 chars after stripping whitespace.",
+    )
+
+
+# --------------------------------------------------------------------------
 # Error / status envelope (used by OTP failure path)
 # --------------------------------------------------------------------------
 class OtpAttemptStatus(BaseModel):
@@ -614,6 +656,7 @@ __all__ = [
     "ResendOtpResponse",
     "ResetPasswordRequest",
     "TokenPair",
+    "UpdateProfileRequest",
     "VerifyEmailRequest",
     "VerifyEmailResponse",
 ]

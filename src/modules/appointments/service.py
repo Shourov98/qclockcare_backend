@@ -1077,6 +1077,135 @@ def _humanize_enum(value: object) -> str | None:
     return humanize_enum(value)
 
 
+# --------------------------------------------------------------------------
+# Patient dashboard summary (spec: GET /patients/{id}/dashboard-summary)
+# --------------------------------------------------------------------------
+# Cap for the upcoming list. The FE renders at most this many cards in
+# the dashboard header; spec calls for 5. Kept as a module constant so
+# it's easy to bump if the FE ever changes its layout.
+PATIENT_DASHBOARD_UPCOMING_LIMIT: int = 5
+
+
+async def get_patient_dashboard_summary(
+    session: AsyncSession,
+    *,
+    patient_id: uuid.UUID,
+    agency_id: uuid.UUID,
+    now: datetime | None = None,
+) -> tuple[list[Appointment], int, int, int]:
+    """Two reads for the patient dashboard:
+
+    1. The patient's next `PATIENT_DASHBOARD_UPCOMING_LIMIT` upcoming
+       appointments — scheduled_start >= now and status in
+       `APPOINTMENT_ACTIVE_STATUSES`. Eager-loaded with the same
+       `selectinload` chain as `list_appointments` so the FE summary
+       cards have `staff_name`, `program_name`, `service_type_label`,
+       etc. pre-joined.
+
+    2. Lifetime stats (totals + total service minutes) for the
+       dashboard summary card.
+
+    `now` is injected so tests can pin time. Defaults to `utc_now()`.
+
+    Returns a 4-tuple:
+      (upcoming_appointments, total_appointments,
+       completed_appointments, total_service_minutes)
+
+    The caller maps these into `PatientDashboardSummaryResponse` and
+    `PatientLifetimeStats`. Splitting the aggregation here keeps the
+    router thin and lets tests call the service directly.
+    """
+    from src.shared.domain.enums import APPOINTMENT_ACTIVE_STATUSES
+    from src.shared.utils.datetime_utils import utc_now
+
+    effective_now = now if now is not None else utc_now()
+
+    # ---- Upcoming list ----
+    upcoming_stmt = (
+        select(Appointment)
+        .where(
+            Appointment.agency_id == agency_id,
+            Appointment.patient_id == patient_id,
+            Appointment.status.in_(APPOINTMENT_ACTIVE_STATUSES),
+            Appointment.scheduled_start >= effective_now,
+        )
+        .options(
+            selectinload(Appointment.staff).selectinload(StaffProfile.user),
+            selectinload(Appointment.staff).selectinload(
+                StaffProfile.qualifications
+            ),
+            selectinload(Appointment.patient).selectinload(
+                PatientProfile.user
+            ),
+            selectinload(Appointment.activities),
+        )
+        # Ascending so the soonest appointment is first — the dashboard
+        # card list reads top-down.
+        .order_by(Appointment.scheduled_start.asc(), Appointment.id.asc())
+        .limit(PATIENT_DASHBOARD_UPCOMING_LIMIT)
+    )
+    upcoming_rows = (
+        await session.execute(upcoming_stmt)
+    ).scalars().all()
+
+    # ---- Lifetime totals + minutes ----
+    # Single round-trip per count via `count()` — three separate
+    # queries is fine for now (the patient's row count is small; this
+    # endpoint is the patient's own dashboard, not an admin scan).
+    total_stmt = (
+        select(func.count())
+        .select_from(Appointment)
+        .where(
+            Appointment.agency_id == agency_id,
+            Appointment.patient_id == patient_id,
+        )
+    )
+    completed_appts_stmt = total_stmt.where(
+        Appointment.status == AppointmentStatus.COMPLETED
+    )
+    # Sum of `(scheduled_end - scheduled_start)` in minutes for every
+    # COMPLETED appointment. `func.extract('epoch', ...)` returns the
+    # delta in seconds; divide by 60 and floor to int.
+    total_minutes_stmt = select(
+        func.coalesce(
+            func.sum(
+                func.extract(
+                    "epoch",
+                    Appointment.scheduled_end - Appointment.scheduled_start,
+                )
+                / 60.0
+            ),
+            0,
+        )
+    ).where(
+        Appointment.agency_id == agency_id,
+        Appointment.patient_id == patient_id,
+        Appointment.status == AppointmentStatus.COMPLETED,
+    )
+
+    total_appointments = int(
+        (await session.execute(total_stmt)).scalar_one()
+    )
+    completed_appointments = int(
+        (await session.execute(completed_appts_stmt)).scalar_one()
+    )
+    total_service_minutes = int(
+        (await session.execute(total_minutes_stmt)).scalar_one()
+    )
+
+    # The 1:1 chain `appointment → visit` makes completed_visits equal
+    # to completed_appointments for any patient who hasn't had their
+    # appointment history retconned. We still expose it as a separate
+    # field in the response so the FE can render "47 visits" without
+    # joining anything client-side.
+    return (
+        list(upcoming_rows),
+        total_appointments,
+        completed_appointments,
+        total_service_minutes,
+    )
+
+
 def _summarize_to_dict(appt: Appointment) -> dict:
     """Project a (eager-loaded) Appointment ORM row into the dict shape
     expected by `AppointmentSummaryResponse`.
@@ -1180,6 +1309,7 @@ __all__ = [
     "create_appointment",
     "delete_activity",
     "get_appointment",
+    "get_patient_dashboard_summary",
     "list_activities",
     "list_appointments",
     "mark_appointment_billing_paid",

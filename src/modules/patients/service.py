@@ -12,8 +12,9 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import date
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -614,6 +615,48 @@ async def list_patient_guardians(
         .order_by(PatientGuardianRelationship.created_at.desc())
     )
     return (await session.execute(stmt)).scalars().all()
+
+
+async def list_guardian_patient_ids(
+    session: AsyncSession,
+    *,
+    guardian_id: uuid.UUID,
+    agency_id: uuid.UUID,
+    as_of: date | None = None,
+) -> list[uuid.UUID]:
+    """Return every patient this guardian is currently linked to.
+
+    Used by the guardian visit-history endpoint to scope the visit
+    query to "patients I can see". Filters on `valid_from` /
+    `valid_until` so revoked relationships stop showing up — the
+    default `as_of` is today (server-side date).
+
+    Order is stable (`created_at asc`) but the caller doesn't depend
+    on it — the downstream visit query orders by `scheduled_start`.
+    """
+    await _get_guardian_or_404(
+        session, guardian_id=guardian_id, agency_id=agency_id
+    )
+    effective_as_of = as_of or date.today()
+    stmt = (
+        select(PatientGuardianRelationship.patient_id)
+        .where(
+            PatientGuardianRelationship.guardian_id == guardian_id,
+            PatientGuardianRelationship.agency_id == agency_id,
+            # Validity window — nulls are open-ended.
+            or_(
+                PatientGuardianRelationship.valid_from.is_(None),
+                PatientGuardianRelationship.valid_from <= effective_as_of,
+            ),
+            or_(
+                PatientGuardianRelationship.valid_until.is_(None),
+                PatientGuardianRelationship.valid_until >= effective_as_of,
+            ),
+        )
+        .order_by(PatientGuardianRelationship.created_at.asc())
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    return list(rows)
 
 
 async def add_patient_guardian(

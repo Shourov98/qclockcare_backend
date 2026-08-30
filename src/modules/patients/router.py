@@ -44,6 +44,12 @@ from src.modules.identity.dependencies import (
     get_session_with_auth,
     require_role,
 )
+from src.modules.appointments import service as appointments_service
+from src.modules.appointments.schemas import (
+    AppointmentSummaryResponse,
+    PatientDashboardSummaryResponse,
+    PatientLifetimeStats,
+)
 from src.modules.patients import service as patients_service
 from src.modules.patients.schemas import (
     GuardianProfileCreateRequest,
@@ -331,6 +337,119 @@ async def get_patient_with_relationships_endpoint(
     )
     _ensure_can_view_patient(ctx, patient.user_id)
     return _to_patient_response(patient, with_relationships=True)
+
+
+@router.get(
+    "/patients/{patient_id}/dashboard-summary",
+    response_model=PatientDashboardSummaryResponse,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Patient dashboard landing data",
+    description=(
+        "Returns two halves of the patient's dashboard in one round trip:\n\n"
+        "  - **`upcoming`** — the next ≤5 appointments where "
+        "`scheduled_start >= now()` and the status is in "
+        "`APPOINTMENT_ACTIVE_STATUSES` "
+        "(`SCHEDULED`, `READY`, `IN_PROGRESS`, `AWAITING_SIGNATURE`). "
+        "Ordered ascending by `scheduled_start` so the soonest is first. "
+        "Each item reuses `AppointmentSummaryResponse` so the FE doesn't "
+        "need a separate type for dashboard cards.\n\n"
+        "  - **`lifetime`** — total appointments, completed appointments, "
+        "completed visits, and the sum of `scheduled_end - scheduled_start` "
+        "in minutes across every `COMPLETED` appointment.\n\n"
+        "Auth: the patient themselves (`ctx.user_id == patient.user_id`) "
+        "or `AGENCY_ADMIN` at the patient's agency. "
+        "`STAFF` and `GUARDIAN` get `CROSS_AGENCY_ACCESS_DENIED` — they "
+        "should use the admin / portal dashboard endpoints instead."
+    ),
+)
+async def get_patient_dashboard_summary_endpoint(
+    patient_id: uuid.UUID,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> PatientDashboardSummaryResponse:
+    agency_id = _require_agency(ctx)
+    # Auth: must be the patient themselves OR an AGENCY_ADMIN at the
+    # same agency. We fetch the patient row first (so the auth check
+    # has the user_id) and also as a 404 guard.
+    patient = await patients_service.get_patient(
+        session, patient_id=patient_id, agency_id=agency_id
+    )
+    _ensure_can_view_patient(ctx, patient.user_id)
+
+    upcoming_rows, total_appointments, completed_appointments, total_minutes = (
+        await appointments_service.get_patient_dashboard_summary(
+            session,
+            patient_id=patient_id,
+            agency_id=agency_id,
+        )
+    )
+
+    return PatientDashboardSummaryResponse(
+        upcoming=[
+            AppointmentSummaryResponse.model_validate(
+                appointments_service._summarize_to_dict(row)
+            )
+            for row in upcoming_rows
+        ],
+        lifetime=PatientLifetimeStats(
+            total_appointments=total_appointments,
+            completed_appointments=completed_appointments,
+            completed_visits=completed_appointments,  # 1:1 chain
+            total_service_minutes=total_minutes,
+        ),
+    )
+
+
+@router.get(
+    "/patients/{patient_id}/visits/history",
+    response_model=dict,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Patient visit history (COMPLETED visits, most recent first)",
+    description=(
+        "Returns the patient's completed visits at the caller's "
+        "agency, ordered by `scheduled_start DESC` (most recent "
+        "first). Each item is a full `VisitResponse` (the same shape "
+        "as `/visits/{id}/with-items`) so the FE can render the visit "
+        "summary card without a second round trip.\n\n"
+        "Auth: the patient themselves (`ctx.user_id == patient.user_id`) "
+        "or `AGENCY_ADMIN` at the patient's agency. `STAFF` and "
+        "`GUARDIAN` get `CROSS_AGENCY_ACCESS_DENIED` — they should "
+        "use the dedicated staff / guardian history endpoints instead.\n\n"
+        "Pagination: `page` (1-indexed, default 1), `page_size` "
+        "(1-100, default 20)."
+    ),
+)
+async def list_patient_visit_history_endpoint(
+    patient_id: uuid.UUID,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+    page: int = Query(default=1, ge=1, le=10000),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> dict:
+    from src.modules.visits import service as visits_service
+    from src.modules.visits.schemas import VisitResponse
+
+    agency_id = _require_agency(ctx)
+    # Fetch the patient first so we can run the auth check (which
+    # needs the patient.user_id) and also 404-guard.
+    patient = await patients_service.get_patient(
+        session, patient_id=patient_id, agency_id=agency_id
+    )
+    _ensure_can_view_patient(ctx, patient.user_id)
+
+    rows, total = await visits_service.list_visit_history(
+        session,
+        agency_id=agency_id,
+        patient_id=patient_id,
+        page=page,
+        page_size=page_size,
+    )
+    return build_offset_response(
+        [VisitResponse.model_validate(v, from_attributes=True) for v in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.patch(
@@ -644,6 +763,96 @@ async def get_guardian_endpoint(
     )
     _ensure_can_view_guardian(ctx, guardian.user_id)
     return _to_guardian_response(guardian)
+
+
+@router.get(
+    "/guardians/{guardian_id}/visits/history",
+    response_model=dict,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Guardian visit history (COMPLETED visits across linked patients)",
+    description=(
+        "Returns the COMPLETED visits for every patient this guardian "
+        "is currently linked to (active `valid_from` / `valid_until` "
+        "window). Ordered by `scheduled_start DESC` (most recent "
+        "first). Each item is a full `VisitResponse` (the same shape "
+        "as `/visits/{id}/with-items`).\n\n"
+        "Auth: the guardian themselves (`ctx.user_id == guardian.user_id`) "
+        "or `AGENCY_ADMIN` at the guardian's agency. Other roles get "
+        "`CROSS_AGENCY_ACCESS_DENIED`.\n\n"
+        "Empty list if the guardian has no active patient links — a "
+        "newly-invited guardian with zero linked patients sees an empty "
+        "page rather than an error.\n\n"
+        "Pagination: `page` (1-indexed, default 1), `page_size` "
+        "(1-100, default 20)."
+    ),
+)
+async def list_guardian_visit_history_endpoint(
+    guardian_id: uuid.UUID,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+    page: int = Query(default=1, ge=1, le=10000),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> dict:
+    from src.modules.visits import service as visits_service
+    from src.modules.visits.schemas import VisitResponse
+
+    agency_id = _require_agency(ctx)
+    # Fetch the guardian first so the auth check has the user_id and
+    # we also 404-guard against non-existent guardian ids.
+    guardian = await patients_service.get_guardian(
+        session, guardian_id=guardian_id, agency_id=agency_id
+    )
+    _ensure_can_view_guardian(ctx, guardian.user_id)
+
+    # The guardian's view is the union of visits for every patient
+    # they're currently linked to. We paginate per-patient and merge
+    # because `list_visit_history` is a single-patient query. For a
+    # typical guardian with 1–3 linked patients the cost is fine; if
+    # a guardian ever has many linked patients we can revisit (e.g.
+    # add a `patient_ids` filter to `list_visit_history`).
+    patient_ids = await patients_service.list_guardian_patient_ids(
+        session,
+        guardian_id=guardian_id,
+        agency_id=agency_id,
+    )
+    if not patient_ids:
+        return build_offset_response(
+            [], total=0, page=page, page_size=page_size
+        )
+
+    merged: list = []
+    total = 0
+    for pid in patient_ids:
+        rows, pid_total = await visits_service.list_visit_history(
+            session,
+            agency_id=agency_id,
+            patient_id=pid,
+            page=page,
+            page_size=page_size,
+        )
+        total += pid_total
+        merged.extend(rows)
+
+    # Re-sort the merged list (descending by scheduled_start) and
+    # slice to the requested page. The per-patient query already
+    # returns DESC-ordered rows, but the merge across patients can
+    # interleave them.
+    merged.sort(
+        key=lambda v: (
+            v.appointment.scheduled_start if v.appointment is not None else v.created_at
+        ),
+        reverse=True,
+    )
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_rows = merged[start:end]
+
+    return build_offset_response(
+        [VisitResponse.model_validate(v, from_attributes=True) for v in page_rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.patch(

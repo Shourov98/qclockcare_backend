@@ -41,6 +41,7 @@ from src.core.exceptions import (
     TokenExpiredError,
     TokenInvalidError,
     UnauthorizedError,
+    ValidationError,
 )
 from src.core.logging import get_logger
 from src.core.security import hash_password, needs_rehash, verify_password
@@ -195,6 +196,7 @@ def _to_current_user(user: User) -> CurrentUser:
         id=str(user.id),
         email=user.email,
         full_name=user.full_name,
+        phone=user.phone,
         status=user.status.value,
         email_verified=user.email_verified_at is not None,
         agency_id=str(agency_id) if agency_id else None,
@@ -955,6 +957,62 @@ async def me(session: AsyncSession, *, user_id: uuid.UUID) -> CurrentUser:
 
 
 # --------------------------------------------------------------------------
+# Edit profile (PATCH /auth/me)
+# --------------------------------------------------------------------------
+async def update_profile(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    payload: "UpdateProfileRequest",
+) -> CurrentUser:
+    """Patch the caller's own `users` row (full_name and/or phone).
+
+    Email is intentionally NOT updatable here — see the docstring on
+    `UpdateProfileRequest`. All payload fields are optional; only the
+    ones the caller sent are applied. Empty payload is a no-op (returns
+    the unchanged user).
+
+    On success, returns the refreshed `CurrentUser` so the FE can update
+    its store without a second `GET /auth/me` round trip.
+    """
+    from src.modules.identity.schemas import UpdateProfileRequest
+
+    user = await _load_user_with_roles(session, user_id)
+
+    # Apply only the fields that were explicitly set. Pydantic's
+    # `model_fields_set` is the standard way to distinguish "field
+    # absent from the JSON" from "field present but null".
+    changes: dict[str, str | None] = {}
+    if "full_name" in payload.model_fields_set:
+        # StringConstraints stripped whitespace before this point;
+        # `full_name` is non-nullable on the column so we treat "" as
+        # "absent" and raise rather than silently blanking the name.
+        if payload.full_name is None or payload.full_name.strip() == "":
+            raise ValidationError(
+                "full_name cannot be empty.",
+                details={"field": "full_name"},
+            )
+        if payload.full_name != user.full_name:
+            changes["full_name"] = payload.full_name
+            user.full_name = payload.full_name
+    if "phone" in payload.model_fields_set:
+        new_phone = (payload.phone or "").strip() or None
+        if new_phone != user.phone:
+            changes["phone"] = new_phone
+            user.phone = new_phone
+
+    if changes:
+        await session.flush()
+
+    # Re-load so we return the canonical post-flush state. We don't
+    # need a full `_load_user_with_roles` because the role list didn't
+    # change — just refresh the user object so the response reflects
+    # the new values.
+    await session.refresh(user, attribute_names=["roles"])
+    return _to_current_user(user)
+
+
+# --------------------------------------------------------------------------
 # Change password (authenticated)
 # --------------------------------------------------------------------------
 async def change_password(
@@ -1096,5 +1154,6 @@ __all__ = [
     "refresh",
     "resend_otp",
     "reset_password",
+    "update_profile",
     "verify_email",
 ]

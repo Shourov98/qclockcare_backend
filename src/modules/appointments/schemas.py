@@ -311,10 +311,84 @@ class AppointmentMarkBillingPaidRequest(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Patient dashboard summary (returned by
+# GET /patients/{id}/dashboard-summary)
+# --------------------------------------------------------------------------
+class PatientLifetimeStats(BaseModel):
+    """Patient's lifetime service statistics.
+
+    Returned by the patient dashboard summary endpoint. All numbers
+    are scoped to the caller's agency (RLS-enforced) and computed
+    on the server at request time — the FE doesn't need to
+    aggregate.
+
+    `total_service_minutes` is the sum of
+    `(scheduled_end - scheduled_start)` in minutes for every
+    appointment whose status is `COMPLETED`. We use the scheduled
+    window (not EVV-derived durations) because:
+
+      1. The EVV end call (`POST /visits/{id}/end`) is optional in
+         the lifecycle — many completed visits never have an
+         `evv_records.end_time`.
+      2. The scheduled duration is what was actually billed to the
+         payer, so it matches the patient-visible invoice.
+      3. It's always populated (every appointment has
+         `scheduled_start` and `scheduled_end`).
+
+    `completed_visits` mirrors `completed_appointments` because
+    the `appointment → visit` chain is 1:1 (the unique constraint
+    on `visits.appointment_id`), but the FE might want to display
+    them separately in the future.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    total_appointments: int = Field(
+        ge=0,
+        description="Every appointment row for this patient at this agency, regardless of status.",
+    )
+    completed_appointments: int = Field(
+        ge=0,
+        description="Appointments with status=COMPLETED — i.e. the visit was signed off.",
+    )
+    completed_visits: int = Field(
+        ge=0,
+        description="Visits with status=COMPLETED. Equal to `completed_appointments` for the 1:1 chain.",
+    )
+    total_service_minutes: int = Field(
+        ge=0,
+        description="Sum of (scheduled_end - scheduled_start) in minutes across COMPLETED appointments.",
+    )
+
+
+class PatientDashboardSummaryResponse(BaseModel):
+    """Aggregated data for the patient dashboard landing screen.
+
+    Two halves:
+      - `upcoming`  — next ≤5 appointments, scheduled_start >= now,
+                     status in the `APPOINTMENT_ACTIVE_STATUSES`
+                     set, ordered ascending by scheduled_start.
+                     Empty list if the patient has nothing booked
+                     in the near future.
+      - `lifetime`  — counts + total minutes of service received
+                     across all history.
+
+    The upcoming list reuses `AppointmentSummaryResponse` so the
+    patient FE doesn't need a separate type for dashboard cards.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    upcoming: list[AppointmentSummaryResponse]
+    lifetime: PatientLifetimeStats
+
+
+# --------------------------------------------------------------------------
 # Forward refs
 # --------------------------------------------------------------------------
 AppointmentCreateRequest.model_rebuild()
 AppointmentResponse.model_rebuild()
+PatientDashboardSummaryResponse.model_rebuild()
 
 
 __all__ = [
@@ -331,4 +405,6 @@ __all__ = [
     "AppointmentStatusTransitionRequest",
     "AppointmentSummaryResponse",
     "AppointmentUpdateRequest",
+    "PatientDashboardSummaryResponse",
+    "PatientLifetimeStats",
 ]

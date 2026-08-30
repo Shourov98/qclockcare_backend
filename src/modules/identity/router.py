@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.config import settings
 from src.core.database import get_session
 from src.core.exceptions import UnauthorizedError
+from src.modules.audit_logs import service as audit_logs_service
 from src.modules.identity import auth_service
 from src.modules.identity.cookies import (
     QC_REFRESH_COOKIE,
@@ -62,9 +63,11 @@ from src.modules.identity.schemas import (
     ResendOtpResponse,
     ResetPasswordRequest,
     TokenPair,
+    UpdateProfileRequest,
     VerifyEmailRequest,
     VerifyEmailResponse,
 )
+from src.shared.domain.enums import AuditAction
 from src.shared.schemas.docs import standard_responses
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -451,6 +454,60 @@ async def me_endpoint(
     # The dependency has already verified the token, loaded the user, and
     # set RLS GUCs. We just need to return the user.
     user = await auth_service.me(session, user_id=ctx.user_id)
+    return MeResponse(user=user)
+
+
+@router.patch(
+    "/me",
+    response_model=MeResponse,
+    responses=standard_responses(include=[401, 403, 422]),
+    summary="Edit the caller's own profile (full_name, phone)",
+    description=(
+        "Authenticated callers (any role) update their own profile. "
+        "Only `full_name` and `phone` are editable here. **Email is "
+        "intentionally not editable** — it's the login identity and the "
+        "stable identifier every audit row keys off; rebinding email "
+        "needs an out-of-band workflow.\n\n"
+        "All fields optional; only the ones the caller sends are "
+        "applied. Empty body is a no-op. On success returns the "
+        "refreshed `CurrentUser` so the FE can update its store "
+        "without a second `GET /auth/me` round trip."
+    ),
+)
+async def update_profile_endpoint(
+    payload: UpdateProfileRequest,
+    request: Request,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> MeResponse:
+    user = await auth_service.update_profile(
+        session,
+        user_id=ctx.user_id,
+        payload=payload,
+    )
+    await session.commit()
+    # Best-effort audit log — UPDATE on USER entity. We don't need to
+    # capture the full diff (that's what the auth_events table is for
+    # on the identity side); just record that the caller touched
+    # their profile.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=user.agency_id,  # may be None for SUPER_ADMIN — handler tolerates
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="USER",
+            entity_id=user.id,
+            new_data={
+                "fields": sorted(payload.model_fields_set),
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return MeResponse(user=user)
 
 

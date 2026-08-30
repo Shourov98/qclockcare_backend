@@ -427,6 +427,108 @@ async def list_visits(
 
 
 # --------------------------------------------------------------------------
+# Visit history (completed-only, per-role views)
+# --------------------------------------------------------------------------
+async def list_visit_history(
+    session: AsyncSession,
+    *,
+    agency_id: uuid.UUID,
+    patient_id: uuid.UUID | None = None,
+    staff_id: uuid.UUID | None = None,
+    page: int = 1,
+    page_size: int = 20,
+) -> tuple[Sequence[Visit], int]:
+    """Patient / staff / guardian visit history.
+
+    Returns only visits in `COMPLETED` status, ordered by
+    `appointment.scheduled_start DESC` (most recent visit first — that
+    matches what a patient opens their dashboard to read).
+
+    Exactly one of `patient_id` or `staff_id` must be provided. The
+    guardian view is composed on top of the patient view by the
+    router (a guardian can see visits for any patient they're linked
+    to — the router fetches the linked patient ids first and calls
+    this function once per patient, then merges).
+
+    The `with_items` chain is eager-loaded so the response is the
+    full `VisitResponse` shape — signature, EVV, activities, notes —
+    matching what the Visit Summary screen already renders. The FE
+    gets a single round trip per history page.
+
+    Pagination mirrors `list_visits` (max page_size 100, 1-indexed).
+    """
+    if (patient_id is None) == (staff_id is None):
+        raise ValidationError(
+            "Provide exactly one of patient_id or staff_id.",
+            details={"field": "patient_id/staff_id"},
+        )
+
+    page = max(1, page)
+    page_size = max(1, min(100, page_size))
+
+    # Status filter is hard-coded to COMPLETED — that's the only thing
+    # that counts as "history". Cancelled / missed / rejected visits
+    # show on the calendar, not here.
+    base = (
+        select(Visit)
+        .where(
+            Visit.agency_id == agency_id,
+            Visit.status == VisitStatus.COMPLETED,
+        )
+        .options(
+            selectinload(Visit.staff).selectinload(StaffProfile.user),
+            selectinload(Visit.evv_record),
+            selectinload(Visit.signature),
+            selectinload(Visit.activity_deliveries).selectinload(
+                VisitActivityDelivery.activity
+            ),
+            selectinload(Visit.notes),
+        )
+    )
+    count_base = (
+        select(func.count())
+        .select_from(Visit)
+        .where(
+            Visit.agency_id == agency_id,
+            Visit.status == VisitStatus.COMPLETED,
+        )
+    )
+    if patient_id is not None:
+        base = base.join(
+            Appointment, Appointment.id == Visit.appointment_id
+        ).where(Appointment.patient_id == patient_id)
+        count_base = count_base.join(
+            Appointment, Appointment.id == Visit.appointment_id
+        ).where(Appointment.patient_id == patient_id)
+    else:
+        # staff_id is guaranteed set by the validation above.
+        base = base.where(Visit.staff_id == staff_id)
+        count_base = count_base.where(Visit.staff_id == staff_id)
+
+    # Order by the parent appointment's scheduled_start DESC. We must
+    # `join(Appointment, ...)` for the patient branch (it's already
+    # there for the WHERE clause) and explicitly here for the staff
+    # branch (the staff branch didn't join Appointment). `outerjoin`
+    # keeps the staff query null-safe; in practice every COMPLETED
+    # visit has an appointment so this is belt + suspenders.
+    if staff_id is not None:
+        base = base.outerjoin(
+            Appointment, Appointment.id == Visit.appointment_id
+        )
+        count_base = count_base.outerjoin(
+            Appointment, Appointment.id == Visit.appointment_id
+        )
+    base = (
+        base.order_by(Appointment.scheduled_start.desc(), Visit.id.desc())
+        .limit(page_size)
+        .offset((page - 1) * page_size)
+    )
+    rows = (await session.execute(base)).scalars().all()
+    total = (await session.execute(count_base)).scalar_one()
+    return rows, int(total)
+
+
+# --------------------------------------------------------------------------
 # State transitions — the gateful ones
 # --------------------------------------------------------------------------
 async def _assert_can_request_signature(visit: Visit) -> None:
@@ -1006,6 +1108,7 @@ __all__ = [
     "get_visit",
     "get_or_create_signature_placeholder",
     "list_visit_activities",
+    "list_visit_history",
     "list_visit_notes",
     "list_visits",
     "record_location_ping",

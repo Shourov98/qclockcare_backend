@@ -388,6 +388,57 @@ async def get_staff_with_details_endpoint(
     return _to_response(staff, with_details=True)
 
 
+@router.get(
+    "/{staff_id}/visits/history",
+    response_model=dict,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Staff visit history (COMPLETED visits, most recent first)",
+    description=(
+        "Returns the staff member's completed visits at the caller's "
+        "agency, ordered by `scheduled_start DESC` (most recent "
+        "first). Each item is a full `VisitResponse` (the same shape "
+        "as `/visits/{id}/with-items`) so the FE can render the visit "
+        "summary card without a second round trip.\n\n"
+        "Auth: the staff member themselves (`ctx.user_id == staff.user_id`) "
+        "or `AGENCY_ADMIN` at the staff's agency. Other roles get "
+        "`CROSS_AGENCY_ACCESS_DENIED`.\n\n"
+        "Pagination: `page` (1-indexed, default 1), `page_size` "
+        "(1-100, default 20)."
+    ),
+)
+async def list_staff_visit_history_endpoint(
+    staff_id: uuid.UUID,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+    page: int = Query(default=1, ge=1, le=10000),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> dict:
+    from src.modules.visits import service as visits_service
+    from src.modules.visits.schemas import VisitResponse
+
+    agency_id = _require_agency(ctx)
+    # Fetch the staff first so we can run the auth check (which needs
+    # the staff.user_id) and also 404-guard.
+    staff = await staff_service.get_staff(
+        session, staff_id=staff_id, agency_id=agency_id
+    )
+    _ensure_can_view(ctx, staff.user_id)
+
+    rows, total = await visits_service.list_visit_history(
+        session,
+        agency_id=agency_id,
+        staff_id=staff_id,
+        page=page,
+        page_size=page_size,
+    )
+    return build_offset_response(
+        [VisitResponse.model_validate(v, from_attributes=True) for v in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
 @router.patch(
     "/{staff_id}",
     response_model=StaffProfileResponse,
