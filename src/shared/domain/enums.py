@@ -214,6 +214,8 @@ class NotificationType(StrEnum):
     BILLING_CONFIRMED = "BILLING_CONFIRMED"
     STAFF_INVITATION = "STAFF_INVITATION"
     PASSWORD_RESET = "PASSWORD_RESET"
+    SUPPORT_TICKET_OPENED = "SUPPORT_TICKET_OPENED"
+    SUPPORT_TICKET_REPLIED = "SUPPORT_TICKET_REPLIED"
     GENERIC = "GENERIC"
 
 
@@ -244,6 +246,9 @@ class AuditAction(StrEnum):
     BILLING_CONFIRMED = "BILLING_CONFIRMED"
     ACTIVITY_MARKED_DONE = "ACTIVITY_MARKED_DONE"
     ACTIVITY_MARKED_NOT_DONE = "ACTIVITY_MARKED_NOT_DONE"
+    SUPPORT_TICKET_OPENED = "SUPPORT_TICKET_OPENED"
+    SUPPORT_TICKET_REPLIED = "SUPPORT_TICKET_REPLIED"
+    SUPPORT_TICKET_STATUS_CHANGED = "SUPPORT_TICKET_STATUS_CHANGED"
 
 
 # --------------------------------------------------------------------------
@@ -409,6 +414,49 @@ class QualificationStatus(StrEnum):
     REVOKED = "REVOKED"
 
 
+# --------------------------------------------------------------------------
+# Patient / Guardian → AGENCY_ADMIN support tickets (`/portal/support` +
+# `/agency/support` surfaces). Distinct from the internal admin
+# `TicketStatus` enum used by `/admin/tickets` — the public surface
+# has only four states and uses different transitions.
+# --------------------------------------------------------------------------
+class SupportTicketStatus(StrEnum):
+    """Lifecycle of a help/support ticket opened by a patient or guardian.
+
+    OPEN            — new, AGENCY_ADMIN has not replied yet.
+    AWAITING_REPLY  — patient/guardian replied, AGENCY_ADMIN owes a response.
+    RESOLVED        — AGENCY_ADMIN marked the issue fixed (sets `resolved_at`).
+    CLOSED          — terminal state; thread is read-only (sets `closed_at`).
+    """
+
+    OPEN = "OPEN"
+    AWAITING_REPLY = "AWAITING_REPLY"
+    RESOLVED = "RESOLVED"
+    CLOSED = "CLOSED"
+
+
+class SupportTicketPriority(StrEnum):
+    """How urgent the issue is. Drives inbox sorting + colour-coding."""
+
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    URGENT = "URGENT"
+
+
+class SupportTicketAuthorKind(StrEnum):
+    """Which side wrote a given message (or opened the ticket).
+
+    PATIENT       — patient themselves.
+    GUARDIAN      — a legal guardian of the patient.
+    AGENCY_ADMIN  — an admin at the agency answering the ticket.
+    """
+
+    PATIENT = "PATIENT"
+    GUARDIAN = "GUARDIAN"
+    AGENCY_ADMIN = "AGENCY_ADMIN"
+
+
 __all__ = [
     "APPOINTMENT_ACTIVE_STATUSES",
     "AgencyStatus",
@@ -427,6 +475,9 @@ __all__ = [
     "RelationshipType",
     "ServiceItemStatus",
     "ServiceType",
+    "SupportTicketAuthorKind",
+    "SupportTicketPriority",
+    "SupportTicketStatus",
     "TicketCommentKind",
     "TicketPriority",
     "TicketStatus",

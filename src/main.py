@@ -81,6 +81,8 @@ from src.modules.staff.models import (  # noqa: F401
     StaffQualification,
 )
 from src.modules.staff.router import router as staff_router
+from src.modules.support.models import SupportTicket, SupportTicketMessage  # noqa: F401
+from src.modules.support.router import router as support_router
 from src.modules.tickets.models import Ticket, TicketComment  # noqa: F401
 from src.modules.tickets.router import router as tickets_router
 from src.modules.visits.models import (  # noqa: F401
@@ -427,6 +429,13 @@ def create_app() -> FastAPI:
     # Guarded by `require_scope(SUPPORT)` so SUPER_ADMIN and PLATFORM_ADMIN
     # with SUPPORT scope can both access.
     app.include_router(tickets_router)
+
+    # Support — patient / guardian ↔ AGENCY_ADMIN help-desk. Distinct
+    # from `tickets/`: this is the public surface the patient portal
+    # hits, scoped to one agency. Two URL groups:
+    #   `/portal/support/tickets` — PATIENT / GUARDIAN
+    #   `/agency/support/tickets` — AGENCY_ADMIN inbox + replies
+    app.include_router(support_router)
 
     # Compliance — agency documents + expiring licenses.
     # Guarded by `require_scope(AGENCIES)` so admins who can manage
