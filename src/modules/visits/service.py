@@ -39,6 +39,7 @@ from src.core.exceptions import (
     NotFoundError,
     ValidationError,
 )
+from src.core.logging import get_logger
 from src.modules.appointments import service as appointments_service
 from src.modules.appointments.models import Appointment, AppointmentActivity
 from src.modules.staff.models import StaffProfile
@@ -64,6 +65,8 @@ from src.shared.domain.enums import (
     VisitStatus,
 )
 from src.shared.utils.datetime_utils import utc_now
+
+logger = get_logger(__name__)
 
 
 # --------------------------------------------------------------------------
@@ -552,6 +555,37 @@ async def transition_visit_status(
             appointment_id=visit.appointment_id,
             new_status=target_appt_status,
         )
+
+    # Mirror the per-visit activity delivery states onto the parent
+    # appointment's activity rows so the FE's Visit Summary (which
+    # reads activities from `GET /appointments/{id}/with-items`)
+    # reflects the actual delivery state. We only do this at the
+    # `IN_PROGRESS → AWAITING_SIGNATURE` transition because that's the
+    # only point where every delivery is *guaranteed* to be in a
+    # terminal state — the `_assert_can_request_signature` gate runs
+    # just above and rejects any visit with a `PENDING` delivery.
+    # Mirroring earlier (e.g. while the visit is still IN_PROGRESS)
+    # would publish incomplete data; mirroring later (after
+    # COMPLETED) wouldn't help — the FE doesn't show the activities
+    # card on COMPLETED appointments.
+    if (
+        target_appt_status == AppointmentStatus.AWAITING_SIGNATURE
+        and payload.status == VisitStatus.AWAITING_SIGNATURE
+    ):
+        mirrored = await appointments_service.sync_appointment_activities_from_visit(
+            session,
+            appointment_id=visit.appointment_id,
+            visit_id=visit.id,
+        )
+        # Debug-only counter — useful for the dev overlay / audit log
+        # to spot the case where the gate let through a visit with
+        # zero activities (shouldn't happen, but cheap to surface).
+        if mirrored == 0:
+            logger.info(
+                "visit.activity_mirror_empty",
+                visit_id=str(visit.id),
+                appointment_id=str(visit.appointment_id),
+            )
     return visit
 
 

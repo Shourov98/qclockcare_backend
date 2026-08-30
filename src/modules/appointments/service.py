@@ -23,7 +23,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import date, datetime, time, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -54,6 +54,10 @@ from src.modules.patients.models import (
     PatientProfile,
 )
 from src.modules.staff.models import StaffProfile, StaffQualification
+# Imported for the activity-status mirror helper. Safe at runtime —
+# visits/models.py only imports model classes from this package, not
+# any service module, so there's no circular import.
+from src.modules.visits.models import Visit, VisitActivityDelivery
 from src.shared.domain.enums import (
     AppointmentStatus,
     ServiceItemStatus,
@@ -135,6 +139,7 @@ async def _get_appointment_or_404(
     agency_id: uuid.UUID,
     with_activities: bool = False,
     with_patient: bool = False,
+    with_signature: bool = False,
 ) -> Appointment:
     stmt = select(Appointment).where(
         Appointment.id == appointment_id,
@@ -144,6 +149,15 @@ async def _get_appointment_or_404(
         stmt = stmt.options(selectinload(Appointment.activities))
     if with_patient:
         stmt = stmt.options(selectinload(Appointment.patient))
+    if with_signature:
+        # Chain `Appointment → Visit → AppointmentSignature`. Both
+        # relationships are 1:1 (`uselist=False`), so a single
+        # `joinedload` would also work, but `selectinload` keeps the
+        # loading style consistent with `activities` / `patient` above
+        # and avoids a wide row on the hot read path.
+        stmt = stmt.options(
+            selectinload(Appointment.visit).selectinload(Visit.signature),
+        )
     appt = (await session.execute(stmt)).scalar_one_or_none()
     if appt is None:
         raise NotFoundError(
@@ -373,6 +387,7 @@ async def get_appointment(
     agency_id: uuid.UUID,
     with_activities: bool = False,
     with_patient: bool = False,
+    with_signature: bool = False,
 ) -> Appointment:
     return await _get_appointment_or_404(
         session,
@@ -380,6 +395,7 @@ async def get_appointment(
         agency_id=agency_id,
         with_activities=with_activities,
         with_patient=with_patient,
+        with_signature=with_signature,
     )
 
 
@@ -791,6 +807,81 @@ async def sync_appointment_status_from_visit(
         return  # appointment doesn't follow the same path; skip silently
     appt.status = new_status
     await session.flush()
+
+
+async def sync_appointment_activities_from_visit(
+    session: AsyncSession,
+    *,
+    appointment_id: uuid.UUID,
+    visit_id: uuid.UUID,
+) -> int:
+    """Mirror per-visit activity delivery states onto the parent
+    AppointmentActivity rows.
+
+    Why this exists
+    ---------------
+    The FE's Visit Summary screen reads `activities` from
+    `GET /appointments/{id}/with-items`, which returns
+    `AppointmentActivity` rows. Those rows have their own `status`
+    column that is **never** updated by the visit flow — the actual
+    delivery state lives on `VisitActivityDelivery`. So the FE used
+    to show all activities as `PENDING` even after the caregiver
+    ticked every one done and the visit flipped to
+    `AWAITING_SIGNATURE`. The state machine gate
+    (`_assert_can_request_signature`) prevented the caregiver from
+    submitting a real "all pending" visit, but the UI was lying
+    about it.
+
+    Called once at the `IN_PROGRESS → AWAITING_SIGNATURE` transition,
+    which is the moment the visit-side deliveries are guaranteed to
+    be in a terminal state (the gate rejects any visit with a
+    `PENDING` delivery). One bulk UPDATE covers every activity on
+    the appointment in a single round trip.
+
+    Returns the number of rows updated — useful for audit logs and
+    for tests.
+
+    RLS: invoked from the visits service which already opened the
+    session under the caller's RLS context. No agency_id re-assert.
+    """
+    # Fetch the deliveries for this visit, keyed by parent activity
+    # id. Eager-load is unnecessary — we're only reading `status`.
+    stmt = select(
+        VisitActivityDelivery.activity_id,
+        VisitActivityDelivery.status,
+    ).where(VisitActivityDelivery.visit_id == visit_id)
+    rows = (await session.execute(stmt)).all()
+    if not rows:
+        return 0
+
+    # Group by activity_id for the bulk UPDATE — defensively, in case
+    # the same activity somehow appears twice (it shouldn't: the
+    # delivery rows are seeded 1:1 from the appointment's activities
+    # at visit creation, with a unique constraint on visit_id +
+    # activity_id).
+    by_activity: dict[uuid.UUID, ServiceItemStatus] = {}
+    for activity_id, status in rows:
+        by_activity[activity_id] = status
+
+    # Bulk UPDATE — one round trip for N activities. Filter the
+    # target rows by `appointment_id` (defence-in-depth: a
+    # cross-agency bug elsewhere could otherwise leak activity ids).
+    activity_ids = list(by_activity.keys())
+    update_stmt = (
+        update(AppointmentActivity)
+        .where(
+            AppointmentActivity.appointment_id == appointment_id,
+            AppointmentActivity.id.in_(activity_ids),
+        )
+        .values(status=case(
+            {sid: status for sid, status in by_activity.items()},
+            value=AppointmentActivity.id,
+        ))
+        .execution_options(synchronize_session=False)
+    )
+    result = await session.execute(update_stmt)
+    await session.flush()
+    return result.rowcount or 0
 
 
 async def assign_staff(

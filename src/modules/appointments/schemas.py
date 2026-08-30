@@ -19,6 +19,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from src.modules.visits.schemas import AppointmentSignatureResponse
 from src.shared.domain.enums import (
     AppointmentStatus,
     ProgramType,
@@ -111,6 +112,11 @@ class AppointmentResponse(BaseModel):
     updated_at: datetime
     # Optional nested — populated only by GET /appointments/{id}/with-items
     activities: list[AppointmentActivityResponse] | None = None
+    # Patient-or-guardian signature captured at the visit level. The
+    # 1:1 chain is `appointment → visit → signature`, so this is `null`
+    # until the caregiver starts the visit. Populated alongside
+    # `activities` on the with-items endpoint.
+    signature: AppointmentSignatureResponse | None = None
 
 
 class AppointmentSummaryResponse(BaseModel):

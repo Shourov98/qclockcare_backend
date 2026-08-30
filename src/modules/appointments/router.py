@@ -134,8 +134,24 @@ def _to_response(
             data["activities"] = list(appt.activities)
         except Exception:
             data["activities"] = None
+        # Signature lives on `appointment.visit.signature` — only
+        # available when the visit exists AND was signed. We guard
+        # each attribute separately because (a) the visit may exist
+        # but have no signature yet (in-flight), and (b) the
+        # relationship is lazy unless explicitly eager-loaded — and
+        # `get_appointment_with_items_endpoint` does load it. For
+        # other callers of `_to_response(..., with_items=True)` the
+        # visit object won't have `signature` populated and we'd hit
+        # `None` here.
+        try:
+            data["signature"] = (
+                appt.visit.signature if appt.visit is not None else None
+            )
+        except Exception:
+            data["signature"] = None
     else:
         data["activities"] = None
+        data["signature"] = None
     return AppointmentResponse.model_validate(data)
 
 
@@ -307,7 +323,8 @@ async def get_appointment_with_items_endpoint(
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> AppointmentResponse:
-    """Fetch a single appointment eagerly loaded with its activities."""
+    """Fetch a single appointment eagerly loaded with its activities
+    and the patient-or-guardian signature from the visit (if signed)."""
     agency_id = _require_agency(ctx)
     appt = await appointments_service.get_appointment(
         session,
@@ -315,6 +332,7 @@ async def get_appointment_with_items_endpoint(
         agency_id=agency_id,
         with_activities=True,
         with_patient=True,
+        with_signature=True,
     )
     _ensure_can_view(ctx, appt.patient.user_id)
     return _to_response(appt, with_items=True)
