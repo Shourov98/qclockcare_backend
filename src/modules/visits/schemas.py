@@ -21,12 +21,27 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, StringConstraints, model_validator
 
 from src.shared.domain.enums import ServiceItemStatus, UserRole, VisitStatus
+
+# The patient-facing ComplianceCard widget (farhan-salad-website
+# `components/scheduling/visit-details/ComplianceCard.tsx`) consumes a
+# strict union of pill states. Mirrored here so the FE doesn't need to
+# re-map the wire shape.
+ComplianceStatusKind = Literal[
+    "captured",
+    "submitted",
+    "signed",
+    "ready",
+    "pending",
+    "verified",
+    "needs_correction",
+    "unavailable",
+]
 
 
 # --------------------------------------------------------------------------
@@ -379,18 +394,59 @@ class AppointmentSignatureResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Visit compliance rollup
+# --------------------------------------------------------------------------
+class VisitComplianceRow(BaseModel):
+    """One row of the `ComplianceCard` widget.
+
+    Mirrors the FE `ComplianceStatusKind` union exactly so the widget
+    can render without remapping.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: Literal["evv", "notes", "signature", "clean_claim", "billing"]
+    label: str  # "EVV Record", "Visit Notes", …
+    status: "ComplianceStatusKind"
+    label_override: str | None = None  # e.g. "Pending submission" on billing
+    captured_at: datetime | None = None  # used for trailing timestamp
+
+
+class VisitComplianceResponse(BaseModel):
+    """Computed-on-read 5-row rollup powering `ComplianceCard`.
+
+    All four checks run inside a single `selectinload` query so this
+    endpoint is one round-trip. Status mapping lives in
+    `visits.service.compute_visit_compliance`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    visit_id: UUID
+    appointment_id: UUID
+    agency_id: UUID
+    status: VisitStatus  # mirror the underlying visit status for FE gating
+    rows: list[VisitComplianceRow]
+    generated_at: datetime
+
+
+# --------------------------------------------------------------------------
 # Forward refs
 # --------------------------------------------------------------------------
 VisitResponse.model_rebuild()
 AppointmentSignatureResponse.model_rebuild()
 EVVRecordResponse.model_rebuild()
+VisitComplianceResponse.model_rebuild()
 
 
 __all__ = [
     "AppointmentSignatureResponse",
+    "ComplianceStatusKind",
     "EVVRecordResponse",
     "VisitActivityDeliveryResponse",
     "VisitActivityUpdateRequest",
+    "VisitComplianceResponse",
+    "VisitComplianceRow",
     "VisitConfirmBillingRequest",
     "VisitCreateRequest",
     "VisitEndRequest",

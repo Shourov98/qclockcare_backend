@@ -1,4 +1,4 @@
-"""Patient/Guardian portal router — `/portal/visits/...` endpoints.
+"""Patient/Guardian portal router — `/portal/visits/...` + `/portal/compliance`.
 
 All routes require authentication with role PATIENT or GUARDIAN.
 Cross-agency / unlinked visits return 404 (not 403) to avoid leaking
@@ -26,6 +26,7 @@ from src.modules.identity.dependencies import (
 )
 from src.modules.portal import service as portal_service
 from src.modules.portal.schemas import (
+    PortalComplianceResponse,
     PortalVisitListItem,
     PortalVisitResponse,
 )
@@ -36,7 +37,12 @@ from src.shared.utils.labels import (
     visit_date_label,
 )
 
-router = APIRouter(prefix="/portal/visits", tags=["portal"])
+# Split into two routers so the FE can hit `/portal/compliance` without
+# pulling visit-related OpenAPI tags. Both routers live under the
+# `/portal` mount in `main.py`.
+visits_router = APIRouter(prefix="/portal/visits", tags=["portal"])
+compliance_router = APIRouter(prefix="/portal", tags=["portal-compliance"])
+
 log = get_logger(__name__)
 
 
@@ -126,7 +132,7 @@ def _to_response(visit, *, with_relations: bool = False) -> PortalVisitResponse:
     return PortalVisitResponse.model_validate(data)
 
 
-@router.get("", response_model=list[PortalVisitListItem])
+@visits_router.get("", response_model=list[PortalVisitListItem])
 async def list_my_visits_endpoint(
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
@@ -167,7 +173,7 @@ async def list_my_visits_endpoint(
     return out
 
 
-@router.get("/{visit_id}", response_model=PortalVisitResponse)
+@visits_router.get("/{visit_id}", response_model=PortalVisitResponse)
 async def get_my_visit_endpoint(
     visit_id: uuid.UUID,
     ctx: CurrentAuth,
@@ -186,4 +192,26 @@ async def get_my_visit_endpoint(
     return _to_response(visit, with_relations=True)
 
 
-__all__ = ["router"]
+# --------------------------------------------------------------------------
+# Compliance dashboard (`/portal/compliance`)
+# --------------------------------------------------------------------------
+@compliance_router.get(
+    "/compliance",
+    response_model=PortalComplianceResponse,
+)
+async def get_portal_compliance_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> PortalComplianceResponse:
+    """Compliance dashboard rollup for the calling patient/guardian.
+
+    Computed on read from live counts on `agency_documents`,
+    `agency_licenses`, and `compliance_issues`. Powers the
+    `farhan-salad-website/app/(dashboard)/compliance/page.tsx` hub.
+    Auth: PATIENT or GUARDIAN (the service layer enforces the
+    same 404-if-not-linked pattern as `/portal/visits`).
+    """
+    return await portal_service.get_portal_compliance(session, ctx=ctx)
+
+
+__all__ = ["visits_router", "compliance_router"]

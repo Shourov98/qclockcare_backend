@@ -36,6 +36,7 @@ from src.core.middleware import RequestContextMiddleware
 from src.modules.agencies.models import Agency as _Agency  # noqa: F401
 from src.modules.agencies.router import router as agencies_router
 from src.modules.compliance.models import AgencyDocument, AgencyLicense  # noqa: F401
+from src.modules.compliance.issues import ComplianceIssue  # noqa: F401
 from src.modules.compliance.router import router as compliance_router
 from src.modules.appointments.models import (  # noqa: F401
     Appointment,
@@ -72,7 +73,10 @@ from src.modules.patients.models import (  # noqa: F401
     PatientProfile,
 )
 from src.modules.patients.router import router as patients_router
-from src.modules.portal.router import router as portal_router
+from src.modules.portal.router import (
+    compliance_router as portal_compliance_router,
+)
+from src.modules.portal.router import visits_router as portal_router
 from src.modules.reports.models import ReportRun  # noqa: F401
 from src.modules.reports.router import router as reports_router
 from src.modules.staff.models import (  # noqa: F401
@@ -399,8 +403,9 @@ def create_app() -> FastAPI:
     # Visits + service items + verification + issues.
     app.include_router(visits_router)
 
-    # Patient/Guardian portal — verify/dispute/report-issue surface.
+    # Patient/Guardian portal — visit history + compliance dashboard.
     app.include_router(portal_router)
+    app.include_router(portal_compliance_router)
 
     # Notifications — recipient-facing list/read endpoints.
     app.include_router(notifications_router)

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
@@ -96,7 +97,81 @@ class PortalVisitListItem(BaseModel):
     created_at: datetime
 
 
+# --------------------------------------------------------------------------
+# Compliance dashboard (`GET /portal/compliance`)
+# --------------------------------------------------------------------------
+class PortalComplianceSubScore(BaseModel):
+    """One row of the dashboard donut — Documentation / Staff Training /
+    Service Auth. `color` mirrors the FE tailwind token directly so the
+    widget can render without a remap."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: Literal["documentation", "staff_training", "service_auth"]
+    label: str
+    percent: int  # 0-100
+    color: Literal["green", "orange", "red"]
+
+
+class PortalComplianceUrgentAction(BaseModel):
+    """One card in the `Urgent Actions` widget."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    title: str
+    description: str | None = None
+    due_label: str  # human-readable ("2 days", "Overdue by 1 day")
+    severity: Literal["critical", "high", "medium", "low"]
+
+
+class PortalComplianceUpcomingAudit(BaseModel):
+    """One card in the `Upcoming Audits` widget."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    title: str
+    scheduled_for: datetime
+    kind: Literal["document", "license", "issue"]
+
+
+class PortalComplianceRecentActivity(BaseModel):
+    """One row of the `Recent Activity` widget."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    actor_label: str
+    description: str
+    occurred_at: datetime
+
+
+class PortalComplianceResponse(BaseModel):
+    """Aggregate compliance dashboard payload for the patient/guardian.
+
+    Mirrors the `/compliance` hub page in
+    `farhan-salad-website/app/(dashboard)/compliance/page.tsx`. The score
+    is computed on read from live counts (documents, licenses, issues)
+    so the FE never sees stale aggregates.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    overall_percent: int
+    sub_scores: list[PortalComplianceSubScore]
+    urgent_actions: list[PortalComplianceUrgentAction]
+    upcoming_audits: list[PortalComplianceUpcomingAudit]
+    recent_activity: list[PortalComplianceRecentActivity]
+    generated_at: datetime
+
+
 __all__ = [
+    "PortalComplianceResponse",
+    "PortalComplianceRecentActivity",
+    "PortalComplianceSubScore",
+    "PortalComplianceUpcomingAudit",
+    "PortalComplianceUrgentAction",
     "PortalVisitListItem",
     "PortalVisitResponse",
 ]

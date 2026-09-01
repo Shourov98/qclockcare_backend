@@ -1100,12 +1100,113 @@ async def sign_visit(
     return sig
 
 
+# --------------------------------------------------------------------------
+# Compliance rollup — computed-on-read for `GET /visits/{id}/compliance`
+# --------------------------------------------------------------------------
+async def get_visit_compliance(
+    session: AsyncSession,
+    *,
+    visit_id: uuid.UUID,
+    agency_id: uuid.UUID,
+) -> "VisitComplianceResponse":
+    """Build the 5-row compliance rollup powering `ComplianceCard`.
+
+    All four checks (EVV start, ≥1 note, signature, billing-confirmed)
+    run against one eager-loaded visit. RLS handles cross-tenant
+    visibility — if the visit doesn't belong to the caller's agency
+    `_get_visit_or_404` raises `NotFoundError` (not 403) so we don't
+    leak existence.
+    """
+    from src.modules.visits.schemas import (
+        VisitComplianceResponse,
+        VisitComplianceRow,
+    )
+
+    visit = await _get_visit_or_404(
+        session,
+        visit_id=visit_id,
+        agency_id=agency_id,
+        with_relations=True,
+        with_staff=False,
+    )
+
+    # EVV row — `unavailable` until the caregiver POSTed `/visits`.
+    evv = visit.evv_record
+    evv_row = VisitComplianceRow(
+        key="evv",
+        label="EVV Record",
+        status="captured" if (evv is not None and evv.start_time) else "unavailable",
+        captured_at=(evv.start_time if evv is not None else None),
+    )
+
+    # Visit notes — `submitted` once any note exists.
+    has_note = bool(visit.notes)
+    notes_row = VisitComplianceRow(
+        key="notes",
+        label="Visit Notes",
+        status="submitted" if has_note else "unavailable",
+        captured_at=visit.notes[0].created_at if has_note else None,
+    )
+
+    # Signature — `signed` once the row exists, otherwise `pending`.
+    sig = visit.signature
+    sig_row = VisitComplianceRow(
+        key="signature",
+        label="Client Signature",
+        status="signed" if sig is not None else "pending",
+        captured_at=(sig.signed_at if sig is not None else None),
+    )
+
+    # Clean claim — `verified` only when both billing-confirmed AND
+    # signature are present; `pending` if billing is confirmed but the
+    # signature is still missing; otherwise `unavailable`.
+    billing_set = visit.billing_confirmed_at is not None
+    if billing_set and sig is not None:
+        clean_claim_status = "verified"
+    elif billing_set:
+        clean_claim_status = "pending"
+    else:
+        clean_claim_status = "unavailable"
+    clean_claim_row = VisitComplianceRow(
+        key="clean_claim",
+        label="Clean Claim",
+        status=clean_claim_status,
+        captured_at=visit.billing_confirmed_at,
+    )
+
+    # Billing — `ready` once confirmed, `pending` otherwise. The FE
+    # renders `"Pending submission"` as the trailing label while pending.
+    billing_row = VisitComplianceRow(
+        key="billing",
+        label="Billing Status",
+        status="ready" if billing_set else "pending",
+        label_override=(None if billing_set else "Pending submission"),
+        captured_at=visit.billing_confirmed_at,
+    )
+
+    return VisitComplianceResponse(
+        visit_id=visit.id,
+        appointment_id=visit.appointment_id,
+        agency_id=visit.agency_id,
+        status=visit.status,
+        rows=[
+            evv_row,
+            notes_row,
+            sig_row,
+            clean_claim_row,
+            billing_row,
+        ],
+        generated_at=utc_now(),
+    )
+
+
 __all__ = [
     "add_visit_note",
     "confirm_billing",
     "create_visit",
     "end_visit",
     "get_visit",
+    "get_visit_compliance",
     "get_or_create_signature_placeholder",
     "list_visit_activities",
     "list_visit_history",

@@ -249,6 +249,10 @@ class AuditAction(StrEnum):
     SUPPORT_TICKET_OPENED = "SUPPORT_TICKET_OPENED"
     SUPPORT_TICKET_REPLIED = "SUPPORT_TICKET_REPLIED"
     SUPPORT_TICKET_STATUS_CHANGED = "SUPPORT_TICKET_STATUS_CHANGED"
+    COMPLIANCE_ISSUE_CREATED = "COMPLIANCE_ISSUE_CREATED"
+    COMPLIANCE_ISSUE_UPDATED = "COMPLIANCE_ISSUE_UPDATED"
+    COMPLIANCE_ISSUE_RESOLVED = "COMPLIANCE_ISSUE_RESOLVED"
+    COMPLIANCE_ISSUE_DISMISSED = "COMPLIANCE_ISSUE_DISMISSED"
 
 
 # --------------------------------------------------------------------------
@@ -457,12 +461,64 @@ class SupportTicketAuthorKind(StrEnum):
     AGENCY_ADMIN = "AGENCY_ADMIN"
 
 
+# --------------------------------------------------------------------------
+# Compliance issue queue (`/admin/compliance/issues`)
+# --------------------------------------------------------------------------
+class ComplianceIssueSeverity(StrEnum):
+    """How serious the issue is. Drives the FE colour-coded badge + sort.
+
+    Matches the values the admin FE renders today in
+    `ComplianceIssueQueueTable` (Critical / High / Medium / Low).
+    """
+
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+
+
+class ComplianceIssueStatus(StrEnum):
+    """Lifecycle of an issue in the admin queue.
+
+    OPEN            — newly filed; no work has started.
+    IN_PROGRESS     — assigned; being worked.
+    PENDING_REVIEW  — work submitted; awaiting admin review.
+    RESOLVED        — closed as fixed (stamps `resolved_at`).
+    DISMISSED       — closed without action (stamps `resolved_at` too).
+    """
+
+    OPEN = "OPEN"
+    IN_PROGRESS = "IN_PROGRESS"
+    PENDING_REVIEW = "PENDING_REVIEW"
+    RESOLVED = "RESOLVED"
+    DISMISSED = "DISMISSED"
+
+
+class ComplianceIssueCategory(StrEnum):
+    """What kind of compliance gap this issue represents.
+
+    Used to group counts in the admin dashboard + drive the FE category
+    badge in `ComplianceIssueQueueTable`. Service Authorizations is
+    in the enum for forward-compat — the table will be added later.
+    """
+
+    DOCUMENTATION = "DOCUMENTATION"
+    STAFF_CREDENTIAL = "STAFF_CREDENTIAL"
+    SAFETY = "SAFETY"
+    SERVICE_AUTH = "SERVICE_AUTH"
+    STAFF_TRAINING = "STAFF_TRAINING"
+    OTHER = "OTHER"
+
+
 __all__ = [
     "APPOINTMENT_ACTIVE_STATUSES",
     "AgencyStatus",
     "AppointmentStatus",
     "AuditAction",
     "AuthAuditEventType",
+    "ComplianceIssueCategory",
+    "ComplianceIssueSeverity",
+    "ComplianceIssueStatus",
     "DocumentStatus",
     "DocumentType",
     "LicenseStatus",

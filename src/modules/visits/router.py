@@ -68,6 +68,7 @@ from src.modules.visits.schemas import (
     AppointmentSignatureResponse,
     VisitActivityDeliveryResponse,
     VisitActivityUpdateRequest,
+    VisitComplianceResponse,
     VisitConfirmBillingRequest,
     VisitCreateRequest,
     VisitEndRequest,
@@ -355,6 +356,37 @@ async def get_visit_with_items_endpoint(
     )
     _ensure_can_view_visit(ctx, visit.staff_id)
     return _to_response(visit, with_relations=True)
+
+
+@router.get(
+    "/{visit_id}/compliance",
+    response_model=VisitComplianceResponse,
+)
+async def get_visit_compliance_endpoint(
+    visit_id: uuid.UUID,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> VisitComplianceResponse:
+    """Computed-on-read 5-row compliance rollup for the visit.
+
+    Powers the `ComplianceCard` widget on the patient/guardian visit
+    detail page. All four checks (EVV / notes / signature / billing)
+    run in a single eager-loaded query.
+
+    Visible to AGENCY_ADMIN, STAFF, and PATIENT/GUARDIAN — RLS narrows
+    the latter two to visits they own. Unauthorised reads return 404
+    so existence isn't leaked.
+    """
+    agency_id = _require_agency(ctx)
+    # Visibility check first — patients/guardians only see visits they're
+    # linked to; staff + admin pass via the helper.
+    existing = await visits_service.get_visit(
+        session, visit_id=visit_id, agency_id=agency_id, with_relations=False
+    )
+    _ensure_can_view_visit(ctx, existing.staff_id)
+    return await visits_service.get_visit_compliance(
+        session, visit_id=visit_id, agency_id=agency_id
+    )
 
 
 @router.patch(

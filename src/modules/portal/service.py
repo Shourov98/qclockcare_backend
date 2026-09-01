@@ -20,22 +20,38 @@ visits router — the portal doesn't expose its own /sign endpoint.
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.core.exceptions import ForbiddenError, NotFoundError
+from src.modules.compliance.issues import ComplianceIssue
+from src.modules.compliance.models import AgencyDocument, AgencyLicense
 from src.modules.identity.dependencies import AuthContext
 from src.modules.patients.models import (
     GuardianProfile,
     PatientGuardianRelationship,
     PatientProfile,
 )
+from src.modules.portal.schemas import (
+    PortalComplianceRecentActivity,
+    PortalComplianceResponse,
+    PortalComplianceSubScore,
+    PortalComplianceUpcomingAudit,
+    PortalComplianceUrgentAction,
+)
 from src.modules.visits import service as visits_service
 from src.modules.visits.models import Visit
-from src.shared.domain.enums import UserRole
+from src.shared.domain.enums import (
+    ComplianceIssueSeverity,
+    ComplianceIssueStatus,
+    DocumentStatus,
+    LicenseStatus,
+    UserRole,
+)
+from src.shared.utils.datetime_utils import utc_now
 
 
 # --------------------------------------------------------------------------
@@ -311,7 +327,302 @@ async def list_my_visits(
     return all_rows[offset : offset + limit]
 
 
+# --------------------------------------------------------------------------
+# Compliance dashboard
+# --------------------------------------------------------------------------
+def _bucket_color(percent: int) -> str:
+    """Mirror the FE tailwind thresholds: green ≥ 90, orange 70-89, red < 70."""
+    if percent >= 90:
+        return "green"
+    if percent >= 70:
+        return "orange"
+    return "red"
+
+
+def _relative_due_label(due_at: datetime | None, *, now: datetime) -> str:
+    """Render the FE-friendly due label ("Overdue by 1 day", "2 days", …)."""
+    if due_at is None:
+        return "—"
+    if due_at < now:
+        days = (now - due_at).days
+        return f"Overdue by {days} day{'s' if days != 1 else ''}"
+    days = (due_at - now).days
+    if days == 0:
+        return "Today"
+    if days == 1:
+        return "1 day"
+    return f"{days} days"
+
+
+async def get_portal_compliance(
+    session: AsyncSession,
+    *,
+    ctx: AuthContext,
+) -> PortalComplianceResponse:
+    """Compute the compliance dashboard for the calling patient/guardian.
+
+    All counts come from live queries against `agency_documents`,
+    `agency_licenses`, and `compliance_issues` for the caller's agency.
+    RLS narrows PATIENT/GUARDIAN to the agency they're logged into; the
+    `_resolve_caller_to_patients` helper above is used to short-circuit
+    empty calls without an agency context.
+    """
+    if ctx.role not in {UserRole.PATIENT, UserRole.GUARDIAN}:
+        raise ForbiddenError(
+            "Portal endpoints are only available to PATIENT or GUARDIAN.",
+            details={"role": ctx.role.value},
+        )
+    # Mirror the other portal endpoints: 404 if the caller has no
+    # resolvable patient/guardian profile.
+    patient_ids = await _resolve_caller_to_patients(session, ctx=ctx)
+    if not patient_ids:
+        raise NotFoundError(
+            "No linked patient profile found.",
+            details={"reason": "no_profile"},
+        )
+    if ctx.agency_id is None:
+        raise NotFoundError(
+            "Caller has no agency context.",
+            details={"reason": "no_agency"},
+        )
+    agency_id = ctx.agency_id
+    now = utc_now()
+
+    # ----- Document counts (Documentation sub-score) -----
+    doc_total = (
+        await session.execute(
+            select(func.count())
+            .select_from(AgencyDocument)
+            .where(
+                AgencyDocument.agency_id == agency_id,
+                AgencyDocument.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one()
+    doc_valid_total = (
+        await session.execute(
+            select(func.count())
+            .select_from(AgencyDocument)
+            .where(
+                AgencyDocument.agency_id == agency_id,
+                AgencyDocument.deleted_at.is_(None),
+                AgencyDocument.status.in_(
+                    [DocumentStatus.VALID, DocumentStatus.EXPIRING]
+                ),
+            )
+        )
+    ).scalar_one()
+    documentation_pct = (
+        int(round((doc_valid_total / doc_total) * 100))
+        if doc_total > 0
+        else 100  # no docs required → trivially compliant
+    )
+
+    # ----- License counts (Staff Training sub-score) -----
+    lic_total = (
+        await session.execute(
+            select(func.count())
+            .select_from(AgencyLicense)
+            .where(
+                AgencyLicense.agency_id == agency_id,
+                AgencyLicense.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one()
+    lic_valid_total = (
+        await session.execute(
+            select(func.count())
+            .select_from(AgencyLicense)
+            .where(
+                AgencyLicense.agency_id == agency_id,
+                AgencyLicense.deleted_at.is_(None),
+                AgencyLicense.status.in_(
+                    [LicenseStatus.VALID, LicenseStatus.UPCOMING]
+                ),
+            )
+        )
+    ).scalar_one()
+    staff_training_pct = (
+        int(round((lic_valid_total / lic_total) * 100))
+        if lic_total > 0
+        else 100
+    )
+
+    # ----- Open issues count (Service Auth sub-score, placeholder) -----
+    open_issue_total = (
+        await session.execute(
+            select(func.count())
+            .select_from(ComplianceIssue)
+            .where(
+                ComplianceIssue.agency_id == agency_id,
+                ComplianceIssue.deleted_at.is_(None),
+                ComplianceIssue.status.notin_(
+                    [
+                        ComplianceIssueStatus.RESOLVED,
+                        ComplianceIssueStatus.DISMISSED,
+                    ]
+                ),
+            )
+        )
+    ).scalar_one()
+    # Inverted score — fewer open issues = higher percent. We treat the
+    # "service auth" surface as a placeholder until that table ships.
+    # Cap the impact at 20 open issues (so 0 → 100, 20+ → 0).
+    service_auth_pct = max(0, 100 - min(open_issue_total, 20) * 5)
+
+    overall_pct = int(
+        round(documentation_pct * 0.5 + staff_training_pct * 0.3 + service_auth_pct * 0.2)
+    )
+    overall_pct = max(0, min(100, overall_pct))
+
+    sub_scores = [
+        PortalComplianceSubScore(
+            key="documentation",
+            label="Documentation",
+            percent=documentation_pct,
+            color=_bucket_color(documentation_pct),
+        ),
+        PortalComplianceSubScore(
+            key="staff_training",
+            label="Staff Training",
+            percent=staff_training_pct,
+            color=_bucket_color(staff_training_pct),
+        ),
+        PortalComplianceSubScore(
+            key="service_auth",
+            label="Service Auth",
+            percent=service_auth_pct,
+            color=_bucket_color(service_auth_pct),
+        ),
+    ]
+
+    # ----- Urgent actions: top 5 critical/high unresolved issues -----
+    urgent_rows = (
+        await session.execute(
+            select(ComplianceIssue)
+            .where(
+                ComplianceIssue.agency_id == agency_id,
+                ComplianceIssue.deleted_at.is_(None),
+                ComplianceIssue.status.notin_(
+                    [
+                        ComplianceIssueStatus.RESOLVED,
+                        ComplianceIssueStatus.DISMISSED,
+                    ]
+                ),
+                ComplianceIssue.severity.in_(
+                    [
+                        ComplianceIssueSeverity.CRITICAL,
+                        ComplianceIssueSeverity.HIGH,
+                    ]
+                ),
+            )
+            .order_by(ComplianceIssue.due_at.asc().nulls_last(), ComplianceIssue.created_at.desc())
+            .limit(5)
+        )
+    ).scalars().all()
+    urgent_actions = [
+        PortalComplianceUrgentAction(
+            id=row.id,
+            title=row.title,
+            description=row.description,
+            due_label=_relative_due_label(row.due_at, now=now),
+            severity=row.severity.value.lower(),
+        )
+        for row in urgent_rows
+    ]
+
+    # ----- Upcoming audits: expiring documents + licenses in next 60d -----
+    upcoming_cutoff = now + timedelta(days=60)
+    upcoming_docs = (
+        await session.execute(
+            select(AgencyDocument)
+            .where(
+                AgencyDocument.agency_id == agency_id,
+                AgencyDocument.deleted_at.is_(None),
+                AgencyDocument.expires_at.is_not(None),
+                AgencyDocument.expires_at <= upcoming_cutoff,
+                AgencyDocument.expires_at >= now,
+            )
+            .order_by(AgencyDocument.expires_at.asc())
+            .limit(5)
+        )
+    ).scalars().all()
+    upcoming_audits = [
+        PortalComplianceUpcomingAudit(
+            id=d.id,
+            title=d.name,
+            scheduled_for=d.expires_at,
+            kind="document",
+        )
+        for d in upcoming_docs
+    ]
+    # Append expiring licenses too.
+    upcoming_lics = (
+        await session.execute(
+            select(AgencyLicense)
+            .where(
+                AgencyLicense.agency_id == agency_id,
+                AgencyLicense.deleted_at.is_(None),
+                AgencyLicense.expires_at <= upcoming_cutoff,
+                AgencyLicense.expires_at >= now,
+                AgencyLicense.status.in_(
+                    [LicenseStatus.WARNING, LicenseStatus.CRITICAL]
+                ),
+            )
+            .order_by(AgencyLicense.expires_at.asc())
+            .limit(5)
+        )
+    ).scalars().all()
+    upcoming_audits.extend(
+        PortalComplianceUpcomingAudit(
+            id=lic.id,
+            title=lic.name,
+            scheduled_for=lic.expires_at,
+            kind="license",
+        )
+        for lic in upcoming_lics
+    )
+    # Trim + sort by scheduled_for asc.
+    upcoming_audits.sort(key=lambda a: a.scheduled_for)
+    upcoming_audits = upcoming_audits[:5]
+
+    # ----- Recent activity: most recent 5 issues by created_at -----
+    recent_rows = (
+        await session.execute(
+            select(ComplianceIssue)
+            .where(
+                ComplianceIssue.agency_id == agency_id,
+                ComplianceIssue.deleted_at.is_(None),
+            )
+            .order_by(ComplianceIssue.created_at.desc())
+            .limit(5)
+        )
+    ).scalars().all()
+    recent_activity = [
+        PortalComplianceRecentActivity(
+            id=row.id,
+            actor_label=row.title,
+            description=(
+                f"Issue {row.status.value.lower()} · "
+                f"severity {row.severity.value.lower()}"
+            ),
+            occurred_at=row.created_at,
+        )
+        for row in recent_rows
+    ]
+
+    return PortalComplianceResponse(
+        overall_percent=overall_pct,
+        sub_scores=sub_scores,
+        urgent_actions=urgent_actions,
+        upcoming_audits=upcoming_audits,
+        recent_activity=recent_activity,
+        generated_at=now,
+    )
+
+
 __all__ = [
+    "get_portal_compliance",
     "list_my_visits",
     "load_visit_with_relations",
 ]
