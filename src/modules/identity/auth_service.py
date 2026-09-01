@@ -897,8 +897,12 @@ async def reset_password(
     new_password: str,
     ip_address: str | None = None,
     user_agent: str | None = None,
-) -> None:
-    """Validate reset token, set new password, revoke all refresh tokens."""
+) -> uuid.UUID:
+    """Validate reset token, set new password, revoke all refresh tokens.
+
+    Returns the affected user's id so the caller can write a
+    `audit_logs` row alongside.
+    """
     payload = jwt_service.verify_single_use_token(reset_token, expected_purpose="password_reset")
     row = (
         await session.execute(
@@ -946,6 +950,7 @@ async def reset_password(
         ip_address=ip_address,
         user_agent=user_agent,
     )
+    return user.id
 
 
 # --------------------------------------------------------------------------

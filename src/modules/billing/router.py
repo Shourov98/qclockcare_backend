@@ -22,6 +22,7 @@ from src.core.config import settings
 from src.core.database import get_session
 from src.core.exceptions import ServiceUnavailableError
 from src.core.logging import get_logger
+from src.modules.audit_logs import service as audit_logs_service
 from src.modules.billing import service as billing_service
 from src.modules.billing import webhook_service
 from src.modules.billing.schemas import (
@@ -38,6 +39,7 @@ from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
 )
+from src.shared.domain.enums import AuditAction
 from src.shared.schemas.docs import standard_responses
 
 log = get_logger(__name__)
@@ -88,6 +90,7 @@ async def post_checkout(
     agency_id: uuid.UUID,
     payload: CheckoutRequest,
     auth: CurrentAuth,
+    request: Request,
     session: AsyncSession = Depends(get_session_with_auth),
 ) -> CheckoutResponse:
     """Start a Stripe Checkout session for the chosen plan.
@@ -97,13 +100,31 @@ async def post_checkout(
     `/billing/webhook` on success.
     """
     _billing_enabled_or_503()
-    return await billing_service.start_checkout(
+    result = await billing_service.start_checkout(
         session,
         settings=settings,
         actor=auth,
         agency_id=agency_id,
         payload=payload,
     )
+    # Best-effort audit row.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=auth.user_id,
+            action=AuditAction.CREATE,
+            entity_type="BILLING_CHECKOUT",
+            entity_id=None,
+            new_data={"plan": payload.plan.value if hasattr(payload.plan, "value") else str(payload.plan)},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -126,17 +147,35 @@ async def post_checkout(
 async def post_portal_session(
     agency_id: uuid.UUID,
     auth: CurrentAuth,
+    request: Request,
     session: AsyncSession = Depends(get_session_with_auth),
 ) -> PortalSessionResponse:
     """Open the Stripe-hosted billing portal (manage payment method,
     view invoices, cancel)."""
     _billing_enabled_or_503()
-    return await billing_service.start_portal_session(
+    result = await billing_service.start_portal_session(
         session,
         settings=settings,
         actor=auth,
         agency_id=agency_id,
     )
+    # Best-effort audit row.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=auth.user_id,
+            action=AuditAction.CREATE,
+            entity_type="BILLING_PORTAL_SESSION",
+            entity_id=None,
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -191,6 +230,31 @@ async def post_webhook(
         duplicate=outcome.duplicate,
         note=outcome.note,
     )
+    # Best-effort audit row for every webhook event — both success and
+    # failure branches. The `error` metadata key is the trigger for the
+    # BILLING_WEBHOOK_FAIL anomaly detection rule.
+    try:
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=outcome.agency_id,
+            actor_user_id=None,
+            action=AuditAction.CREATE,
+            entity_type="STRIPE_WEBHOOK",
+            entity_id=None,
+            new_data=None,
+            metadata={
+                "event_id": event.get("id"),
+                "event_type": event.get("type"),
+                "applied": outcome.applied,
+                "duplicate": outcome.duplicate,
+                "error": (outcome.note if not outcome.applied else None),
+            },
+            ip_address=str(request.client.host) if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+        )
+        await session.commit()
+    except Exception:
+        pass
     return WebhookAck(
         event_id=event.get("id") or "",
         event_type=event.get("type") or "unknown",

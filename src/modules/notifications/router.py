@@ -237,6 +237,7 @@ async def get_notification_endpoint(
 )
 async def mark_read_endpoint(
     notification_id: uuid.UUID,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> NotificationResponse:
@@ -245,6 +246,22 @@ async def mark_read_endpoint(
     )
     await session.commit()
     await session.refresh(notif)
+    # Best-effort audit row.
+    try:
+        ip, ua = request_ip_ua(request)
+        await audit_log(
+            session,
+            agency_id=ctx.agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="NOTIFICATION",
+            entity_id=notification_id,
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return NotificationResponse.model_validate(notif)
 
 
@@ -253,6 +270,7 @@ async def mark_read_endpoint(
     status_code=status.HTTP_200_OK,
 )
 async def mark_all_read_endpoint(
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> dict[str, int]:
@@ -263,6 +281,23 @@ async def mark_all_read_endpoint(
         actor_user_id=str(ctx.user_id),
         marked_count=count,
     )
+    # Best-effort audit row.
+    try:
+        ip, ua = request_ip_ua(request)
+        await audit_log(
+            session,
+            agency_id=ctx.agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="NOTIFICATION_PREFERENCES",
+            entity_id=None,
+            new_data={"event": "read_all", "count": count},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return {"marked_count": count}
 
 

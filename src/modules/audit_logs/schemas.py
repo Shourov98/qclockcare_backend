@@ -51,4 +51,74 @@ class AuditLogResponse(BaseModel):
         return super().model_validate(obj)
 
 
-__all__ = ["AuditLogResponse"]
+# --------------------------------------------------------------------------
+# Filter dropdown values (powers the FE audit-log page filter selects)
+# --------------------------------------------------------------------------
+class AuditLogActorSummary(BaseModel):
+    """One distinct actor that has produced audit rows in the caller's scope."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    user_id: UUID
+    full_name: str | None = None
+    email: str | None = None
+    role: str | None = None
+    event_count: int = 0
+
+
+class AuditLogFilterOptionsResponse(BaseModel):
+    """Distinct filter values to populate the FE dropdowns.
+
+    Only values that actually appear in the caller's scope are returned,
+    so the FE can render a tight, meaningful list rather than the full
+    `AuditAction` enum.
+    """
+
+    users: list[AuditLogActorSummary] = Field(default_factory=list)
+    actions: list[AuditAction] = Field(default_factory=list)
+    entity_types: list[str] = Field(default_factory=list)
+    date_min: datetime | None = None
+    date_max: datetime | None = None
+
+
+# --------------------------------------------------------------------------
+# Anomaly detection (powers the FE purple "Review Anomaly" banner)
+# --------------------------------------------------------------------------
+class AuditLogAnomaly(BaseModel):
+    """One detected anomaly window.
+
+    `audit_log_ids` references the underlying audit rows that fired the
+    rule — the FE can deep-link straight to them. Capped at 100 ids to
+    keep the response bounded; if more than 100 matched, the first 50
+    and last 50 are kept and `metadata.truncated` is set to True.
+    """
+
+    id: str = Field(..., description="Deterministic id: sha1(rule + actor + window_start)")
+    rule: str = Field(..., description="Machine name (e.g. OVERRIDE_BURST)")
+    severity: str = Field(..., description="LOW | MEDIUM | HIGH")
+    title: str
+    description: str
+    actor_user_id: UUID | None = None
+    actor_display_name: str | None = None
+    window_start: datetime
+    window_end: datetime
+    event_count: int
+    audit_log_ids: list[UUID] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AuditLogAnomalyResponse(BaseModel):
+    """Anomaly detection result envelope."""
+
+    anomalies: list[AuditLogAnomaly] = Field(default_factory=list)
+    generated_at: datetime
+    window_hours: int
+
+
+__all__ = [
+    "AuditLogResponse",
+    "AuditLogActorSummary",
+    "AuditLogFilterOptionsResponse",
+    "AuditLogAnomaly",
+    "AuditLogAnomalyResponse",
+]

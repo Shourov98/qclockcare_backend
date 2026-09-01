@@ -2,6 +2,9 @@
 
 Endpoints:
   GET /audit-logs              — paginated list with filters
+  GET /audit-logs/filters      — distinct values for FE filter dropdowns
+  GET /audit-logs/anomalies    — rule-based anomaly detection
+  GET /audit-logs/export.csv   — streamed CSV download
   GET /audit-logs/{id}         — single log entry
 
 No INSERT/DELETE endpoints. New rows are written via
@@ -18,10 +21,15 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.modules.audit_logs import service as audit_logs_service
-from src.modules.audit_logs.schemas import AuditLogResponse
+from src.modules.audit_logs.schemas import (
+    AuditLogAnomalyResponse,
+    AuditLogFilterOptionsResponse,
+    AuditLogResponse,
+)
 from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
@@ -84,6 +92,95 @@ async def list_audit_logs_endpoint(
         total=total,
         page=page,
         page_size=page_size,
+    )
+
+
+@router.get(
+    "/filters",
+    response_model=AuditLogFilterOptionsResponse,
+    dependencies=_AUDIT_LOG_READERS,
+)
+async def audit_log_filters_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> AuditLogFilterOptionsResponse:
+    """Distinct users / actions / entity_types + date bounds.
+
+    Powers the FE audit-log page filter dropdowns. Only values that
+    actually appear in the caller's scope are returned, so the FE
+    renders a tight, meaningful list.
+    """
+    return await audit_logs_service.list_audit_log_filter_options(session, ctx=ctx)
+
+
+@router.get(
+    "/anomalies",
+    response_model=AuditLogAnomalyResponse,
+    dependencies=_AUDIT_LOG_READERS,
+)
+async def audit_log_anomalies_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+    window_hours: Annotated[int, Query(ge=1, le=168)] = 24,
+) -> AuditLogAnomalyResponse:
+    """Rule-based anomaly detection for the audit log.
+
+    Powers the FE purple "Review Anomaly" banner. Runs 5 heuristics
+    over the last `window_hours` (default 24, max 168 = 7d):
+      - OVERRIDE_BURST       (≥3 override actions per actor in 2h)
+      - LOGIN_BRUTE_FORCE    (≥5 LOGIN_FAILED in 15 min)
+      - OFF_HOURS_ADMIN      (admin actions outside 06:00–22:00 UTC)
+      - ROLE_ESCALATION      (any ROLE_GRANTED event)
+      - BILLING_WEBHOOK_FAIL (Stripe webhook failure)
+    """
+    anomalies, hours = await audit_logs_service.detect_audit_anomalies(
+        session, ctx=ctx, window_hours=window_hours
+    )
+    return AuditLogAnomalyResponse(
+        anomalies=anomalies,
+        generated_at=datetime.utcnow(),
+        window_hours=hours,
+    )
+
+
+@router.get(
+    "/export.csv",
+    dependencies=_AUDIT_LOG_READERS,
+    response_class=StreamingResponse,
+)
+async def audit_log_export_csv_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+    actor_user_id: Annotated[uuid.UUID | None, Query()] = None,
+    entity_type: Annotated[str | None, Query(max_length=255)] = None,
+    entity_id: Annotated[uuid.UUID | None, Query()] = None,
+    action: Annotated[AuditAction | None, Query()] = None,
+    date_from: Annotated[datetime | None, Query()] = None,
+    date_to: Annotated[datetime | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100_000)] = 50_000,
+) -> StreamingResponse:
+    """Stream a CSV export of the audit log under the same filter set
+    as `GET /audit-logs`. Hard cap 100k rows; default 50k.
+    """
+    generator = audit_logs_service.stream_audit_logs_csv(
+        session,
+        ctx=ctx,
+        actor_user_id=actor_user_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        action=action,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+    )
+    filename = f"audit-logs-{datetime.utcnow().strftime('%Y-%m-%d')}.csv"
+    return StreamingResponse(
+        generator,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
     )
 
 

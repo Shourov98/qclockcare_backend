@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
 from src.core.exceptions import ConflictError, DuplicateResourceError, NotFoundError
+from src.modules.audit_logs import service as audit_logs_service
 from src.modules.identity.dependencies import (
     CurrentAuth,
     get_session_with_auth,
@@ -37,7 +38,7 @@ from src.modules.identity.dependencies import (
 from src.modules.identity.models import AdminScope as AdminScopeModel
 from src.modules.identity.models import User, UserRoleAssignment
 from src.modules.identity.schemas import _validate_password
-from src.shared.domain.enums import AdminScope, UserRole, UserStatus
+from src.shared.domain.enums import AdminScope, AuditAction, UserRole, UserStatus
 from src.shared.schemas.docs import standard_responses
 from src.shared.schemas.pagination import PaginatedResponse, build_offset_response
 
@@ -383,6 +384,28 @@ async def create_platform_admin_endpoint(
         recipient_user_id=user.id,
     )
 
+    # Best-effort audit row.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=None,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.ROLE_GRANTED,
+            entity_type="ADMIN_USER",
+            entity_id=user.id,
+            new_data={
+                "email": str(user.email),
+                "role": UserRole.PLATFORM_ADMIN.value,
+                "scopes": [s.value for s in payload.scopes],
+            },
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
+
     return _to_admin_response(
         user, role=UserRole.PLATFORM_ADMIN, scopes=payload.scopes
     )
@@ -412,6 +435,7 @@ async def get_platform_admin_endpoint(
 async def update_platform_admin_endpoint(
     user_id: uuid.UUID,
     payload: PlatformAdminUpdateRequest,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> PlatformAdminResponse:
@@ -502,6 +526,24 @@ async def update_platform_admin_endpoint(
 
     await session.commit()
     await session.refresh(user)
+    # Best-effort audit row.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=None,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="ADMIN_USER",
+            entity_id=user.id,
+            new_data={"fields": sorted(changes.keys())},
+            metadata={"role": role.value, "scopes": [s.value for s in current_scopes]},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return _to_admin_response(user, role=role, scopes=current_scopes)
 
 
@@ -513,6 +555,7 @@ async def update_platform_admin_endpoint(
 )
 async def archive_platform_admin_endpoint(
     user_id: uuid.UUID,
+    request: Request,
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> Response:
@@ -539,4 +582,22 @@ async def archive_platform_admin_endpoint(
     user.status = UserStatus.ARCHIVED
     user.deleted_at = datetime.now(tz=UTC)
     await session.commit()
+    # Best-effort audit row.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=None,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.DELETE,
+            entity_type="ADMIN_USER",
+            entity_id=user.id,
+            old_data={"status": UserStatus.ACTIVE.value, "email": str(user.email)},
+            metadata={"role": role.value},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return Response(status_code=status.HTTP_204_NO_CONTENT)

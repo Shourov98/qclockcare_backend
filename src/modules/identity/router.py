@@ -37,7 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
 from src.core.database import get_session
-from src.core.exceptions import UnauthorizedError
+from src.core.exceptions import AppException, UnauthorizedError
 from src.modules.audit_logs import service as audit_logs_service
 from src.modules.identity import auth_service
 from src.modules.identity.cookies import (
@@ -107,19 +107,58 @@ async def login_endpoint(
     response: Response,
     session: AsyncSession = Depends(get_session),
 ) -> TokenPair:
-    issued = await auth_service.login(
-        session,
-        email=payload.email,
-        password=payload.password,
-        ip_address=_client_ip(request),
-        user_agent=_user_agent(request),
-    )
+    try:
+        issued = await auth_service.login(
+            session,
+            email=payload.email,
+            password=payload.password,
+            ip_address=_client_ip(request),
+            user_agent=_user_agent(request),
+        )
+    except AppException as exc:
+        # Best-effort audit row for the failure branch (the success
+        # branch writes it post-issue, below). Best-effort = the audit
+        # write itself never breaks the login response.
+        try:
+            ip, ua = audit_logs_service.request_ip_ua(request)
+            await audit_logs_service.audit_log(
+                session,
+                agency_id=None,
+                actor_user_id=None,
+                action=AuditAction.LOGIN_FAILED,
+                entity_type="AUTH",
+                entity_id=None,
+                new_data={"email": payload.email, "reason": exc.code if hasattr(exc, "code") else "auth_failed"},
+                ip_address=ip,
+                user_agent=ua,
+            )
+            await session.commit()
+        except Exception:
+            pass
+        raise
+
     set_auth_cookies(
         response,
         access_token=issued.access_token,
         refresh_token=issued.refresh_token,
         expires_in=issued.expires_in,
     )
+    # Best-effort LOGIN audit row on the success branch.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=issued.user.agency_id,
+            actor_user_id=issued.user.id,
+            action=AuditAction.LOGIN,
+            entity_type="AUTH",
+            entity_id=issued.user.id,
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return TokenPair(
         access_token=issued.access_token,
         refresh_token=issued.refresh_token,
@@ -170,6 +209,23 @@ async def refresh_endpoint(
         refresh_token=issued.refresh_token,
         expires_in=issued.expires_in,
     )
+    # Best-effort audit row.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=issued.user.agency_id,
+            actor_user_id=issued.user.id,
+            action=AuditAction.UPDATE,
+            entity_type="AUTH_TOKEN",
+            entity_id=issued.user.id,
+            new_data={"event": "refresh"},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     return TokenPair(
         access_token=issued.access_token,
         refresh_token=issued.refresh_token,
@@ -223,6 +279,22 @@ async def logout_endpoint(
         user_agent=_user_agent(request),
     )
     clear_auth_cookies(response)
+    # Best-effort audit row.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=ctx.agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.LOGOUT,
+            entity_type="AUTH",
+            entity_id=ctx.user_id,
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -424,13 +496,30 @@ async def reset_password_endpoint(
     request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> None:
-    await auth_service.reset_password(
+    user_id = await auth_service.reset_password(
         session,
         reset_token=payload.reset_token,
         new_password=payload.password,
         ip_address=_client_ip(request),
         user_agent=_user_agent(request),
     )
+    # Best-effort audit row.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=None,
+            actor_user_id=user_id,
+            action=AuditAction.UPDATE,
+            entity_type="USER",
+            entity_id=user_id,
+            new_data={"event": "password_reset"},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -549,6 +638,23 @@ async def change_password_endpoint(
         ip_address=_client_ip(request),
         user_agent=_user_agent(request),
     )
+    # Best-effort audit row.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=ctx.agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="USER",
+            entity_id=ctx.user_id,
+            new_data={"event": "password_changed"},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
     # No body. Refresh-token revocation is a side effect; the client
     # will discover it on its next refresh attempt.
     return Response(status_code=status.HTTP_204_NO_CONTENT)
