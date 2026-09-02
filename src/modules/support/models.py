@@ -74,7 +74,7 @@ class SupportTicket(IdMixin, TimestampedMixin, Base):
     )
     patient_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("patients.id", ondelete="SET NULL"),
+        ForeignKey("patient_profiles.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
         doc=(

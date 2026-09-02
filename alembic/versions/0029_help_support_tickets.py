@@ -151,9 +151,9 @@ def upgrade() -> None:
         ),
         sa.ForeignKeyConstraint(
             ["patient_id"],
-            ["patients.id"],
+            ["patient_profiles.id"],
             ondelete="SET NULL",
-            name="fk_support_tickets_patient_id_patients",
+            name="fk_support_tickets_patient_id_patient_profiles",
         ),
         sa.ForeignKeyConstraint(
             ["reporter_user_id"],
