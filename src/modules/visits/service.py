@@ -391,6 +391,13 @@ async def list_visits(
         .options(
             selectinload(Visit.staff).selectinload(StaffProfile.user),
             selectinload(Visit.evv_record),
+            # Eager-load the parent appointment + its scheduled window.
+            # The portal list endpoint (`GET /portal/visits`) reads
+            # `v.appointment.scheduled_start` to sort and render each row,
+            # and the admin/staff list pages render the same field — so we
+            # eager-load it for every caller to avoid lazy-load
+            # `MissingGreenlet` errors in async contexts.
+            selectinload(Visit.appointment),
         )
     )
     count_base = (
