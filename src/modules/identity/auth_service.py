@@ -190,8 +190,53 @@ async def _record_audit(
     )
 
 
-def _to_current_user(user: User) -> CurrentUser:
+async def _to_current_user(
+    session: AsyncSession, user: User
+) -> CurrentUser:
+    """Build the `CurrentUser` payload returned in login + refresh responses.
+
+    For PATIENT callers we also resolve and include `patient_id` (the
+    `PatientProfile.id` for the same `user_id`), and for STAFF callers we
+    include `staff_id`. The FE uses these convenience fields to jump
+    straight to `/patients/{patient_id}/dashboard-summary` /
+    `/staff/{staff_id}/visits/history` without a separate profile
+    lookup. Both fields are NULL for callers with other roles.
+
+    The lookups are best-effort: if the profile row is missing (e.g. an
+    INVITED user who hasn't accepted yet), the corresponding field is
+    NULL rather than raising — the rest of the auth payload is still
+    useful.
+    """
+    from src.modules.patients.models import PatientProfile
+    from src.modules.staff.models import StaffProfile
+
     role, agency_id = _pick_primary_role(user.roles, user_id=user.id)
+
+    patient_id: str | None = None
+    staff_id: str | None = None
+    if role == UserRole.PATIENT and agency_id is not None:
+        row = (
+            await session.execute(
+                select(PatientProfile.id).where(
+                    PatientProfile.user_id == user.id,
+                    PatientProfile.agency_id == agency_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if row is not None:
+            patient_id = str(row)
+    elif role == UserRole.STAFF and agency_id is not None:
+        row = (
+            await session.execute(
+                select(StaffProfile.id).where(
+                    StaffProfile.user_id == user.id,
+                    StaffProfile.agency_id == agency_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if row is not None:
+            staff_id = str(row)
+
     return CurrentUser(
         id=str(user.id),
         email=user.email,
@@ -201,6 +246,8 @@ def _to_current_user(user: User) -> CurrentUser:
         email_verified=user.email_verified_at is not None,
         agency_id=str(agency_id) if agency_id else None,
         role=role.value,
+        patient_id=patient_id,
+        staff_id=staff_id,
     )
 
 
@@ -279,7 +326,7 @@ async def _issue_pair(
         access_token=access_token,
         refresh_token=refresh_token,
         expires_in=expires_in,
-        user=_to_current_user(user),
+        user=await _to_current_user(session, user),
     )
 
 
@@ -958,7 +1005,7 @@ async def reset_password(
 # --------------------------------------------------------------------------
 async def me(session: AsyncSession, *, user_id: uuid.UUID) -> CurrentUser:
     user = await _load_user_with_roles(session, user_id)
-    return _to_current_user(user)
+    return await _to_current_user(session, user)
 
 
 # --------------------------------------------------------------------------
@@ -1014,7 +1061,7 @@ async def update_profile(
     # change — just refresh the user object so the response reflects
     # the new values.
     await session.refresh(user, attribute_names=["roles"])
-    return _to_current_user(user)
+    return await _to_current_user(session, user)
 
 
 # --------------------------------------------------------------------------

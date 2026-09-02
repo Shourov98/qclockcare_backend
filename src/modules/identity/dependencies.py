@@ -134,7 +134,7 @@ async def get_session_with_auth(
             await assert_agency_allows_auth(session, agency_id=agency_id)
             request.state.auth = AuthContext(
                 user_id=user.id,
-                user=_to_current_user(user),
+                user=await _to_current_user(session, user),
                 role=role,
                 agency_id=agency_id,
                 scopes=payload.scopes,

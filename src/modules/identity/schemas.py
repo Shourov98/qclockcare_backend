@@ -184,6 +184,24 @@ class CurrentUser(BaseModel):
             "(`SUPER_ADMIN`, `AGENCY_ADMIN`, `STAFF`, `PATIENT`, `GUARDIAN`)."
         ),
     )
+    patient_id: str | None = Field(
+        default=None,
+        description=(
+            "Convenience link to the `PatientProfile.id` when the active "
+            "role is `PATIENT`. Lets the FE jump straight to "
+            "`/patients/{patient_id}/...` without a separate profile "
+            "lookup. NULL for non-patient callers."
+        ),
+    )
+    staff_id: str | None = Field(
+        default=None,
+        description=(
+            "Convenience link to the `StaffProfile.id` when the active "
+            "role is `STAFF`. Lets the FE jump straight to "
+            "`/staff/{staff_id}/...` without a separate profile lookup. "
+            "NULL for non-staff callers."
+        ),
+    )
 
 
 # --------------------------------------------------------------------------
