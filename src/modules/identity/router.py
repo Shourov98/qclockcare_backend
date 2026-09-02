@@ -39,6 +39,7 @@ from src.core.config import settings
 from src.core.database import get_session
 from src.core.exceptions import AppException, UnauthorizedError
 from src.modules.audit_logs import service as audit_logs_service
+from src.modules.auth import email_service as auth_email
 from src.modules.identity import auth_service
 from src.modules.identity.cookies import (
     QC_REFRESH_COOKIE,
