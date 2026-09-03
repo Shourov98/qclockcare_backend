@@ -288,6 +288,42 @@ async def get_patient(
     return p
 
 
+async def get_patient_by_user_id(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    agency_id: uuid.UUID,
+    with_relationships: bool = False,
+) -> PatientProfile:
+    """Resolve a `PatientProfile` from the caller's `user_id`.
+
+    Used by the `/me/patients/*` self-service endpoints so the URL
+    doesn't have to carry the caller's identity. Raises `NotFoundError`
+    if the user has no `PatientProfile` at the caller's agency (e.g.
+    a `GUARDIAN` or `STAFF` calling `/me/patients/...`).
+    """
+    stmt = (
+        select(PatientProfile)
+        .where(
+            PatientProfile.user_id == user_id,
+            PatientProfile.agency_id == agency_id,
+        )
+        .options(selectinload(PatientProfile.user))
+    )
+    if with_relationships:
+        stmt = stmt.options(selectinload(PatientProfile.guardian_links))
+    p = (await session.execute(stmt)).scalar_one_or_none()
+    if p is None:
+        raise NotFoundError(
+            details={
+                "resource": "patient_profile",
+                "user_id": str(user_id),
+                "reason": "no PatientProfile for this user at this agency",
+            }
+        )
+    return p
+
+
 async def list_patients(
     session: AsyncSession,
     *,
@@ -511,6 +547,38 @@ async def get_guardian(
     return await _get_guardian_or_404(
         session, guardian_id=guardian_id, agency_id=agency_id
     )
+
+
+async def get_guardian_by_user_id(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    agency_id: uuid.UUID,
+) -> GuardianProfile:
+    """Resolve a `GuardianProfile` from the caller's `user_id`.
+
+    Used by `/me/guardians/*` so the URL doesn't carry the caller's
+    identity. Raises `NotFoundError` if the user has no
+    `GuardianProfile` at the caller's agency.
+    """
+    stmt = (
+        select(GuardianProfile)
+        .where(
+            GuardianProfile.user_id == user_id,
+            GuardianProfile.agency_id == agency_id,
+        )
+        .options(selectinload(GuardianProfile.user))
+    )
+    g = (await session.execute(stmt)).scalar_one_or_none()
+    if g is None:
+        raise NotFoundError(
+            details={
+                "resource": "guardian_profile",
+                "user_id": str(user_id),
+                "reason": "no GuardianProfile for this user at this agency",
+            }
+        )
+    return g
 
 
 async def list_guardians(

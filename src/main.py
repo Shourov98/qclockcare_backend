@@ -85,6 +85,7 @@ from src.modules.staff.models import (  # noqa: F401
     StaffQualification,
 )
 from src.modules.staff.router import router as staff_router
+from src.modules.staff.router import me_router as staff_me_router
 from src.modules.support.models import SupportTicket, SupportTicketMessage  # noqa: F401
 from src.modules.support.router import router as support_router
 from src.modules.tickets.models import Ticket, TicketComment  # noqa: F401
@@ -393,6 +394,8 @@ def create_app() -> FastAPI:
 
     # Staff — agency-scoped staff profiles, qualifications, availability.
     app.include_router(staff_router)
+    # Self-service `/me/staff/*` (resolved from bearer token).
+    app.include_router(staff_me_router)
 
     # Patients + guardians + relationships.
     app.include_router(patients_router)

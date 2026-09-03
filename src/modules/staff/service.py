@@ -317,6 +317,44 @@ async def get_staff(
     return staff
 
 
+async def get_staff_by_user_id(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    agency_id: uuid.UUID,
+    with_details: bool = False,
+) -> StaffProfile:
+    """Resolve a `StaffProfile` from the caller's `user_id`.
+
+    Used by `/me/staff/*` so the URL doesn't carry the caller's
+    identity. Raises `NotFoundError` if the user has no
+    `StaffProfile` at the caller's agency.
+    """
+    stmt = (
+        select(StaffProfile)
+        .where(
+            StaffProfile.user_id == user_id,
+            StaffProfile.agency_id == agency_id,
+        )
+        .options(selectinload(StaffProfile.user))
+    )
+    if with_details:
+        stmt = stmt.options(
+            selectinload(StaffProfile.qualifications),
+            selectinload(StaffProfile.availability),
+        )
+    staff = (await session.execute(stmt)).scalar_one_or_none()
+    if staff is None:
+        raise NotFoundError(
+            details={
+                "resource": "staff_profile",
+                "user_id": str(user_id),
+                "reason": "no StaffProfile for this user at this agency",
+            }
+        )
+    return staff
+
+
 async def list_staff(
     session: AsyncSession,
     *,

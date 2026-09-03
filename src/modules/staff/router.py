@@ -965,4 +965,153 @@ async def delete_availability_endpoint(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-__all__ = ["router"]
+# --------------------------------------------------------------------------
+# Self-service `/me/staff/*` routes — resolve entity ID from the JWT.
+#
+# These mirror the `/{staff_id}` endpoints above but don't carry the
+# caller's identity in the URL. The staff `user_id` is taken from
+# `ctx.user_id` (verified by the bearer-token dependency chain) so the
+# URL doesn't leak PII into logs / browser history / screenshots.
+#
+# `AGENCY_ADMIN` keeps using `/staff/{id}` for cross-user lookups.
+# --------------------------------------------------------------------------
+me_router = APIRouter(prefix="/me/staff", tags=["staff"])
+
+
+@me_router.get(
+    "",
+    response_model=StaffProfileResponse,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Get the caller's own staff profile",
+    description=(
+        "Self-service. Returns the `StaffProfile` whose `user_id` "
+        "matches the bearer token. Equivalent to `GET /staff/{id}` "
+        "but the URL doesn't carry the caller's identity."
+    ),
+    dependencies=[Depends(require_role(UserRole.STAFF))],
+)
+async def get_my_staff_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> StaffProfileResponse:
+    """Fetch the caller's own staff profile."""
+    agency_id = _require_agency(ctx)
+    staff = await staff_service.get_staff_by_user_id(
+        session, user_id=ctx.user_id, agency_id=agency_id, with_details=False
+    )
+    return _to_response(staff, with_details=False)
+
+
+@me_router.get(
+    "/with-details",
+    response_model=StaffProfileResponse,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Get the caller's own staff profile with qual + avail",
+    description=(
+        "Self-service. Same as `GET /me/staff` but inlines "
+        "qualifications and availability windows."
+    ),
+    dependencies=[Depends(require_role(UserRole.STAFF))],
+)
+async def get_my_staff_with_details_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> StaffProfileResponse:
+    """Fetch the caller's own staff profile + nested qual + avail."""
+    agency_id = _require_agency(ctx)
+    staff = await staff_service.get_staff_by_user_id(
+        session, user_id=ctx.user_id, agency_id=agency_id, with_details=True
+    )
+    return _to_response(staff, with_details=True)
+
+
+@me_router.get(
+    "/visits/history",
+    response_model=dict,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Caller's own visit history (COMPLETED visits, most recent first)",
+    description=(
+        "Self-service. Same payload as `GET /staff/{id}/visits/history` "
+        "but for the caller. Paginated by `page` / `page_size`."
+    ),
+    dependencies=[Depends(require_role(UserRole.STAFF))],
+)
+async def list_my_staff_visit_history_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+    page: int = Query(default=1, ge=1, le=10000),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> dict:
+    from src.modules.visits import service as visits_service
+    from src.modules.visits.schemas import VisitResponse
+
+    agency_id = _require_agency(ctx)
+    staff = await staff_service.get_staff_by_user_id(
+        session, user_id=ctx.user_id, agency_id=agency_id
+    )
+    rows, total = await visits_service.list_visit_history(
+        session,
+        agency_id=agency_id,
+        staff_id=staff.id,
+        page=page,
+        page_size=page_size,
+    )
+    return build_offset_response(
+        [VisitResponse.model_validate(v, from_attributes=True) for v in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@me_router.get(
+    "/qualifications",
+    response_model=list[StaffQualificationResponse],
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="List the caller's own qualifications",
+    description=(
+        "Self-service. Returns every qualification row attached to "
+        "the caller (including signed download URLs when applicable)."
+    ),
+    dependencies=[Depends(require_role(UserRole.STAFF))],
+)
+async def list_my_qualifications_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> list[StaffQualificationResponse]:
+    agency_id = _require_agency(ctx)
+    staff = await staff_service.get_staff_by_user_id(
+        session, user_id=ctx.user_id, agency_id=agency_id
+    )
+    quals = await staff_service.list_qualifications(
+        session, staff_id=staff.id, agency_id=agency_id
+    )
+    return [await _qualification_to_response(q) for q in quals]
+
+
+@me_router.get(
+    "/availability",
+    response_model=list[StaffAvailabilityResponse],
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="List the caller's own availability windows",
+    description=(
+        "Self-service. Returns every availability window attached "
+        "to the caller's `StaffProfile`."
+    ),
+    dependencies=[Depends(require_role(UserRole.STAFF))],
+)
+async def list_my_availability_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> list[StaffAvailabilityResponse]:
+    agency_id = _require_agency(ctx)
+    staff = await staff_service.get_staff_by_user_id(
+        session, user_id=ctx.user_id, agency_id=agency_id
+    )
+    rows = await staff_service.list_availability(
+        session, staff_id=staff.id, agency_id=agency_id
+    )
+    return [StaffAvailabilityResponse.model_validate(r) for r in rows]
+
+
+__all__ = ["router", "me_router"]

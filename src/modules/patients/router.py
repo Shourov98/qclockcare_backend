@@ -452,6 +452,254 @@ async def list_patient_visit_history_endpoint(
     )
 
 
+# --------------------------------------------------------------------------
+# Self-service `/me/*` routes — resolve entity ID from the JWT.
+#
+# These mirror the `/{patient_id}` / `/{guardian_id}` endpoints above
+# but don't carry the caller's identity in the URL. The patient / guardian
+# user_id is taken from `ctx.user_id` (verified by the bearer-token
+# dependency chain) so the URL doesn't leak PII into logs / browser
+# history / screenshots.
+#
+# `AGENCY_ADMIN` and `SUPER_ADMIN` should keep using `/patients/{id}` /
+# `/guardians/{id}` for cross-user lookups.
+# --------------------------------------------------------------------------
+@router.get(
+    "/me/patients",
+    response_model=PatientProfileResponse,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Get the caller's own patient profile",
+    description=(
+        "Self-service. Returns the `PatientProfile` whose `user_id` "
+        "matches the bearer token. Equivalent to `GET /patients/{id}` "
+        "but the URL doesn't carry the caller's identity."
+    ),
+    dependencies=[Depends(require_role(UserRole.PATIENT))],
+)
+async def get_my_patient_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> PatientProfileResponse:
+    patient = await patients_service.get_patient_by_user_id(
+        session, user_id=ctx.user_id, agency_id=ctx.agency_id
+    )
+    return _to_patient_response(patient)
+
+
+@router.get(
+    "/me/patients/with-relationships",
+    response_model=PatientProfileResponse,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Get the caller's own profile with guardian links inlined",
+    description=(
+        "Self-service. Same as `GET /me/patients` but eagerly joins "
+        "every active `PatientGuardianRelationship` for the patient."
+    ),
+    dependencies=[Depends(require_role(UserRole.PATIENT))],
+)
+async def get_my_patient_with_relationships_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> PatientProfileResponse:
+    patient = await patients_service.get_patient_by_user_id(
+        session,
+        user_id=ctx.user_id,
+        agency_id=ctx.agency_id,
+        with_relationships=True,
+    )
+    return _to_patient_response(patient, with_relationships=True)
+
+
+@router.get(
+    "/me/patients/dashboard-summary",
+    response_model=PatientDashboardSummaryResponse,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Patient dashboard landing data (self-service)",
+    description=(
+        "Self-service. Same payload as `GET /patients/{id}/dashboard-summary` "
+        "but for the caller. Two halves: `upcoming` (≤5 next active "
+        "appointments) and `lifetime` totals."
+    ),
+    dependencies=[Depends(require_role(UserRole.PATIENT))],
+)
+async def get_my_dashboard_summary_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> PatientDashboardSummaryResponse:
+    agency_id = _require_agency(ctx)
+    patient = await patients_service.get_patient_by_user_id(
+        session, user_id=ctx.user_id, agency_id=agency_id
+    )
+    upcoming_rows, total_appointments, completed_appointments, total_minutes = (
+        await appointments_service.get_patient_dashboard_summary(
+            session,
+            patient_id=patient.id,
+            agency_id=agency_id,
+        )
+    )
+    return PatientDashboardSummaryResponse(
+        upcoming=[
+            AppointmentSummaryResponse.model_validate(
+                appointments_service._summarize_to_dict(row)
+            )
+            for row in upcoming_rows
+        ],
+        lifetime=PatientLifetimeStats(
+            total_appointments=total_appointments,
+            completed_appointments=completed_appointments,
+            completed_visits=completed_appointments,
+            total_service_minutes=total_minutes,
+        ),
+    )
+
+
+@router.get(
+    "/me/patients/visits/history",
+    response_model=dict,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Caller's own visit history (COMPLETED visits, most recent first)",
+    description=(
+        "Self-service. Same payload as `GET /patients/{id}/visits/history` "
+        "but for the caller. Paginated by `page` / `page_size`."
+    ),
+    dependencies=[Depends(require_role(UserRole.PATIENT))],
+)
+async def list_my_visit_history_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+    page: int = Query(default=1, ge=1, le=10000),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> dict:
+    from src.modules.visits import service as visits_service
+    from src.modules.visits.schemas import VisitResponse
+
+    agency_id = _require_agency(ctx)
+    patient = await patients_service.get_patient_by_user_id(
+        session, user_id=ctx.user_id, agency_id=agency_id
+    )
+    rows, total = await visits_service.list_visit_history(
+        session,
+        agency_id=agency_id,
+        patient_id=patient.id,
+        page=page,
+        page_size=page_size,
+    )
+    return build_offset_response(
+        [VisitResponse.model_validate(v, from_attributes=True) for v in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get(
+    "/me/patients/guardians",
+    response_model=list[PatientGuardianRelationshipResponse],
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="List the caller's own guardian relationships",
+    description=(
+        "Self-service. Returns every `PatientGuardianRelationship` for "
+        "the caller's `PatientProfile` (active + expired)."
+    ),
+    dependencies=[Depends(require_role(UserRole.PATIENT))],
+)
+async def list_my_patient_guardians_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> list[PatientGuardianRelationshipResponse]:
+    agency_id = _require_agency(ctx)
+    patient = await patients_service.get_patient_by_user_id(
+        session, user_id=ctx.user_id, agency_id=agency_id
+    )
+    rows = await patients_service.list_patient_guardians(
+        session, patient_id=patient.id, agency_id=agency_id
+    )
+    return [PatientGuardianRelationshipResponse.model_validate(r) for r in rows]
+
+
+@router.get(
+    "/me/guardians",
+    response_model=GuardianProfileResponse,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Get the caller's own guardian profile",
+    description=(
+        "Self-service. Returns the `GuardianProfile` whose `user_id` "
+        "matches the bearer token. Equivalent to `GET /guardians/{id}` "
+        "but the URL doesn't carry the caller's identity."
+    ),
+    dependencies=[Depends(require_role(UserRole.GUARDIAN))],
+)
+async def get_my_guardian_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> GuardianProfileResponse:
+    guardian = await patients_service.get_guardian_by_user_id(
+        session, user_id=ctx.user_id, agency_id=ctx.agency_id
+    )
+    return _to_guardian_response(guardian)
+
+
+@router.get(
+    "/me/guardians/visits/history",
+    response_model=dict,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Caller's own visit history across linked patients",
+    description=(
+        "Self-service. Same payload as `GET /guardians/{id}/visits/history` "
+        "but for the caller. Aggregates COMPLETED visits for every "
+        "patient this guardian is currently linked to (active "
+        "`valid_from` / `valid_until` window)."
+    ),
+    dependencies=[Depends(require_role(UserRole.GUARDIAN))],
+)
+async def list_my_guardian_visit_history_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+    page: int = Query(default=1, ge=1, le=10000),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> dict:
+    from src.modules.visits import service as visits_service
+    from src.modules.visits.schemas import VisitResponse
+
+    agency_id = _require_agency(ctx)
+    guardian = await patients_service.get_guardian_by_user_id(
+        session, user_id=ctx.user_id, agency_id=agency_id
+    )
+    patient_ids = await patients_service.list_guardian_patient_ids(
+        session,
+        guardian_id=guardian.id,
+        agency_id=agency_id,
+    )
+    if not patient_ids:
+        return build_offset_response([], total=0, page=page, page_size=page_size)
+    merged: list = []
+    total = 0
+    for pid in patient_ids:
+        rows, pid_total = await visits_service.list_visit_history(
+            session,
+            agency_id=agency_id,
+            patient_id=pid,
+            page=page,
+            page_size=page_size,
+        )
+        total += pid_total
+        merged.extend(rows)
+    merged.sort(
+        key=lambda v: (
+            v.appointment.scheduled_start if v.appointment is not None else v.created_at
+        ),
+        reverse=True,
+    )
+    start = (page - 1) * page_size
+    end = start + page_size
+    return build_offset_response(
+        [VisitResponse.model_validate(v, from_attributes=True) for v in merged[start:end]],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
 @router.patch(
     "/patients/{patient_id}",
     response_model=PatientProfileResponse,
