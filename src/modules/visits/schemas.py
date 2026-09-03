@@ -24,7 +24,7 @@ from decimal import Decimal
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, StringConstraints, model_validator
+from pydantic import BaseModel, ConfigDict, StringConstraints, field_validator, model_validator
 
 from src.shared.domain.enums import ServiceItemStatus, UserRole, VisitStatus
 
@@ -388,9 +388,27 @@ class AppointmentSignatureResponse(BaseModel):
     signer_display_name: str  # "J. Smith"
     signature_image_url: str
     signed_at: datetime
-    ip_address: str | None
+    # `ip_address` is stored as Postgres `INET` — psycopg returns an
+    # `IPv4Address` object, not a `str`. Coerce with a validator so
+    # the schema accepts both shapes.
+    ip_address: str | None = None
     user_agent: str | None
-    created_at: datetime
+    # NOTE: the ORM model `AppointmentSignature` does NOT extend
+    # `TimestampedMixin`, so there is no `created_at` column on the
+    # row. `signed_at` is the canonical write timestamp; it carries
+    # the same semantic value (the moment the row was created)
+    # because the row is INSERT-only — a signature is never updated.
+    # If the model is migrated to TimestampedMixin later, restore this
+    # field.
+    # created_at: datetime
+
+    @field_validator("ip_address", mode="before")
+    @classmethod
+    def _ip_to_str(cls, v: object) -> object:
+        """Coerce `ipaddress.IPv4Address` → `str` so Pydantic accepts it."""
+        if v is None:
+            return None
+        return str(v)
 
 
 # --------------------------------------------------------------------------
