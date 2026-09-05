@@ -25,9 +25,10 @@ PATIENT     patient1..patient8@qlockcare.dev      / PatientDevPass123!
 
 GUARDIAN    guardian1..guardian3@qlockcare.dev    / GuardianDevPass123!
             guardian_profile rows for each (linked to "QlockCare Dev Agency")
-            plus a `patient_guardian_relationships` row linking each
-            guardian to patient1 so the GUARDIAN login actually has
-            someone to look at in the mobile app.
+            plus a `patient_guardian_relationships` row (relationship_type=
+            'GUARDIAN') linking each guardian to the canonical
+            patient@qlockcare.dev so the GUARDIAN login actually has
+            appointments to see in /me/appointments/calendar.
 
 PLATFORM_ADMIN
             platform@qlockcare.dev                / PlatformDevPass123!
@@ -75,7 +76,10 @@ PLATFORM_ADMIN_EMAIL = "platform@qlockcare.dev"
 PLATFORM_ADMIN_NAME = "Dev Platform Admin"
 
 # Each guardian gets linked to this patient (so the mobile app has data).
-PRIMARY_PATIENT_EMAIL = "patient1@qlockcare.dev"
+# Pointed at the canonical seeded patient (seed_test_user.py) so the
+# appointments seeded by seed_appointments.py show up in the
+# guardian's /me/appointments/calendar view.
+PRIMARY_PATIENT_EMAIL = "patient@qlockcare.dev"
 
 
 @dataclass(frozen=True)
@@ -277,7 +281,7 @@ async def _link_guardian_to_patient1(
                     text(
                         "SELECT 1 FROM patient_guardian_relationships "
                         "WHERE patient_id = :p AND guardian_id = :g "
-                        "  AND relationship_type = 'EMERGENCY_CONTACT'"
+                        "  AND relationship_type = 'GUARDIAN'"
                     ),
                     {"p": patient_id, "g": guardian_id},
                 )
@@ -290,7 +294,7 @@ async def _link_guardian_to_patient1(
                     "(id, agency_id, patient_id, guardian_id, "
                     " relationship_type, is_legal, valid_from) "
                     "VALUES (:id, :a, :p, :g, "
-                    " 'EMERGENCY_CONTACT', true, current_date)"
+                    " 'GUARDIAN', true, current_date)"
                 ),
                 {
                     "id": uuid.uuid4(),

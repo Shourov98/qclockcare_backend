@@ -140,6 +140,7 @@ async def _get_appointment_or_404(
     with_activities: bool = False,
     with_patient: bool = False,
     with_signature: bool = False,
+    with_location: bool = False,
 ) -> Appointment:
     stmt = select(Appointment).where(
         Appointment.id == appointment_id,
@@ -149,6 +150,10 @@ async def _get_appointment_or_404(
         stmt = stmt.options(selectinload(Appointment.activities))
     if with_patient:
         stmt = stmt.options(selectinload(Appointment.patient))
+    if with_location:
+        # Eager-load the structured location so the detail endpoints
+        # can render lat/lng + address without a second round trip.
+        stmt = stmt.options(selectinload(Appointment.location_rel))
     if with_signature:
         # Chain `Appointment → Visit → AppointmentSignature`. Both
         # relationships are 1:1 (`uselist=False`), so a single
@@ -325,6 +330,7 @@ async def create_appointment(
         scheduled_start=payload.scheduled_start,
         scheduled_end=payload.scheduled_end,
         location=payload.location,
+        location_id=payload.location_id,
         notes=payload.notes,
         status=AppointmentStatus.SCHEDULED,
         billing_status="unpaid",
@@ -388,6 +394,7 @@ async def get_appointment(
     with_activities: bool = False,
     with_patient: bool = False,
     with_signature: bool = False,
+    with_location: bool = False,
 ) -> Appointment:
     return await _get_appointment_or_404(
         session,
@@ -396,6 +403,7 @@ async def get_appointment(
         with_activities=with_activities,
         with_patient=with_patient,
         with_signature=with_signature,
+        with_location=with_location,
     )
 
 
@@ -444,6 +452,7 @@ async def list_appointments(
                 PatientProfile.user
             ),
             selectinload(Appointment.activities),
+            selectinload(Appointment.location_rel),
         )
     )
     count_base = (
@@ -478,6 +487,71 @@ async def list_appointments(
     rows = (await session.execute(base)).scalars().all()
     total = (await session.execute(count_base)).scalar_one()
     return rows, int(total)
+
+
+async def list_appointments_in_window(
+    session: AsyncSession,
+    *,
+    agency_id: uuid.UUID,
+    date_from: date | None,
+    date_to: date | None,
+    patient_id: uuid.UUID | None = None,
+    staff_id: uuid.UUID | None = None,
+    status_filter: AppointmentStatus | None = None,
+    include_past: bool = True,
+) -> Sequence[Appointment]:
+    """List appointments inside a date window — no pagination, no row cap.
+
+    Designed for the role-scoped calendar endpoints
+    (`/me/appointments/calendar/*`). The FE typically wants every
+    appointment in a date range for a single role (patient / staff /
+    guardian), so we cap the window at 90 days implicitly by trusting
+    the caller to pass sane `date_from` / `date_to` values.
+
+    `include_past=False` drops appointments whose `scheduled_start` is
+    already in the past, useful when the FE only wants "today and
+    ahead" without paging through old visits.
+
+    Eager-loads the same joined fields as `list_appointments` so the
+    response items render the full card in a single round trip.
+    """
+    base = (
+        select(Appointment)
+        .where(Appointment.agency_id == agency_id)
+        .options(
+            selectinload(Appointment.staff).selectinload(StaffProfile.user),
+            selectinload(Appointment.staff).selectinload(
+                StaffProfile.qualifications
+            ),
+            selectinload(Appointment.patient).selectinload(
+                PatientProfile.user
+            ),
+            selectinload(Appointment.activities),
+            selectinload(Appointment.location_rel),
+        )
+    )
+    if patient_id is not None:
+        base = base.where(Appointment.patient_id == patient_id)
+    if staff_id is not None:
+        base = base.where(Appointment.staff_id == staff_id)
+    if status_filter is not None:
+        base = base.where(Appointment.status == status_filter)
+    if date_from is not None:
+        dt_from = datetime.combine(date_from, time.min)
+        base = base.where(Appointment.scheduled_start >= dt_from)
+    if date_to is not None:
+        # +1 day so `date_to` is inclusive of the entire day.
+        dt_to_excl = datetime.combine(date_to + timedelta(days=1), time.min)
+        base = base.where(Appointment.scheduled_start < dt_to_excl)
+    if not include_past:
+        from src.shared.utils.datetime_utils import utc_now
+
+        base = base.where(Appointment.scheduled_start >= utc_now())
+
+    # Ascending so the FE renders top-down by date — matches the
+    # "List my appointments" / dashboard cards.
+    base = base.order_by(Appointment.scheduled_start.asc(), Appointment.id.asc())
+    return (await session.execute(base)).scalars().all()
 
 
 async def update_appointment(
@@ -528,6 +602,8 @@ async def update_appointment(
         appt.scheduled_end = payload.scheduled_end
     if payload.location is not None:
         appt.location = payload.location
+    if payload.location_id is not None:
+        appt.location_id = payload.location_id
     if payload.notes is not None:
         appt.notes = payload.notes
 
@@ -1138,6 +1214,7 @@ async def get_patient_dashboard_summary(
                 PatientProfile.user
             ),
             selectinload(Appointment.activities),
+            selectinload(Appointment.location_rel),
         )
         # Ascending so the soonest appointment is first — the dashboard
         # card list reads top-down.
@@ -1266,6 +1343,35 @@ def _summarize_to_dict(appt: Appointment) -> dict:
 
     location_label = getattr(appt, "location", None)
 
+    # ----- Structured location (lat/lng for the FE map pin) -----
+    # Populated when `Appointment.location_rel` is eagerly loaded by
+    # the service (see `list_appointments`, `list_appointments_in_window`,
+    # `get_patient_dashboard_summary`). The relationship uses
+    # `lazy="raise"` so an un-eager-loaded access would crash — every
+    # caller that reaches this function MUST `selectinload` it.
+    location_id: uuid.UUID | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    location_name: str | None = None
+    location_address: str | None = None
+    location_rel = getattr(appt, "location_rel", None)
+    if location_rel is not None:
+        location_id = getattr(location_rel, "id", None)
+        lat = getattr(location_rel, "latitude", None)
+        lng = getattr(location_rel, "longitude", None)
+        # `Numeric` comes back as Decimal — cast to float for the
+        # JSON wire format. Pydantic will serialize Decimal as a
+        # string by default, which breaks Leaflet/Google Maps pin
+        # code that expects a JS number.
+        latitude = float(lat) if lat is not None else None
+        longitude = float(lng) if lng is not None else None
+        location_name = getattr(location_rel, "label", None)
+        line1 = getattr(location_rel, "address_line1", None)
+        city = getattr(location_rel, "city", None)
+        state = getattr(location_rel, "state", None)
+        parts = [p for p in (line1, city, state) if p]
+        location_address = ", ".join(parts) if parts else None
+
     # ----- Duration (planned; actual EVV fallback done by the router) -----
     duration_str: str | None = None
     start = getattr(appt, "scheduled_start", None)
@@ -1292,6 +1398,11 @@ def _summarize_to_dict(appt: Appointment) -> dict:
         "program_name": program_name,
         "service_type_label": activity_label,
         "location_label": location_label,
+        "location_id": location_id,
+        "latitude": latitude,
+        "longitude": longitude,
+        "location_name": location_name,
+        "location_address": location_address,
         "patient_name": patient_name,
         "patient_initials": patient_initials,
         "patient_code": patient_code,
@@ -1312,6 +1423,7 @@ __all__ = [
     "get_patient_dashboard_summary",
     "list_activities",
     "list_appointments",
+    "list_appointments_in_window",
     "mark_appointment_billing_paid",
     "mark_appointment_missed",
     "mark_appointment_ready",

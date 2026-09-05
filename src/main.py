@@ -42,6 +42,9 @@ from src.modules.appointments.models import (  # noqa: F401
     Appointment,
     AppointmentActivity,
 )
+from src.modules.appointments.router import (
+    me_router as appointments_me_router,
+)
 from src.modules.appointments.router import router as appointments_router
 from src.modules.audit_logs.models import AuditLog  # noqa: F401
 from src.modules.audit_logs.router import router as audit_logs_router
@@ -402,6 +405,9 @@ def create_app() -> FastAPI:
 
     # Appointments + service items.
     app.include_router(appointments_router)
+    # Self-service `/me/appointments/*` (date-bucketed, role-scoped;
+    # resolves the caller's identity from the bearer token).
+    app.include_router(appointments_me_router)
 
     # Visits + service items + verification + issues.
     app.include_router(visits_router)

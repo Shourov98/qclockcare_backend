@@ -29,15 +29,21 @@ Endpoints:
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from collections.abc import Sequence
+from datetime import date, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.exceptions import CrossAgencyAccessDeniedError, ForbiddenError
+from src.core.exceptions import (
+    CrossAgencyAccessDeniedError,
+    ForbiddenError,
+    ValidationError,
+)
 from src.core.logging import get_logger
 from src.modules.appointments import service as appointments_service
+from src.modules.appointments.models import Appointment
 from src.modules.appointments.schemas import (
     AppointmentActivityCreateRequest,
     AppointmentActivityResponse,
@@ -52,6 +58,7 @@ from src.modules.appointments.schemas import (
     AppointmentStatusTransitionRequest,
     AppointmentSummaryResponse,
     AppointmentUpdateRequest,
+    CalendarAppointmentsResponse,
 )
 from src.modules.audit_logs import service as audit_logs_service
 from src.modules.identity.dependencies import (
@@ -60,6 +67,7 @@ from src.modules.identity.dependencies import (
     require_role,
 )
 from src.shared.domain.enums import AppointmentStatus, AuditAction, UserRole
+from src.shared.schemas.docs import standard_responses
 from src.shared.schemas.pagination import build_offset_response
 
 logger = get_logger(__name__)
@@ -112,7 +120,40 @@ def _to_response(
     `Appointment.activities` is a lazy-loaded relationship. We only
     include nested items when explicitly requested AND the collection has
     been eager-loaded by the service.
+
+    `Appointment.location_rel` is `lazy="raise"` so we always have to
+    project it explicitly via `getattr(..., None)` (the service-layer
+    eagers, when used, leave the attr as `None` on rows without a
+    location row).
     """
+    location_rel = getattr(appt, "location_rel", None)
+    latitude = (
+        float(location_rel.latitude)
+        if location_rel is not None and location_rel.latitude is not None
+        else None
+    )
+    longitude = (
+        float(location_rel.longitude)
+        if location_rel is not None and location_rel.longitude is not None
+        else None
+    )
+    location_name = (
+        getattr(location_rel, "label", None) if location_rel is not None else None
+    )
+    line1 = (
+        getattr(location_rel, "address_line1", None)
+        if location_rel is not None
+        else None
+    )
+    city = (
+        getattr(location_rel, "city", None) if location_rel is not None else None
+    )
+    state = (
+        getattr(location_rel, "state", None) if location_rel is not None else None
+    )
+    parts = [p for p in (line1, city, state) if p]
+    location_address = ", ".join(parts) if parts else None
+
     data: dict = {
         "id": appt.id,
         "agency_id": appt.agency_id,
@@ -128,6 +169,11 @@ def _to_response(
         "cancelled_at": appt.cancelled_at,
         "created_at": appt.created_at,
         "updated_at": appt.updated_at,
+        "location_id": getattr(appt, "location_id", None),
+        "latitude": latitude,
+        "longitude": longitude,
+        "location_name": location_name,
+        "location_address": location_address,
     }
     if with_items:
         try:
@@ -309,6 +355,7 @@ async def get_appointment_endpoint(
         agency_id=agency_id,
         with_activities=False,
         with_patient=True,
+        with_location=True,
     )
     _ensure_can_view(ctx, appt.patient.user_id)
     return _to_response(appt, with_items=False)
@@ -333,6 +380,7 @@ async def get_appointment_with_items_endpoint(
         with_activities=True,
         with_patient=True,
         with_signature=True,
+        with_location=True,
     )
     _ensure_can_view(ctx, appt.patient.user_id)
     return _to_response(appt, with_items=True)
@@ -894,4 +942,256 @@ async def delete_activity_endpoint(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-__all__ = ["router"]
+# --------------------------------------------------------------------------
+# Self-service `/me/appointments/*` routes — date-bucketed, no pagination.
+#
+# The `/appointments?page=&page_size=` endpoint is paginated for admin
+# tooling but the FE calendar UI wants date-bucketed, role-scoped
+# responses ("today / upcoming / past"). These endpoints:
+#   - resolve the caller's patient / staff / guardian linkage from
+#     `ctx.user_id` server-side (so the URL doesn't leak identity),
+#   - take an inclusive `date_from` / `date_to` calendar window,
+#   - return either a flat list (`/calendar`) or a bucketed shape
+#     (`/calendar/grouped`) — the FE picks whichever it needs.
+#
+# `AGENCY_ADMIN` and `SUPER_ADMIN` keep using `/appointments` for
+# cross-user lookups.
+# --------------------------------------------------------------------------
+me_router = APIRouter(prefix="/me/appointments", tags=["appointments"])
+
+
+def _today_utc() -> date:
+    """Calendar today in UTC.
+
+    The FE renders the "Today" bucket against the user's local day,
+    but the bucket boundaries are computed server-side from the
+    stored timestamps (which are stored in UTC). Treating "today" as
+    `utc_now().date()` keeps the bucket stable across timezones; if
+    the FE needs a per-user timezone it can split buckets client-side
+    using `scheduled_start`.
+    """
+    from src.shared.utils.datetime_utils import utc_now
+
+    return utc_now().date()
+
+
+def _bucket(
+    rows: Sequence[Appointment],
+) -> tuple[list, list, list]:
+    """Partition a flat list of appointments into (today, upcoming, past).
+
+    Each item is projected to `AppointmentSummaryResponse` via the
+    shared `_summarize_to_dict` helper so the wire shape matches
+    everything else the FE already renders.
+    """
+    today = _today_utc()
+    today_list: list = []
+    upcoming_list: list = []
+    past_list: list = []
+    for appt in rows:
+        start = getattr(appt, "scheduled_start", None)
+        summary = AppointmentSummaryResponse.model_validate(
+            appointments_service._summarize_to_dict(appt)
+        )
+        if start is None:
+            # Defensive — every appointment has a scheduled_start but
+            # if we ever accept "unscheduled" rows we still render them
+            # in the upcoming bucket so they're visible.
+            upcoming_list.append(summary)
+            continue
+        if start.date() == today:
+            today_list.append(summary)
+        elif start.date() > today:
+            upcoming_list.append(summary)
+        else:
+            past_list.append(summary)
+    return today_list, upcoming_list, past_list
+
+
+@me_router.get(
+    "/calendar",
+    response_model=list[AppointmentSummaryResponse],
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Caller's appointments in a date window (no pagination)",
+    description=(
+        "Self-service. Returns every appointment for the caller "
+        "within `[date_from, date_to]` (both inclusive, calendar "
+        "dates in UTC), sorted ascending by `scheduled_start`. "
+        "No pagination — the FE calendar typically wants every "
+        "appointment in a 1-3 month window.\n\n"
+        "Role scope:\n"
+        "  - **PATIENT** — appointments where `patient_id == caller`\n"
+        "  - **STAFF**   — appointments where `staff_id == caller's staff profile`\n"
+        "  - **GUARDIAN**— appointments for every patient the caller is currently linked to\n\n"
+        "Defaults to a ±30 day window around today if no dates are given."
+    ),
+    dependencies=[
+        Depends(
+            require_role(
+                UserRole.PATIENT, UserRole.STAFF, UserRole.GUARDIAN
+            )
+        )
+    ],
+)
+async def my_calendar_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+    date_from: date | None = Query(
+        default=None,
+        description="Inclusive start date (YYYY-MM-DD). Default: today - 30 days.",
+    ),
+    date_to: date | None = Query(
+        default=None,
+        description="Inclusive end date (YYYY-MM-DD). Default: today + 60 days.",
+    ),
+    status_filter: AppointmentStatus | None = Query(
+        default=None, alias="status"
+    ),
+) -> list[AppointmentSummaryResponse]:
+    from src.modules.patients import service as patients_service
+
+    agency_id = _require_agency(ctx)
+    today = _today_utc()
+    effective_from = date_from or (today - timedelta(days=30))
+    effective_to = date_to or (today + timedelta(days=60))
+    if effective_to < effective_from:
+        raise ValidationError(
+            "date_to must be on or after date_from.",
+            details={
+                "date_from": effective_from.isoformat(),
+                "date_to": effective_to.isoformat(),
+            },
+        )
+
+    patient_id: uuid.UUID | None = None
+    staff_id: uuid.UUID | None = None
+
+    if ctx.role == UserRole.PATIENT:
+        patient = await patients_service.get_patient_by_user_id(
+            session, user_id=ctx.user_id, agency_id=agency_id
+        )
+        patient_id = patient.id
+    elif ctx.role == UserRole.STAFF:
+        from src.modules.staff import service as staff_service
+
+        staff = await staff_service.get_staff_by_user_id(
+            session, user_id=ctx.user_id, agency_id=agency_id
+        )
+        staff_id = staff.id
+    elif ctx.role == UserRole.GUARDIAN:
+        guardian = await patients_service.get_guardian_by_user_id(
+            session, user_id=ctx.user_id, agency_id=agency_id
+        )
+        patient_ids = await patients_service.list_guardian_patient_ids(
+            session, guardian_id=guardian.id, agency_id=agency_id
+        )
+        if not patient_ids:
+            return []
+        # `list_appointments_in_window` only takes one patient_id, so
+        # fan out per-patient and merge. For a typical guardian with
+        # 1-3 linked patients the cost is fine; the alternative would
+        # be a `patient_ids` filter on the service layer.
+        merged: list[AppointmentSummaryResponse] = []
+        for pid in patient_ids:
+            rows = await appointments_service.list_appointments_in_window(
+                session,
+                agency_id=agency_id,
+                date_from=effective_from,
+                date_to=effective_to,
+                patient_id=pid,
+                status_filter=status_filter,
+                include_past=True,
+            )
+            merged.extend(
+                AppointmentSummaryResponse.model_validate(
+                    appointments_service._summarize_to_dict(r)
+                )
+                for r in rows
+            )
+        merged.sort(key=lambda a: a.scheduled_start)
+        return merged
+
+    rows = await appointments_service.list_appointments_in_window(
+        session,
+        agency_id=agency_id,
+        date_from=effective_from,
+        date_to=effective_to,
+        patient_id=patient_id,
+        staff_id=staff_id,
+        status_filter=status_filter,
+        include_past=True,
+    )
+    return [
+        AppointmentSummaryResponse.model_validate(
+            appointments_service._summarize_to_dict(r)
+        )
+        for r in rows
+    ]
+
+
+@me_router.get(
+    "/calendar/grouped",
+    response_model=CalendarAppointmentsResponse,
+    responses=standard_responses(include=[401, 403, 404]),
+    summary="Caller's appointments bucketed (today / upcoming / past)",
+    description=(
+        "Self-service. Same data as `/me/appointments/calendar` but "
+        "partitioned into three buckets so the FE calendar can render "
+        "today / upcoming / past sections directly without re-bucketing "
+        "client-side. Bucket boundaries are computed in UTC."
+    ),
+    dependencies=[
+        Depends(
+            require_role(
+                UserRole.PATIENT, UserRole.STAFF, UserRole.GUARDIAN
+            )
+        )
+    ],
+)
+async def my_calendar_grouped_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+    date_from: date | None = Query(
+        default=None,
+        description="Inclusive start date (YYYY-MM-DD). Default: today - 30 days.",
+    ),
+    date_to: date | None = Query(
+        default=None,
+        description="Inclusive end date (YYYY-MM-DD). Default: today + 60 days.",
+    ),
+    status_filter: AppointmentStatus | None = Query(
+        default=None, alias="status"
+    ),
+) -> CalendarAppointmentsResponse:
+    # Reuse the flat endpoint so role scoping + filtering stays in
+    # one place; just partition its output into buckets here.
+    flat = await my_calendar_endpoint(
+        ctx=ctx,
+        session=session,
+        date_from=date_from,
+        date_to=date_to,
+        status_filter=status_filter,
+    )
+    today = _today_utc()
+    today_list: list[AppointmentSummaryResponse] = []
+    upcoming_list: list[AppointmentSummaryResponse] = []
+    past_list: list[AppointmentSummaryResponse] = []
+    for appt in flat:
+        if appt.scheduled_start is None:
+            upcoming_list.append(appt)
+            continue
+        d = appt.scheduled_start.date()
+        if d == today:
+            today_list.append(appt)
+        elif d > today:
+            upcoming_list.append(appt)
+        else:
+            past_list.append(appt)
+    return CalendarAppointmentsResponse(
+        today=today_list,
+        upcoming=upcoming_list,
+        past=past_list,
+    )
+
+
+__all__ = ["router", "me_router"]

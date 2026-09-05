@@ -47,6 +47,7 @@ from src.shared.domain.enums import (
 
 if TYPE_CHECKING:
     from src.modules.agencies.models import Agency
+    from src.modules.locations.models import Location
     from src.modules.patients.models import PatientProfile
     from src.modules.staff.models import StaffProfile
     from src.modules.visits.models import Visit
@@ -115,6 +116,15 @@ class Appointment(IdMixin, TimestampedMixin, Base):
 
     # Context
     location: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Structured location — points to a row in the `locations` table
+    # which carries lat/lng + structured address. Nullable so legacy
+    # free-text `location` rows keep working; new appointments should
+    # prefer this FK so the FE can render a map pin.
+    location_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Cancellation (exception edge)
@@ -148,6 +158,11 @@ class Appointment(IdMixin, TimestampedMixin, Base):
     # Relationships
     agency: Mapped[Agency] = relationship(
         "Agency", back_populates="appointments"
+    )
+    location_rel: Mapped["Location | None"] = relationship(
+        "Location",
+        foreign_keys=[location_id],
+        lazy="raise",  # never implicit — eager-load explicitly via selectinload
     )
     patient: Mapped[PatientProfile] = relationship(
         "PatientProfile", back_populates="appointments"
@@ -183,6 +198,12 @@ class Appointment(IdMixin, TimestampedMixin, Base):
                 "status IN ('SCHEDULED', 'READY', 'IN_PROGRESS', "
                 "'AWAITING_SIGNATURE')"
             ),
+        ),
+        Index(
+            "idx_appointments_agency_location",
+            "agency_id",
+            "location_id",
+            postgresql_where=text("location_id IS NOT NULL"),
         ),
         CheckConstraint(
             "scheduled_end > scheduled_start",

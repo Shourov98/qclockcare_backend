@@ -41,6 +41,12 @@ class AppointmentCreateRequest(BaseModel):
     scheduled_start: datetime
     scheduled_end: datetime
     location: Annotated[str, StringConstraints(max_length=512)] | None = None
+    # Optional structured location — points to a row in the `locations`
+    # table which carries lat/lng + structured address. Both `location`
+    # and `location_id` can be set (e.g. agency title in `location`,
+    # FK in `location_id`) or only one. New appointments should prefer
+    # `location_id` so the FE can render a map pin.
+    location_id: UUID | None = None
     notes: Annotated[str, StringConstraints(max_length=4000)] | None = None
     # Optional initial set of activities (free-text per spec §2)
     activities: list[AppointmentActivityCreateRequest] = Field(
@@ -69,6 +75,10 @@ class AppointmentUpdateRequest(BaseModel):
     scheduled_start: datetime | None = None
     scheduled_end: datetime | None = None
     location: Annotated[str, StringConstraints(max_length=512)] | None = None
+    # Use `None` to leave unchanged; send a UUID to set/replace; the
+    # FE doesn't currently have a way to clear an existing FK — if
+    # that becomes a need, we'd switch to a sentinel pattern.
+    location_id: UUID | None = None
     notes: Annotated[str, StringConstraints(max_length=4000)] | None = None
 
     @model_validator(mode="after")
@@ -110,6 +120,14 @@ class AppointmentResponse(BaseModel):
     cancelled_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    # Structured location FK — same as the summary response. Surfaced
+    # on the full response too so admin detail pages can show the map
+    # pin without needing the summary endpoint.
+    location_id: UUID | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    location_name: str | None = None
+    location_address: str | None = None
     # Optional nested — populated only by GET /appointments/{id}/with-items
     activities: list[AppointmentActivityResponse] | None = None
     # Patient-or-guardian signature captured at the visit level. The
@@ -163,6 +181,16 @@ class AppointmentSummaryResponse(BaseModel):
     # summary so the patient mobile app doesn't need a second round trip
     # to display "123 Oak St, Saint Paul MN".
     location_label: str | None = None
+    # ----- Structured location (the `locations` row this appointment points to) -----
+    # Lets the FE render a map pin without a second round trip. Populated
+    # by `_summarize_to_dict` when `Appointment.location_rel` is
+    # eagerly loaded via `selectinload`. All three are nullable because
+    # the appointment may not be linked to a `locations` row.
+    location_id: UUID | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    location_name: str | None = None
+    location_address: str | None = None
     # ----- Patient identity (header card) -----
     # `patient_name` is the full name; `patient_initials` is the avatar
     # initials ("JS"); `patient_code` is the per-agency patient code
@@ -383,12 +411,36 @@ class PatientDashboardSummaryResponse(BaseModel):
     lifetime: PatientLifetimeStats
 
 
+class CalendarAppointmentsResponse(BaseModel):
+    """Bucketed appointments for the FE's calendar UI.
+
+    Used by `/me/appointments/calendar/grouped`. The three buckets
+    partition the window returned by `list_appointments_in_window`
+    (which itself is constrained by `date_from` / `date_to`):
+
+      - `today`     — appointments whose scheduled_start falls on
+                      the current calendar day in UTC.
+      - `upcoming`  — appointments after today (within the window).
+      - `past`      — appointments before today (within the window).
+
+    Each item reuses `AppointmentSummaryResponse` so the FE doesn't
+    need a separate card type for calendar cells.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    today: list[AppointmentSummaryResponse] = Field(default_factory=list)
+    upcoming: list[AppointmentSummaryResponse] = Field(default_factory=list)
+    past: list[AppointmentSummaryResponse] = Field(default_factory=list)
+
+
 # --------------------------------------------------------------------------
 # Forward refs
 # --------------------------------------------------------------------------
 AppointmentCreateRequest.model_rebuild()
 AppointmentResponse.model_rebuild()
 PatientDashboardSummaryResponse.model_rebuild()
+CalendarAppointmentsResponse.model_rebuild()
 
 
 __all__ = [

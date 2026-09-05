@@ -19,8 +19,9 @@ Run:
 
     uv run python scripts/seed_appointments.py
 
-What gets created (8 appointments, each with 3 activities):
+What gets created (14 appointments, each with 3 activities):
 
+  ## Lifecycle demo (8 — drives the agency-admin / staff dashboards):
   A1  SCHEDULED                 today 14:00 - 15:00    Morning meds
   A2  READY                     today 16:00 - 17:00   Vitals check
   A3  IN_PROGRESS               now-30m               Bathing assistance
@@ -29,6 +30,15 @@ What gets created (8 appointments, each with 3 activities):
   A6  CANCELLED                 2 days ago            Rescheduled by family
   A7  MISSED                    3 days ago            Caregiver no-show
   A8  COMPLETED + disputed      4 days ago            Patient disputed duration
+
+  ## Upcoming calendar demo (6 — drives the patient FE dashboard /
+  ## calendar UI so frontend devs can visualize the upcoming list):
+  U1  SCHEDULED  staff unassigned   +2h              Morning medication
+  U2  READY      Dev Staff          +5h              Vitals check
+  U3  SCHEDULED  Dev Staff          +1 day 09:00     Personal care
+  U4  SCHEDULED  Dev Staff          +3 days 14:00    Therapy session
+  U5  SCHEDULED  Dev Staff          +7 days 10:00    Weekly assessment
+  U6  SCHEDULED  unassigned         +30 days 11:00   Monthly check-in
 
 Dependencies:
   - Run `scripts/seed_test_user.py` first. This script looks up the
@@ -234,6 +244,76 @@ async def _require_seeded_ids(engine: AsyncEngine) -> SeededIds:
         )
 
 
+DEV_LOCATION_LABEL = "Patient Residence — 123 Oak St"
+DEV_LOCATION_LINE1 = "123 Oak St"
+DEV_LOCATION_CITY = "Springfield"
+DEV_LOCATION_STATE = "MN"
+DEV_LOCATION_POSTAL = "55101"
+DEV_LOCATION_LAT = 44.9778
+DEV_LOCATION_LNG = -93.2650
+DEV_LOCATION_RADIUS_M = 150
+
+
+async def _seed_locations(
+    engine: AsyncEngine,
+    *,
+    ids: SeededIds,
+) -> uuid.UUID:
+    """Insert (or reuse) the dev `locations` row every appointment points to.
+
+    We want one canonical address + lat/lng for the dev seed so the FE
+    map view renders a consistent pin across every appointment. The
+    migration `0033_appointment_location_id` made `appointments.location_id`
+    nullable — older rows may still have NULL — so this helper is
+    idempotent: if a row already exists for the same
+    `(agency_id, label)` triple we reuse its id, otherwise we insert.
+    """
+    async with engine.begin() as conn:
+        existing = (
+            await conn.execute(
+                text(
+                    "SELECT id FROM locations "
+                    "WHERE agency_id = :a AND label = :l "
+                    "AND deleted_at IS NULL"
+                ),
+                {"a": ids.agency_id, "l": DEV_LOCATION_LABEL},
+            )
+        ).first()
+        if existing is not None:
+            print(f"  reusing existing location {existing[0]}")
+            return existing[0]
+        new_id = uuid.uuid4()
+        await conn.execute(
+            text(
+                "INSERT INTO locations ("
+                "id, agency_id, label, "
+                "address_line1, address_line2, city, state, postal_code, country, "
+                "latitude, longitude, geofence_radius_m, is_active, "
+                "created_at, updated_at"
+                ") VALUES ("
+                ":id, :agency, :label, "
+                ":line1, NULL, :city, :state, :postal, 'US', "
+                ":lat, :lng, :radius, true, "
+                "now(), now()"
+                ")"
+            ),
+            {
+                "id": new_id,
+                "agency": ids.agency_id,
+                "label": DEV_LOCATION_LABEL,
+                "line1": DEV_LOCATION_LINE1,
+                "city": DEV_LOCATION_CITY,
+                "state": DEV_LOCATION_STATE,
+                "postal": DEV_LOCATION_POSTAL,
+                "lat": DEV_LOCATION_LAT,
+                "lng": DEV_LOCATION_LNG,
+                "radius": DEV_LOCATION_RADIUS_M,
+            },
+        )
+        print(f"  inserted location {new_id}")
+        return new_id
+
+
 async def _wipe(engine: AsyncEngine) -> None:
     """Clear rows in dependency order.
 
@@ -296,11 +376,17 @@ async def _seed() -> SeedResult:
         print(f"  staff={ids.staff_profile_id} "
               f"patient={ids.patient_profile_id}")
 
+        print("Seeding the dev `locations` row (idempotent)…")
+        location_id = await _seed_locations(engine, ids=ids)
+
         print("Wiping existing appointments + visits + signatures + EVV + notes…")
         await _wipe(engine)
 
-        print("Inserting 8 appointments across the lifecycle…")
-        result = await _insert_appointments(engine, ids=ids)
+        print(
+            "Inserting 14 appointments "
+            "(8 lifecycle demo + 6 upcoming for the patient calendar)…"
+        )
+        result = await _insert_appointments(engine, ids=ids, location_id=location_id)
         return result
     finally:
         await engine.dispose()
@@ -310,10 +396,13 @@ async def _insert_appointments(
     engine: AsyncEngine,
     *,
     ids: SeededIds,
+    location_id: uuid.UUID,
 ) -> SeedResult:
     """Insert 8 appointments + activities + (for active/completed states)
     a materialized `Visit` row + per-activity deliveries + EVVRecord +
-    visit notes + signature + billing.
+    visit notes + signature + billing. Every appointment also gets
+    `location_id` set to the single dev `locations` row so the FE can
+    render a map pin across the lifecycle demo.
     """
     now = _now()
 
@@ -465,6 +554,89 @@ async def _insert_appointments(
             ],
             "program_type": "PCA",
         },
+        # ---- Upcoming calendar demo (drives patient dashboard / FE) ----
+        # U1 — same-day SCHEDULED, no staff yet (admin still working).
+        {
+            "code": "U1",
+            "status": "SCHEDULED",
+            "start_delta_h": 2,
+            "duration_h": 1,
+            "title": "Follow-up medication pass",
+            "notes": "Afternoon medication. Admin still assigning staff.",
+            "location": "Patient residence — 123 Oak St, Springfield",
+            "with_visit": False,
+            "unassigned": True,
+            "program_type": "PCA",
+        },
+        # U2 — same-day READY, staff accepted, ~5h out.
+        {
+            "code": "U2",
+            "status": "READY",
+            "start_delta_h": 5,
+            "duration_h": 1,
+            "title": "Evening vitals + wound inspection",
+            "notes": "Caregiver accepted. Please arrive 10 min early.",
+            "location": "Patient residence — 123 Oak St, Springfield",
+            "with_visit": False,
+            "program_type": "PCA",
+        },
+        # U3 — tomorrow at 09:00.
+        {
+            "code": "U3",
+            "status": "SCHEDULED",
+            "start_local": (now + timedelta(days=1)).replace(
+                hour=9, minute=0, second=0, microsecond=0
+            ),
+            "duration_h": 1.5,
+            "title": "Morning personal care",
+            "notes": "Bathing, dressing, light breakfast prep.",
+            "location": "Patient residence — 123 Oak St, Springfield",
+            "with_visit": False,
+            "program_type": "PCA",
+        },
+        # U4 — 3 days out at 14:00.
+        {
+            "code": "U4",
+            "status": "SCHEDULED",
+            "start_local": (now + timedelta(days=3)).replace(
+                hour=14, minute=0, second=0, microsecond=0
+            ),
+            "duration_h": 1,
+            "title": "Physical therapy session",
+            "notes": "Range-of-motion exercises per care plan.",
+            "location": "Patient residence — 123 Oak St, Springfield",
+            "with_visit": False,
+            "program_type": "PCA",
+        },
+        # U5 — 7 days out at 10:00 (weekly).
+        {
+            "code": "U5",
+            "status": "SCHEDULED",
+            "start_local": (now + timedelta(days=7)).replace(
+                hour=10, minute=0, second=0, microsecond=0
+            ),
+            "duration_h": 1,
+            "title": "Weekly wellness assessment",
+            "notes": "Routine check-in. BP, HR, weight log.",
+            "location": "Patient residence — 123 Oak St, Springfield",
+            "with_visit": False,
+            "program_type": "PCA",
+        },
+        # U6 — 30 days out (monthly), unassigned.
+        {
+            "code": "U6",
+            "status": "SCHEDULED",
+            "start_local": (now + timedelta(days=30)).replace(
+                hour=11, minute=0, second=0, microsecond=0
+            ),
+            "duration_h": 1,
+            "title": "Monthly comprehensive check-in",
+            "notes": "Care-plan review with family present.",
+            "location": "Patient residence — 123 Oak St, Springfield",
+            "with_visit": False,
+            "unassigned": True,
+            "program_type": "PCA",
+        },
     ]
 
     appt_n = 0
@@ -478,7 +650,17 @@ async def _insert_appointments(
     async with engine.begin() as conn:
         for spec in appt_specs:
             appt_id = uuid.uuid4()
-            scheduled_start = now + timedelta(hours=spec["start_delta_h"])
+            if "start_local" in spec:
+                # Absolute UTC datetime — for upcoming calendar rows we
+                # want predictable times ("tomorrow 09:00") rather than
+                # `now + N hours` which drifts based on the wall clock.
+                local = spec["start_local"]
+                if local.tzinfo is None:
+                    scheduled_start = local.replace(tzinfo=UTC)
+                else:
+                    scheduled_start = local.astimezone(UTC)
+            else:
+                scheduled_start = now + timedelta(hours=spec["start_delta_h"])
             scheduled_end = scheduled_start + timedelta(hours=spec["duration_h"])
             claim_id = _make_claim_id(ids.agency_name, appt_id)
 
@@ -508,7 +690,7 @@ async def _insert_appointments(
                     "id, agency_id, patient_id, staff_id, "
                     "program_type, "
                     "scheduled_start, scheduled_end, status, "
-                    "location, notes, "
+                    "location, location_id, notes, "
                     "cancelled_reason, cancelled_at, "
                     "billing_status, billing_paid_at, billing_paid_by_user_id, "
                     "claim_id, "
@@ -517,7 +699,7 @@ async def _insert_appointments(
                     ":id, :agency, :patient, :staff, "
                     ":program, "
                     ":start, :end, :status, "
-                    ":location, :notes, "
+                    ":location, :location_id, :notes, "
                     ":cancelled_reason, :cancelled_at, "
                     ":billing_status, :billing_paid_at, :billing_paid_by, "
                     ":claim_id, "
@@ -528,12 +710,17 @@ async def _insert_appointments(
                     "id": appt_id,
                     "agency": ids.agency_id,
                     "patient": ids.patient_profile_id,
-                    "staff": ids.staff_profile_id,
+                    "staff": (
+                        ids.staff_profile_id
+                        if not spec.get("unassigned")
+                        else None
+                    ),
                     "program": spec.get("program_type"),
                     "start": scheduled_start,
                     "end": scheduled_end,
                     "status": spec["status"],
                     "location": spec["location"],
+                    "location_id": location_id,
                     "notes": spec["notes"],
                     "cancelled_reason": cancelled_reason,
                     "cancelled_at": cancelled_at,
@@ -707,12 +894,12 @@ async def _insert_appointments(
                 await conn.execute(
                     text(
                         "INSERT INTO visit_activity_deliveries ("
-                        "id, visit_id, appointment_service_item_id, "
+                        "id, visit_id, agency_id, activity_id, "
                         "status, reason, note, "
                         "completed_at, completed_by, "
                         "created_at, updated_at"
                         ") VALUES ("
-                        ":id, :visit, :activity, "
+                        ":id, :visit, :agency, :activity, "
                         ":status, :reason, :note, "
                         ":completed_at, :completed_by, "
                         "now(), now()"
@@ -721,6 +908,7 @@ async def _insert_appointments(
                     {
                         "id": uuid.uuid4(),
                         "visit": visit_id,
+                        "agency": ids.agency_id,
                         "activity": aid,
                         "status": status_label,
                         "reason": reason,
