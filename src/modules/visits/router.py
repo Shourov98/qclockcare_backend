@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from datetime import date, timedelta
 from typing import Annotated
 
 from fastapi import (
@@ -81,7 +82,9 @@ from src.modules.visits.schemas import (
     VisitSummaryResponse,
 )
 from src.shared.domain.enums import AuditAction, UserRole, VisitStatus
+from src.shared.schemas.docs import standard_responses
 from src.shared.schemas.pagination import build_offset_response
+from src.shared.utils.datetime_utils import utc_now
 
 logger = get_logger(__name__)
 
@@ -862,4 +865,172 @@ async def sign_visit_endpoint(
     return AppointmentSignatureResponse.model_validate(sig)
 
 
-__all__ = ["router"]
+__all__ = ["router", "me_router"]
+
+
+# --------------------------------------------------------------------------
+# /me/visits — self-service date-window listing
+# --------------------------------------------------------------------------
+# Same pattern as /me/appointments/calendar (see appointments/router.py):
+#   - role-gated to PATIENT / STAFF / GUARDIAN
+#   - caller identity resolved from `ctx.user_id` (no PII in the URL)
+#   - no pagination; date window only
+#   - eager-loads staff + parent appointment so the FE renders each
+#     visit card without N+1 round trips
+#
+# AGENCY_ADMIN keeps using /visits for cross-user lookups.
+# --------------------------------------------------------------------------
+
+
+me_router = APIRouter(prefix="/me/visits", tags=["visits"])
+
+
+def _visit_to_summary(visit: object) -> VisitSummaryResponse:
+    """Project a `Visit` ORM row to `VisitSummaryResponse`, including
+    the joined fields the FE renders in calendar cards.
+    """
+    staff_name: str | None = None
+    try:
+        staff = getattr(visit, "staff", None)
+        if staff is not None:
+            user = getattr(staff, "user", None)
+            if user is not None:
+                staff_name = getattr(user, "full_name", None)
+    except Exception:
+        staff_name = None
+
+    scheduled_start = None
+    try:
+        appt = getattr(visit, "appointment", None)
+        if appt is not None:
+            scheduled_start = getattr(appt, "scheduled_start", None)
+    except Exception:
+        scheduled_start = None
+
+    return VisitSummaryResponse(
+        id=visit.id,
+        appointment_id=visit.appointment_id,
+        agency_id=visit.agency_id,
+        staff_id=visit.staff_id,
+        status=visit.status,
+        billing_confirmed_at=getattr(visit, "billing_confirmed_at", None),
+        live_lat=getattr(visit, "live_lat", None),
+        live_lng=getattr(visit, "live_lng", None),
+        live_ping_at=getattr(visit, "live_ping_at", None),
+        live_accuracy_m=getattr(visit, "live_accuracy_m", None),
+        sharing_location=getattr(visit, "sharing_location", False),
+        created_at=visit.created_at,
+        updated_at=visit.updated_at,
+        staff_name=staff_name,
+        patient_name=None,
+        service_item_count=0,
+        duration_label=None,
+        scheduled_start=scheduled_start,
+    )
+
+
+@me_router.get(
+    "",
+    response_model=list[VisitSummaryResponse],
+    responses=standard_responses(include=[401, 403]),
+    summary="Caller's visits in a date window (no pagination)",
+    description=(
+        "Self-service. Returns every visit for the caller within "
+        "`[date_from, date_to]` (both inclusive, calendar dates in "
+        "UTC), sorted ascending by the parent appointment's "
+        "`scheduled_start`. No pagination — the FE calendar typically "
+        "wants every visit in a 1-3 month window.\n\n"
+        "Role scope:\n"
+        "  - **PATIENT**  — visits whose appointment.patient_id is the caller\n"
+        "  - **STAFF**    — visits where `staff_id` is the caller's staff profile\n"
+        "  - **GUARDIAN** — visits for every patient the caller is currently linked to\n\n"
+        "Defaults to a ±30 day window around today if no dates are given."
+    ),
+    dependencies=[
+        Depends(
+            require_role(
+                UserRole.PATIENT, UserRole.STAFF, UserRole.GUARDIAN
+            )
+        )
+    ],
+)
+async def my_visits_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+    date_from: date | None = Query(
+        default=None,
+        description="Inclusive start date (YYYY-MM-DD). Default: today - 30 days.",
+    ),
+    date_to: date | None = Query(
+        default=None,
+        description="Inclusive end date (YYYY-MM-DD). Default: today + 60 days.",
+    ),
+    status_filter: VisitStatus | None = Query(
+        default=None, alias="status"
+    ),
+) -> list[VisitSummaryResponse]:
+    from src.modules.patients import service as patients_service
+
+    agency_id = _require_agency(ctx)
+    today = utc_now().date()
+    effective_from = date_from or (today - timedelta(days=30))
+    effective_to = date_to or (today + timedelta(days=60))
+    if effective_to < effective_from:
+        raise ValidationError(
+            "date_to must be on or after date_from.",
+            details={
+                "date_from": effective_from.isoformat(),
+                "date_to": effective_to.isoformat(),
+            },
+        )
+
+    patient_id: uuid.UUID | None = None
+    staff_id: uuid.UUID | None = None
+
+    if ctx.role == UserRole.PATIENT:
+        patient = await patients_service.get_patient_by_user_id(
+            session, user_id=ctx.user_id, agency_id=agency_id
+        )
+        patient_id = patient.id
+    elif ctx.role == UserRole.STAFF:
+        from src.modules.staff import service as staff_service
+
+        staff = await staff_service.get_staff_by_user_id(
+            session, user_id=ctx.user_id, agency_id=agency_id
+        )
+        staff_id = staff.id
+    elif ctx.role == UserRole.GUARDIAN:
+        guardian = await patients_service.get_guardian_by_user_id(
+            session, user_id=ctx.user_id, agency_id=agency_id
+        )
+        patient_ids = await patients_service.list_guardian_patient_ids(
+            session, guardian_id=guardian.id, agency_id=agency_id
+        )
+        if not patient_ids:
+            return []
+        merged: list[VisitSummaryResponse] = []
+        for pid in patient_ids:
+            rows = await visits_service.list_visits_in_window(
+                session,
+                agency_id=agency_id,
+                date_from=effective_from,
+                date_to=effective_to,
+                patient_id=pid,
+                status_filter=status_filter,
+            )
+            merged.extend(_visit_to_summary(r) for r in rows)
+        merged.sort(
+            key=lambda v: v.scheduled_start or v.created_at
+        )
+        return merged
+
+    rows = await visits_service.list_visits_in_window(
+        session,
+        agency_id=agency_id,
+        date_from=effective_from,
+        date_to=effective_to,
+        patient_id=patient_id,
+        staff_id=staff_id,
+        status_filter=status_filter,
+    )
+    return [_visit_to_summary(r) for r in rows]

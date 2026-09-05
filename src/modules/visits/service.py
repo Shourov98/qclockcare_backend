@@ -433,6 +433,68 @@ async def list_visits(
     return rows, int(total)
 
 
+async def list_visits_in_window(
+    session: AsyncSession,
+    *,
+    agency_id: uuid.UUID,
+    date_from: "datetime.date",
+    date_to: "datetime.date",
+    patient_id: uuid.UUID | None = None,
+    staff_id: uuid.UUID | None = None,
+    status_filter: VisitStatus | None = None,
+    sharing_only: bool = False,
+) -> Sequence[Visit]:
+    """Date-window visit list — NO pagination.
+
+    Mirrors `list_appointments_in_window` (appointments module): the
+    FE calendar typically wants *every* visit for a 1-3 month window,
+    not paginated chunks. Date filtering happens on the parent
+    appointment's `scheduled_start` so the bucket aligns with what the
+    appointments calendar shows.
+
+    Eager-loads the same relations as `list_visits` (staff→user,
+    evv_record, parent appointment) so the FE can render each card
+    without N+1 round trips.
+
+    Returns visits in ascending scheduled_start order. The caller is
+    responsible for role-based visibility — this helper applies
+    agency scoping only (RLS narrows further for PATIENT/GUARDIAN).
+    """
+    # Local import to avoid circulars at module import time.
+    import datetime as _dt
+
+    base = (
+        select(Visit)
+        .where(Visit.agency_id == agency_id)
+        # Date window via the parent appointment's scheduled_start.
+        # We join unconditionally so the WHERE is applied; the eager-load
+        # below reuses the same join alias to populate `Visit.appointment`.
+        .join(Appointment, Appointment.id == Visit.appointment_id)
+        .where(Appointment.scheduled_start >= _dt.datetime.combine(
+            date_from, _dt.time.min, tzinfo=_dt.timezone.utc))
+        .where(Appointment.scheduled_start < _dt.datetime.combine(
+            date_to + _dt.timedelta(days=1), _dt.time.min,
+            tzinfo=_dt.timezone.utc))
+        .options(
+            selectinload(Visit.staff).selectinload(StaffProfile.user),
+            selectinload(Visit.evv_record),
+            selectinload(Visit.appointment),
+        )
+    )
+    if patient_id is not None:
+        base = base.where(Appointment.patient_id == patient_id)
+    if staff_id is not None:
+        base = base.where(Visit.staff_id == staff_id)
+    if status_filter is not None:
+        base = base.where(Visit.status == status_filter)
+    if sharing_only:
+        base = base.where(Visit.sharing_location.is_(True))
+
+    base = base.order_by(Appointment.scheduled_start.asc(), Visit.id)
+    rows = (await session.execute(base)).scalars().all()
+    return rows
+
+
 # --------------------------------------------------------------------------
 # Visit history (completed-only, per-role views)
 # --------------------------------------------------------------------------
@@ -1219,6 +1281,7 @@ __all__ = [
     "list_visit_history",
     "list_visit_notes",
     "list_visits",
+    "list_visits_in_window",
     "record_location_ping",
     "sign_visit",
     "start_location_sharing",

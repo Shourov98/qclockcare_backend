@@ -237,6 +237,11 @@ class VisitSummaryResponse(BaseModel):
     patient_name: str | None = None
     service_item_count: int = 0  # count of activities on the parent appt
     duration_label: str | None = None
+    # Joined from `Visit.appointment` so the FE calendar can render a
+    # date-ordered visit list without an extra round trip. Optional to
+    # keep backwards compatibility with call sites that don't eager-load
+    # the appointment (admin endpoints, tests).
+    scheduled_start: datetime | None = None
 
 
 # --------------------------------------------------------------------------

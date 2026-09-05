@@ -101,6 +101,7 @@ from src.modules.visits.models import (  # noqa: F401
     VisitNote,
 )
 from src.modules.visits.router import router as visits_router
+from src.modules.visits.router import me_router as visits_me_router
 from src.shared.schemas.docs import (
     OPENAPI_SECURITY,
     OPENAPI_SECURITY_SCHEMES,
@@ -411,6 +412,8 @@ def create_app() -> FastAPI:
 
     # Visits + service items + verification + issues.
     app.include_router(visits_router)
+    # /me/visits — self-service date-window listing for PATIENT/STAFF/GUARDIAN.
+    app.include_router(visits_me_router)
 
     # Patient/Guardian portal — visit history + compliance dashboard.
     app.include_router(portal_router)
