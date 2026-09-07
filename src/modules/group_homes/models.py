@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from sqlalchemy import DateTime, ForeignKey, Integer, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from src.shared.domain.base_entity import Base, IdMixin, TimestampedMixin
@@ -13,6 +13,7 @@ class GroupHome(IdMixin, TimestampedMixin, Base):
     location_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("locations.id", ondelete="RESTRICT"), nullable=False, unique=True)
     name: Mapped[str] = mapped_column(Text, nullable=False)
     capacity: Mapped[int] = mapped_column(Integer, nullable=False, server_default="4")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
 
 
 class GroupHomeMember(IdMixin, TimestampedMixin, Base):
@@ -32,6 +33,7 @@ class GroupHomeAppointment(IdMixin, TimestampedMixin, Base):
     scheduled_start: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=False)
     scheduled_end: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="SCHEDULED")
 
 
 class GroupHomeAppointmentPatient(IdMixin, Base):
