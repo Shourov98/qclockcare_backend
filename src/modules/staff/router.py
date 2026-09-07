@@ -57,6 +57,7 @@ from src.modules.staff.schemas import (
     StaffAvailabilityUpdateRequest,
     StaffProfileCreateRequest,
     StaffProfileResponse,
+    StaffProfileSelfUpdateRequest,
     StaffProfileSummaryResponse,
     StaffProfileUpdateRequest,
     StaffQualificationCreateRequest,
@@ -1000,6 +1001,68 @@ async def get_my_staff_endpoint(
         session, user_id=ctx.user_id, agency_id=agency_id, with_details=False
     )
     return _to_response(staff, with_details=False)
+
+
+@me_router.patch(
+    "",
+    response_model=StaffProfileResponse,
+    responses=standard_responses(include=[401, 403, 404, 422]),
+    summary="Update the caller's own staff profile",
+    description=(
+        "Self-service. Partial update — only fields you set are "
+        "applied. Equivalent to `PATCH /staff/{id}` but the URL "
+        "doesn't carry the caller's identity. Editable fields are the "
+        "user-facing subset (`full_name`, `phone`). Lifecycle fields "
+        "like `staff_code`, `hired_at`, `terminated_at`, and `status` "
+        "stay AGENCY_ADMIN-only."
+    ),
+    dependencies=[Depends(require_role(UserRole.STAFF))],
+)
+async def update_my_staff_endpoint(
+    payload: StaffProfileSelfUpdateRequest,
+    request: Request,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> StaffProfileResponse:
+    """Update the caller's own staff profile (full_name, phone)."""
+    agency_id = _require_agency(ctx)
+    staff = await staff_service.get_staff_by_user_id(
+        session, user_id=ctx.user_id, agency_id=agency_id, with_details=False
+    )
+    updated = await staff_service.update_staff(
+        session,
+        staff_id=staff.id,
+        agency_id=agency_id,
+        # Forward as the admin-shaped payload; admin-only fields are
+        # forced to None so a staff member can't edit them via this route.
+        payload=StaffProfileUpdateRequest(
+            **payload.model_dump(),
+            staff_code=None,
+            hired_at=None,
+            terminated_at=None,
+            status=None,
+        ),
+    )
+    await session.commit()
+    await session.refresh(updated)
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="STAFF_PROFILE",
+            entity_id=updated.id,
+            new_data=payload.model_dump(mode="json"),
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
+    return _to_response(updated, with_details=False)
 
 
 @me_router.get(

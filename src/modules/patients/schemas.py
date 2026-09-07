@@ -108,6 +108,59 @@ class PatientProfileCreateRequest(BaseModel):
     )
 
 
+class PatientProfileSelfUpdateRequest(BaseModel):
+    """PATCH /me/patients — self-service partial update.
+
+    Subset of `PatientProfileUpdateRequest` that a patient is allowed
+    to edit on their own profile. Excludes admin-only fields:
+
+      - `patient_code`, `admitted_at`, `discharged_at`, `status`
+        — agency-internal lifecycle, AGENCY_ADMIN only.
+
+    `email` lives on `users.email` and is intentionally NOT editable
+    here (handled in a separate flow that re-issues a verification
+    OTP). Use `PATCH /auth/me` only as a fallback for `full_name` /
+    `phone` if the FE prefers the legacy route — both routes write
+    to the same underlying `users` row.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "full_name": "Jane Q. Public",
+                    "phone": "+1-612-555-0188",
+                    "preferred_language": "en",
+                    "care_notes": "Hearing aid in left ear.",
+                }
+            ]
+        },
+    )
+
+    full_name: Annotated[
+        str, StringConstraints(min_length=1, max_length=255)
+    ] | None = Field(default=None, description="New display name.")
+    phone: Annotated[str, StringConstraints(max_length=32)] | None = Field(
+        default=None,
+        description="New phone. Send `null` to clear.",
+    )
+    date_of_birth: date | None = Field(default=None, description="New DOB.")
+    gender: Annotated[str, StringConstraints(max_length=64)] | None = Field(
+        default=None, description="New gender label."
+    )
+    preferred_language: Annotated[str, StringConstraints(max_length=64)] | None = Field(
+        default=None, description="New preferred language code."
+    )
+    care_notes: Annotated[str, StringConstraints(max_length=4000)] | None = Field(
+        default=None,
+        description=(
+            "Free-text care notes (allergies, mobility aids, "
+            "communication preferences). Visible to assigned staff."
+        ),
+    )
+
+
 class PatientProfileUpdateRequest(BaseModel):
     """PATCH /patients/{id} — partial update.
 
@@ -362,6 +415,47 @@ class GuardianProfileUpdateRequest(BaseModel):
     status: UserStatus | None = Field(default=None, description="New lifecycle status.")
 
 
+class GuardianProfileSelfUpdateRequest(BaseModel):
+    """PATCH /me/guardians — self-service partial update.
+
+    Same shape as `GuardianProfileUpdateRequest` minus the admin-only
+    `status` field. A guardian can't archive themselves; that's done
+    via `DELETE /guardians/{id}` (AGENCY_ADMIN) or
+    `DELETE /patient-guardian-relationships/{id}` to detach from a
+    patient.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "full_name": "Pat Doe",
+                    "phone": "+1-612-555-0188",
+                    "contact_phone": "+1-612-555-0199",
+                    "notes": "Preferred contact window: 9am-5pm.",
+                }
+            ]
+        },
+    )
+
+    full_name: Annotated[
+        str, StringConstraints(min_length=1, max_length=255)
+    ] | None = Field(default=None, description="New display name.")
+    phone: Annotated[str, StringConstraints(max_length=32)] | None = Field(
+        default=None, description="New personal phone."
+    )
+    contact_phone: Annotated[str, StringConstraints(max_length=32)] | None = Field(
+        default=None, description="New outreach phone."
+    )
+    contact_email: EmailStr | None = Field(
+        default=None, description="New outreach email."
+    )
+    notes: Annotated[str, StringConstraints(max_length=4000)] | None = Field(
+        default=None, description="Updated notes."
+    )
+
+
 class GuardianProfileResponse(BaseModel):
     model_config = ConfigDict(
         from_attributes=True,
@@ -572,12 +666,14 @@ PatientGuardianRelationshipCreateRequest.model_rebuild()
 __all__ = [
     "GuardianProfileCreateRequest",
     "GuardianProfileResponse",
+    "GuardianProfileSelfUpdateRequest",
     "GuardianProfileUpdateRequest",
     "PatientGuardianRelationshipCreateRequest",
     "PatientGuardianRelationshipResponse",
     "PatientGuardianRelationshipUpdateRequest",
     "PatientProfileCreateRequest",
     "PatientProfileResponse",
+    "PatientProfileSelfUpdateRequest",
     "PatientProfileSummaryResponse",
     "PatientProfileUpdateRequest",
 ]

@@ -54,12 +54,14 @@ from src.modules.patients import service as patients_service
 from src.modules.patients.schemas import (
     GuardianProfileCreateRequest,
     GuardianProfileResponse,
+    GuardianProfileSelfUpdateRequest,
     GuardianProfileUpdateRequest,
     PatientGuardianRelationshipCreateRequest,
     PatientGuardianRelationshipResponse,
     PatientGuardianRelationshipUpdateRequest,
     PatientProfileCreateRequest,
     PatientProfileResponse,
+    PatientProfileSelfUpdateRequest,
     PatientProfileSummaryResponse,
     PatientProfileUpdateRequest,
 )
@@ -510,6 +512,63 @@ async def get_my_patient_with_relationships_endpoint(
     return _to_patient_response(patient, with_relationships=True)
 
 
+@router.patch(
+    "/me/patients",
+    response_model=PatientProfileResponse,
+    responses=standard_responses(include=[401, 403, 404, 422]),
+    summary="Update the caller's own patient profile",
+    description=(
+        "Self-service. Partial update — only fields you set are "
+        "applied. Equivalent to `PATCH /patients/{id}` but the URL "
+        "doesn't carry the caller's identity. Editable fields are "
+        "the user-facing subset (`full_name`, `phone`, "
+        "`date_of_birth`, `gender`, `preferred_language`, "
+        "`care_notes`). Agency-internal fields like `patient_code`, "
+        "`admitted_at`, `discharged_at`, and `status` stay "
+        "AGENCY_ADMIN-only."
+    ),
+    dependencies=[Depends(require_role(UserRole.PATIENT))],
+)
+async def update_my_patient_endpoint(
+    payload: PatientProfileSelfUpdateRequest,
+    request: Request,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> PatientProfileResponse:
+    patient = await patients_service.get_patient_by_user_id(
+        session, user_id=ctx.user_id, agency_id=ctx.agency_id
+    )
+    updated = await patients_service.update_patient(
+        session,
+        patient_id=patient.id,
+        agency_id=ctx.agency_id,
+        # Build an admin-shaped payload from the subset the patient is
+        # allowed to touch. The admin service layer accepts None for
+        # every field, so it's safe to forward a half-filled payload.
+        payload=PatientProfileUpdateRequest(**payload.model_dump()),
+    )
+    await session.commit()
+    await session.refresh(updated, attribute_names=["user"])
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=ctx.agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="PATIENT_PROFILE",
+            entity_id=updated.id,
+            new_data=payload.model_dump(mode="json"),
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
+    return _to_patient_response(updated)
+
+
 @router.get(
     "/me/patients/dashboard-summary",
     response_model=PatientDashboardSummaryResponse,
@@ -637,6 +696,62 @@ async def get_my_guardian_endpoint(
         session, user_id=ctx.user_id, agency_id=ctx.agency_id
     )
     return _to_guardian_response(guardian)
+
+
+@router.patch(
+    "/me/guardians",
+    response_model=GuardianProfileResponse,
+    responses=standard_responses(include=[401, 403, 404, 422]),
+    summary="Update the caller's own guardian profile",
+    description=(
+        "Self-service. Partial update — only fields you set are "
+        "applied. Equivalent to `PATCH /guardians/{id}` but the URL "
+        "doesn't carry the caller's identity. Editable fields are the "
+        "user-facing subset (`full_name`, `phone`, `contact_phone`, "
+        "`contact_email`, `notes`). Lifecycle `status` stays "
+        "AGENCY_ADMIN-only."
+    ),
+    dependencies=[Depends(require_role(UserRole.GUARDIAN))],
+)
+async def update_my_guardian_endpoint(
+    payload: GuardianProfileSelfUpdateRequest,
+    request: Request,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> GuardianProfileResponse:
+    guardian = await patients_service.get_guardian_by_user_id(
+        session, user_id=ctx.user_id, agency_id=ctx.agency_id
+    )
+    updated = await patients_service.update_guardian(
+        session,
+        guardian_id=guardian.id,
+        agency_id=ctx.agency_id,
+        # Forward as the admin-shaped payload; status is forced to
+        # None so a guardian can't archive themselves via this route.
+        payload=GuardianProfileUpdateRequest(
+            **payload.model_dump(), status=None
+        ),
+    )
+    await session.commit()
+    await session.refresh(updated, attribute_names=["user"])
+    # Best-effort audit log.
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=ctx.agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="GUARDIAN_PROFILE",
+            entity_id=updated.id,
+            new_data=payload.model_dump(mode="json"),
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
+    return _to_guardian_response(updated)
 
 
 @router.get(

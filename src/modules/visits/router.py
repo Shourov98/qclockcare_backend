@@ -508,6 +508,94 @@ async def transition_visit_endpoint(
 
 
 # --------------------------------------------------------------------------
+# Patient / Guardian self-service: complete a signed visit
+# --------------------------------------------------------------------------
+# Spec §8 calls for a patient signature to "submit" the visit. The
+# existing `PATCH /visits/{id}/transition` is gated to AGENCY_ADMIN +
+# STAFF because it can target *any* visit status (IN_PROGRESS →
+# AWAITING_SIGNATURE requires billing confirmation, etc.). This
+# dedicated endpoint is the patient/guardian-friendly surface for the
+# `AWAITING_SIGNATURE → COMPLETED` edge only — it pins `status =
+# COMPLETED` internally so a patient can't accidentally transition
+# out of an earlier state.
+#
+# The service-layer `_assert_signature_exists` gate still applies:
+# a visit can't be completed without an `AppointmentSignature` row,
+# so the patient must call `POST /visits/{id}/sign` first.
+# --------------------------------------------------------------------------
+
+
+@router.post(
+    "/{visit_id}/complete",
+    response_model=VisitResponse,
+    responses=standard_responses(include=[401, 403, 404, 409]),
+    summary="Submit a signed visit as COMPLETED",
+    description=(
+        "Self-service-friendly. Transitions a signed visit from "
+        "`AWAITING_SIGNATURE` to `COMPLETED`. The visit MUST have a "
+        "patient/guardian signature on file — call "
+        "`POST /visits/{id}/sign` first.\n\n"
+        "Allowed callers: PATIENT, GUARDIAN, AGENCY_ADMIN, STAFF. "
+        "Internally equivalent to "
+        "`PATCH /visits/{id}/transition {status: \"COMPLETED\"}` but "
+        "exposed as a separate route so the patient/guardian role "
+        "gate doesn't accidentally let them move a visit through "
+        "other transitions (which require billing confirmation, etc.)."
+    ),
+    dependencies=[
+        Depends(
+            require_role(
+                UserRole.PATIENT,
+                UserRole.GUARDIAN,
+                UserRole.AGENCY_ADMIN,
+                UserRole.STAFF,
+            )
+        )
+    ],
+)
+async def complete_visit_endpoint(
+    visit_id: uuid.UUID,
+    request: Request,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> VisitResponse:
+    """Patient/guardian-friendly completion endpoint.
+
+    Pins `status = COMPLETED` internally; the service layer's
+    `_assert_signature_exists` enforces that an `AppointmentSignature`
+    row exists before allowing the transition.
+    """
+    agency_id = _require_agency(ctx)
+    ip, ua = audit_logs_service.request_ip_ua(request)
+    visit = await visits_service.transition_visit_status(
+        session,
+        visit_id=visit_id,
+        agency_id=agency_id,
+        payload=VisitStatusTransitionRequest(status=VisitStatus.COMPLETED),
+    )
+    await session.commit()
+    await session.refresh(visit)
+    # Audit log on the COMPLETED edge (matches the existing
+    # `transition_visit_endpoint` audit pattern).
+    try:
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.VISIT_COMPLETED,
+            entity_type="VISIT",
+            entity_id=visit.id,
+            new_data={"status": visit.status.value},
+            ip_address=ip,
+            user_agent=ua,
+        )
+        await session.commit()
+    except Exception:
+        pass
+    return _to_response(visit, with_relations=True)
+
+
+# --------------------------------------------------------------------------
 # Billing confirmation (spec §6)
 # --------------------------------------------------------------------------
 @router.post(

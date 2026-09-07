@@ -142,6 +142,38 @@ class StaffProfileUpdateRequest(BaseModel):
     )
 
 
+class StaffProfileSelfUpdateRequest(BaseModel):
+    """PATCH /me/staff — self-service partial update.
+
+    Subset of `StaffProfileUpdateRequest` that a staff member is
+    allowed to edit on their own profile. Excludes admin-only fields
+    (`staff_code`, `hired_at`, `terminated_at`, `status`).
+
+    The only editable fields are the user-facing ones on the joined
+    `users` row (`full_name`, `phone`).
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {"full_name": "Jenna M. Lopez", "phone": "+1-612-555-9999"}
+            ]
+        },
+    )
+
+    full_name: Annotated[
+        str, StringConstraints(min_length=1, max_length=255)
+    ] | None = Field(
+        default=None,
+        description="New display name (omit to leave unchanged).",
+    )
+    phone: Annotated[str, StringConstraints(max_length=32)] | None = Field(
+        default=None,
+        description="New phone (omit to leave unchanged). Send `null` to clear.",
+    )
+
+
 class StaffProfileResponse(BaseModel):
     """Single staff profile, optionally with nested qualifications + availability."""
 
@@ -765,6 +797,7 @@ __all__ = [
     "StaffAvailabilityUpdateRequest",
     "StaffProfileCreateRequest",
     "StaffProfileResponse",
+    "StaffProfileSelfUpdateRequest",
     "StaffProfileSummaryResponse",
     "StaffProfileUpdateRequest",
     "StaffQualificationCreateRequest",
