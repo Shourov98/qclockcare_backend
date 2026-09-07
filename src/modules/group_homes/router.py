@@ -53,7 +53,7 @@ async def list_homes(ctx: CurrentAuth, session: Annotated[AsyncSession, Depends(
 async def create_home(payload: HomeCreate, ctx: CurrentAuth, session: Annotated[AsyncSession, Depends(get_session)]):
     aid = agency(ctx)
     home = GroupHome(agency_id=aid, location_id=payload.location_id, name=payload.name, capacity=4)
-    session.add(home); await session.commit(); await session.refresh(home)
+    session.add(home); await session.flush()
     return {"id": home.id, "location_id": home.location_id, "name": home.name, "capacity": 4, "is_active": True, "member_count": 0}
 
 @router.patch("/{home_id}", dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))])
@@ -62,7 +62,7 @@ async def update_home(home_id: uuid.UUID, payload: HomeUpdate, ctx: CurrentAuth,
     if not home: raise ValidationError("Group home was not found.")
     if payload.name is not None: home.name = payload.name
     if payload.is_active is not None: home.is_active = payload.is_active
-    await session.commit(); return {"id": home.id, "name": home.name, "is_active": home.is_active}
+    await session.flush(); return {"id": home.id, "name": home.name, "is_active": home.is_active}
 
 @router.get("/{home_id}")
 async def get_home(home_id: uuid.UUID, ctx: CurrentAuth, session: Annotated[AsyncSession, Depends(get_session)]):
@@ -81,14 +81,14 @@ async def add_member(home_id: uuid.UUID, payload: MemberCreate, ctx: CurrentAuth
     if not home or not patient: raise ValidationError("Group home or patient was not found.")
     count = await session.scalar(select(func.count()).select_from(GroupHomeMember).where(GroupHomeMember.group_home_id == home_id, GroupHomeMember.removed_at.is_(None)))
     if (count or 0) >= 4: raise ValidationError("A group home can have at most four active patients.")
-    session.add(GroupHomeMember(group_home_id=home_id, patient_id=payload.patient_id)); await session.commit()
+    session.add(GroupHomeMember(group_home_id=home_id, patient_id=payload.patient_id)); await session.flush()
     return {"group_home_id": home_id, "patient_id": payload.patient_id}
 
 @router.delete("/{home_id}/members/{patient_id}", dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))])
 async def remove_member(home_id: uuid.UUID, patient_id: uuid.UUID, ctx: CurrentAuth, session: Annotated[AsyncSession, Depends(get_session)]):
     member = (await session.execute(select(GroupHomeMember).join(GroupHome).where(GroupHomeMember.group_home_id == home_id, GroupHomeMember.patient_id == patient_id, GroupHome.agency_id == agency(ctx), GroupHomeMember.removed_at.is_(None)))).scalar_one_or_none()
     if not member: raise ValidationError("Active group-home member was not found.")
-    member.removed_at = datetime.now().astimezone(); await session.commit()
+    member.removed_at = datetime.now().astimezone(); await session.flush()
 
 @router.post("/{home_id}/appointments", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))])
 async def create_group_appointment(home_id: uuid.UUID, payload: GroupAppointmentCreate, ctx: CurrentAuth, session: Annotated[AsyncSession, Depends(get_session)]):
@@ -100,11 +100,11 @@ async def create_group_appointment(home_id: uuid.UUID, payload: GroupAppointment
     if not participants or not set(participants).issubset(set(members)): raise ValidationError("Participants must be active patients of this group home.")
     appt = GroupHomeAppointment(agency_id=aid, group_home_id=home_id, staff_id=payload.staff_id, service=payload.service, scheduled_start=payload.scheduled_start, scheduled_end=payload.scheduled_end, notes=payload.notes)
     session.add(appt); await session.flush()
-    session.add_all([GroupHomeAppointmentPatient(group_appointment_id=appt.id, patient_id=pid) for pid in participants]); await session.commit()
+    session.add_all([GroupHomeAppointmentPatient(group_appointment_id=appt.id, patient_id=pid) for pid in participants]); await session.flush()
     return {"id": appt.id, "group_home_id": home_id, "service": appt.service, "scheduled_start": appt.scheduled_start, "scheduled_end": appt.scheduled_end, "patient_ids": participants}
 
 @router.post("/{home_id}/appointments/{appointment_id}/cancel", dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))])
 async def cancel_group_appointment(home_id: uuid.UUID, appointment_id: uuid.UUID, ctx: CurrentAuth, session: Annotated[AsyncSession, Depends(get_session)]):
     row = (await session.execute(select(GroupHomeAppointment).where(GroupHomeAppointment.id == appointment_id, GroupHomeAppointment.group_home_id == home_id, GroupHomeAppointment.agency_id == agency(ctx)))).scalar_one_or_none()
     if not row: raise ValidationError("Group appointment was not found.")
-    row.status = "CANCELLED"; await session.commit(); return {"id": row.id, "status": row.status}
+    row.status = "CANCELLED"; await session.flush(); return {"id": row.id, "status": row.status}
