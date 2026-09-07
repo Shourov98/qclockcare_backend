@@ -55,6 +55,15 @@ async def create_home(payload: HomeCreate, ctx: CurrentAuth, session: Annotated[
     session.add(home); await session.commit(); await session.refresh(home)
     return {"id": home.id, "location_id": home.location_id, "name": home.name, "capacity": 4, "member_count": 0}
 
+@router.get("/{home_id}")
+async def get_home(home_id: uuid.UUID, ctx: CurrentAuth, session: Annotated[AsyncSession, Depends(get_session)]):
+    aid = agency(ctx)
+    home = (await session.execute(select(GroupHome).where(GroupHome.id == home_id, GroupHome.agency_id == aid))).scalar_one_or_none()
+    if not home: raise ValidationError("Group home was not found.")
+    members = (await session.execute(select(GroupHomeMember.patient_id).where(GroupHomeMember.group_home_id == home_id, GroupHomeMember.removed_at.is_(None)))).scalars().all()
+    appointments = (await session.execute(select(GroupHomeAppointment).where(GroupHomeAppointment.group_home_id == home_id).order_by(GroupHomeAppointment.scheduled_start.desc()))).scalars().all()
+    return {"id": home.id, "location_id": home.location_id, "name": home.name, "capacity": home.capacity, "patient_ids": members, "appointments": [{"id": row.id, "service": row.service, "scheduled_start": row.scheduled_start, "scheduled_end": row.scheduled_end, "staff_id": row.staff_id} for row in appointments]}
+
 @router.post("/{home_id}/members", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))])
 async def add_member(home_id: uuid.UUID, payload: MemberCreate, ctx: CurrentAuth, session: Annotated[AsyncSession, Depends(get_session)]):
     aid = agency(ctx)
