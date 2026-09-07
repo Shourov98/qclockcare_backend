@@ -68,6 +68,8 @@ from src.modules.identity.platform_router import router as identity_platform_rou
 from src.modules.identity.router import router as auth_router
 from src.modules.locations.models import Location  # noqa: F401
 from src.modules.locations.router import router as locations_router
+from src.modules.group_homes.models import GroupHome, GroupHomeAppointment, GroupHomeAppointmentPatient, GroupHomeMember  # noqa: F401
+from src.modules.group_homes.router import router as group_homes_router
 from src.modules.notifications.models import Notification  # noqa: F401
 from src.modules.notifications.router import router as notifications_router
 from src.modules.patients.models import (  # noqa: F401
@@ -424,6 +426,7 @@ def create_app() -> FastAPI:
 
     # Locations — service-delivery addresses (used by appointments/visits).
     app.include_router(locations_router)
+    app.include_router(group_homes_router)
 
     # Audit logs — admin-facing list/get endpoints.
     app.include_router(audit_logs_router)
