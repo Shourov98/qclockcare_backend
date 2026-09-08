@@ -4888,7 +4888,7 @@
     },
     {
       "name": "group-homes",
-      "description": "Agency-admin group homes. A home has at most four active patients; a shared appointment uses one service for its selected home patients.",
+      "description": "Agency-admin group homes. Creation requires 1-4 resident patients. A guardian, if assigned, is owner; otherwise one resident patient must be owner. A fifth patient is rejected. Shared appointments use one service for selected residents.",
       "item": [
         {
           "name": "List group homes",
@@ -4940,7 +4940,7 @@
           ]
         },
         {
-          "name": "Create group home",
+          "name": "Create group home \u2014 patient owner",
           "request": {
             "method": "POST",
             "header": [
@@ -4976,7 +4976,7 @@
             },
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"name\": \"Maple Home\",\n  \"location_id\": \"{{location_id}}\"\n}",
+              "raw": "{\n  \"name\": \"Maple Home\",\n  \"location_id\": \"{{location_id}}\",\n  \"patient_ids\": [\n    \"{{patient_id}}\"\n  ],\n  \"owner_patient_id\": \"{{patient_id}}\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -4991,7 +4991,67 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test('Create group home \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Create group home \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either {data: ...} or\n        // {data: [...], pagination: ...} or 204 with empty body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success envelope missing data').to.have.property('data');\n        }\n    }\n});\n\npm.test('Create group home \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});"
+                  "pm.test('Create group home \u2014 patient owner \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Create group home \u2014 patient owner \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either {data: ...} or\n        // {data: [...], pagination: ...} or 204 with empty body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success envelope missing data').to.have.property('data');\n        }\n    }\n});\n\npm.test('Create group home \u2014 patient owner \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});",
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {\n    const b = pm.response.json();\n    const v = \"id\".split('.').reduce(\n        (o, k) => (o == null ? o : o[k]), b\n    );\n    if (v != null) {\n        pm.environment.set('group_home_id', String(v));\n    }\n}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create group home \u2014 guardian owner",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-ID",
+                "value": "{{$randomUUID}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/group-homes",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "group-homes"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Oak Home\",\n  \"location_id\": \"{{location_id}}\",\n  \"patient_ids\": [\n    \"{{patient_id}}\"\n  ],\n  \"guardian_id\": \"{{guardian_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Create group home \u2014 guardian owner \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Create group home \u2014 guardian owner \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either {data: ...} or\n        // {data: [...], pagination: ...} or 204 with empty body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success envelope missing data').to.have.property('data');\n        }\n    }\n});\n\npm.test('Create group home \u2014 guardian owner \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});",
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {\n    const b = pm.response.json();\n    const v = \"id\".split('.').reduce(\n        (o, k) => (o == null ? o : o[k]), b\n    );\n    if (v != null) {\n        pm.environment.set('group_home_id', String(v));\n    }\n}"
                 ]
               }
             }
@@ -5213,7 +5273,8 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test('Schedule shared group appointment \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Schedule shared group appointment \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either {data: ...} or\n        // {data: [...], pagination: ...} or 204 with empty body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success envelope missing data').to.have.property('data');\n        }\n    }\n});\n\npm.test('Schedule shared group appointment \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});"
+                  "pm.test('Schedule shared group appointment \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Schedule shared group appointment \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either {data: ...} or\n        // {data: [...], pagination: ...} or 204 with empty body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success envelope missing data').to.have.property('data');\n        }\n    }\n});\n\npm.test('Schedule shared group appointment \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});",
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {\n    const b = pm.response.json();\n    const v = \"id\".split('.').reduce(\n        (o, k) => (o == null ? o : o[k]), b\n    );\n    if (v != null) {\n        pm.environment.set('group_appointment_id', String(v));\n    }\n}"
                 ]
               }
             }

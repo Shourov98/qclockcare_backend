@@ -972,14 +972,37 @@ GROUP_HOMES_FOLDER = folder(
     "group-homes",
     [
         make_request(name="List group homes", method="GET", path="/group-homes"),
-        make_request(name="Create group home", method="POST", path="/group-homes", body={"name": "Maple Home", "location_id": "{{location_id}}"}),
+        make_request(
+            name="Create group home — patient owner",
+            method="POST",
+            path="/group-homes",
+            body={
+                "name": "Maple Home",
+                "location_id": "{{location_id}}",
+                "patient_ids": ["{{patient_id}}"],
+                "owner_patient_id": "{{patient_id}}",
+            },
+            extract=[("group_home_id", "id")],
+        ),
+        make_request(
+            name="Create group home — guardian owner",
+            method="POST",
+            path="/group-homes",
+            body={
+                "name": "Oak Home",
+                "location_id": "{{location_id}}",
+                "patient_ids": ["{{patient_id}}"],
+                "guardian_id": "{{guardian_id}}",
+            },
+            extract=[("group_home_id", "id")],
+        ),
         make_request(name="Get group home", method="GET", path="/group-homes/{{group_home_id}}"),
         make_request(name="Add group-home patient", method="POST", path="/group-homes/{{group_home_id}}/members", body={"patient_id": "{{patient_id}}"}),
         make_request(name="Remove group-home patient", method="DELETE", path="/group-homes/{{group_home_id}}/members/{{patient_id}}"),
-        make_request(name="Schedule shared group appointment", method="POST", path="/group-homes/{{group_home_id}}/appointments", body={"service": "Community support", "scheduled_start": "2026-09-15T09:00:00Z", "scheduled_end": "2026-09-15T11:00:00Z", "patient_ids": ["{{patient_id}}"]}),
+        make_request(name="Schedule shared group appointment", method="POST", path="/group-homes/{{group_home_id}}/appointments", body={"service": "Community support", "scheduled_start": "2026-09-15T09:00:00Z", "scheduled_end": "2026-09-15T11:00:00Z", "patient_ids": ["{{patient_id}}"]}, extract=[("group_appointment_id", "id")]),
         make_request(name="Cancel shared group appointment", method="POST", path="/group-homes/{{group_home_id}}/appointments/{{group_appointment_id}}/cancel", body={}),
     ],
-    description="Agency-admin group homes. A home has at most four active patients; a shared appointment uses one service for its selected home patients.",
+    description="Agency-admin group homes. Creation requires 1-4 resident patients. A guardian, if assigned, is owner; otherwise one resident patient must be owner. A fifth patient is rejected. Shared appointments use one service for selected residents.",
 )
 
 # --------------------------------------------------------------------------
