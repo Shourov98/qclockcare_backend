@@ -568,7 +568,14 @@ async def update_appointment(
     place.
     """
     appt = await _get_appointment_or_404(
-        session, appointment_id=appointment_id, agency_id=agency_id
+        session,
+        appointment_id=appointment_id,
+        agency_id=agency_id,
+        # The PATCH endpoint immediately serializes the updated row with
+        # `_to_response`, which reads `location_rel`. This relationship is
+        # `lazy="raise"`, so load it here instead of failing after a valid
+        # update has already been persisted.
+        with_location=True,
     )
 
     # Block edits once the visit is in flight or terminal.
