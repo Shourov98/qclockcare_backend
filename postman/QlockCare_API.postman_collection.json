@@ -5884,6 +5884,121 @@
       ]
     },
     {
+      "name": "agency-settings",
+      "description": "Agency Admin self-service profile settings. Only the current agency is available; subscription plan and lifecycle status remain platform-managed.",
+      "item": [
+        {
+          "name": "Get my agency settings",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-ID",
+                "value": "{{$randomUUID}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/agencies/me",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "agencies",
+                "me"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{access_token}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Get my agency settings \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Get my agency settings \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either {data: ...} or\n        // {data: [...], pagination: ...} or 204 with empty body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success envelope missing data').to.have.property('data');\n        }\n    }\n});\n\npm.test('Get my agency settings \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Update my agency settings",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-ID",
+                "value": "{{$randomUUID}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/agencies/me",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "agencies",
+                "me"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Updated Agency {{$randomUUID}}\",\n  \"timezone\": \"America/Chicago\",\n  \"settings\": {\n    \"identity\": {\n      \"dba\": \"QlockCare Home Services\",\n      \"npi\": \"1234567890\"\n    },\n    \"location\": {\n      \"address\": \"123 Main St\",\n      \"counties\": [\n        \"Hennepin\"\n      ]\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Update my agency settings \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Update my agency settings \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either {data: ...} or\n        // {data: [...], pagination: ...} or 204 with empty body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success envelope missing data').to.have.property('data');\n        }\n    }\n});\n\npm.test('Update my agency settings \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
       "name": "change-password",
       "description": "Authenticated password rotation. Caller must supply the *current* password (re-authentication guard). On success the server revokes ALL outstanding refresh tokens, forcing re-login on every other device. The current browser continues to work until its access token expires.",
       "item": [
@@ -12191,6 +12306,115 @@
                 "type": "text/javascript",
                 "exec": [
                   "pm.test('Archive location (DELETE) \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Archive location (DELETE) \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either {data: ...} or\n        // {data: [...], pagination: ...} or 204 with empty body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success envelope missing data').to.have.property('data');\n        }\n    }\n});\n\npm.test('Archive location (DELETE) \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get my agency settings",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-ID",
+                "value": "{{$randomUUID}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/agencies/me",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "agencies",
+                "me"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{access_token}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Get my agency settings \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Get my agency settings \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either {data: ...} or\n        // {data: [...], pagination: ...} or 204 with empty body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success envelope missing data').to.have.property('data');\n        }\n    }\n});\n\npm.test('Get my agency settings \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Update my agency settings",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-ID",
+                "value": "{{$randomUUID}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/agencies/me",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "agencies",
+                "me"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Updated Agency {{$randomUUID}}\",\n  \"timezone\": \"America/Chicago\",\n  \"settings\": {\n    \"identity\": {\n      \"dba\": \"QlockCare Home Services\",\n      \"npi\": \"1234567890\"\n    },\n    \"location\": {\n      \"address\": \"123 Main St\",\n      \"counties\": [\n        \"Hennepin\"\n      ]\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Update my agency settings \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Update my agency settings \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either {data: ...} or\n        // {data: [...], pagination: ...} or 204 with empty body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success envelope missing data').to.have.property('data');\n        }\n    }\n});\n\npm.test('Update my agency settings \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});"
                 ]
               }
             }

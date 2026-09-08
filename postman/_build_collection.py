@@ -1026,7 +1026,7 @@ AUDIT_LOGS_FOLDER = folder(
 )
 
 # --------------------------------------------------------------------------
-# 10. Agencies (6 routes — SUPER_ADMIN only)
+# 10. Agencies (SUPER_ADMIN only)
 # --------------------------------------------------------------------------
 AGENCIES_FOLDER = folder(
     "agencies",
@@ -1102,6 +1102,37 @@ AGENCIES_FOLDER = folder(
         "soft-delete agencies, and list the programs each agency offers. "
         "Auto-extracts `agency_id` from the Create response for use by the "
         "downstream Get/Patch/Delete/Programs requests."
+    ),
+)
+
+# --------------------------------------------------------------------------
+# 10b. Agency self-settings (AGENCY_ADMIN only)
+# --------------------------------------------------------------------------
+AGENCY_SETTINGS_FOLDER = folder(
+    "agency-settings",
+    [
+        make_request(
+            name="Get my agency settings",
+            method="GET",
+            path="/agencies/me",
+        ),
+        make_request(
+            name="Update my agency settings",
+            method="PATCH",
+            path="/agencies/me",
+            body={
+                "name": "Updated Agency {{$randomUUID}}",
+                "timezone": "America/Chicago",
+                "settings": {
+                    "identity": {"dba": "QlockCare Home Services", "npi": "1234567890"},
+                    "location": {"address": "123 Main St", "counties": ["Hennepin"]},
+                },
+            },
+        ),
+    ],
+    description=(
+        "Agency Admin self-service profile settings. Only the current agency "
+        "is available; subscription plan and lifecycle status remain platform-managed."
     ),
 )
 
@@ -1603,6 +1634,10 @@ AGENCY_ADMIN_FOLDER = folder(
             "Archive location (DELETE)",
         ),
         # Notifications
+        *_requests(AGENCY_SETTINGS_FOLDER,
+            "Get my agency settings",
+            "Update my agency settings",
+        ),
         *_requests(NOTIFICATIONS_FOLDER,
             "List my notifications",
             "Get unread badge count",
@@ -1885,6 +1920,7 @@ COLLECTION: dict[str, Any] = {
         GROUP_HOMES_FOLDER,
         AUDIT_LOGS_FOLDER,
         AGENCIES_FOLDER,
+        AGENCY_SETTINGS_FOLDER,
         CHANGE_PASSWORD_FOLDER,
         ADMIN_TICKETS_FOLDER,
         ADMIN_COMPLIANCE_FOLDER,

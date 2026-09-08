@@ -32,12 +32,14 @@ from src.modules.agencies.schemas import (
     AgencyProgramListResponse,
     AgencyProgramResponse,
     AgencyResponse,
+    AgencySelfUpdateRequest,
     AgencySubscriptionPackageListResponse,
     AgencySubscriptionPackageResponse,
     AgencyUpdateRequest,
 )
 from src.modules.appointments import models as _appt_models  # noqa: F401
 from src.modules.identity import models as _identity_models  # noqa: F401
+from src.modules.locations import models as _locations_models  # noqa: F401
 from src.modules.patients import models as _patient_models  # noqa: F401
 from src.modules.staff import models as _staff_models  # noqa: F401
 from src.modules.visits import models as _visits_models  # noqa: F401
@@ -292,6 +294,20 @@ class TestAgencyUpdateRequest:
     def test_blank_name_rejected(self) -> None:
         with pytest.raises(ValidationError):
             AgencyUpdateRequest(name="   ")
+
+
+class TestAgencySelfUpdateRequest:
+    def test_allows_only_profile_fields(self) -> None:
+        request = AgencySelfUpdateRequest(
+            name="Acme Home Care",
+            timezone="America/Chicago",
+            settings={"identity": {"dba": "Acme"}},
+        )
+        assert request.model_dump(exclude_unset=True)["settings"]["identity"]["dba"] == "Acme"
+
+    def test_rejects_platform_managed_fields(self) -> None:
+        with pytest.raises(ValidationError):
+            AgencySelfUpdateRequest(status=AgencyStatus.SUSPENDED)
 
 
 # --------------------------------------------------------------------------

@@ -92,7 +92,7 @@ async def _cleanup(test_engine) -> None:
     async with test_engine.begin() as conn:
         await conn.execute(
             text(
-                "DELETE FROM audit_logs WHERE entity_type = 'AGENCY' "
+                "DELETE FROM audit_logs WHERE entity_type IN ('AGENCY', 'AGENCY_SETTINGS') "
                 "AND entity_id IN (SELECT id FROM agencies WHERE name LIKE 'Test Agency%')"
             )
         )
@@ -172,6 +172,44 @@ async def test_agency_admin_returns_403(super_admin_seed) -> None:
         )
         r = await client.get("/agencies", headers={"Authorization": f"Bearer {token}"})
         assert r.status_code == 403, r.text
+
+
+async def test_agency_admin_can_manage_own_settings(super_admin_seed) -> None:
+    """Agency admins have a self-scoped settings surface, not tenant-wide access."""
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=10) as client:
+        token = await _login(
+            client, super_admin_seed["admin_email"], super_admin_seed["admin_password"]
+        )
+        auth = {"Authorization": f"Bearer {token}"}
+
+        r = await client.get("/agencies/me", headers=auth)
+        assert r.status_code == 200, r.text
+        assert r.json()["id"] == super_admin_seed["agency_id"]
+
+        settings = {
+            "identity": {"dba": "Test Care", "ein": "12-3456789"},
+            "location": {"address": "123 Main St", "counties": ["Hennepin"]},
+        }
+        r = await client.patch(
+            "/agencies/me",
+            json={"name": "Test Agency Settings", "settings": settings},
+            headers=auth,
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["name"] == "Test Agency Settings"
+        assert r.json()["settings"] == settings
+
+        r = await client.get("/agencies/me", headers=auth)
+        assert r.status_code == 200, r.text
+        assert r.json()["settings"] == settings
+
+        # Agency admins cannot alter platform-managed subscription/status fields.
+        r = await client.patch(
+            "/agencies/me",
+            json={"status": "SUSPENDED"},
+            headers=auth,
+        )
+        assert r.status_code == 422, r.text
 
 
 async def test_subscription_packages_catalog() -> None:
