@@ -32,6 +32,7 @@ from src.modules.agencies.schemas import (
     AgencyProgramListResponse,
     AgencyProgramResponse,
     AgencyResponse,
+    AgencySelfUpdateRequest,
     AgencySubscriptionPackageListResponse,
     AgencySubscriptionPackageResponse,
     AgencyUpdateRequest,
@@ -58,6 +59,14 @@ _SUPER_ADMIN_ONLY = [Depends(require_role(UserRole.SUPER_ADMIN))]
 # AGENCIES scope can also reach. POST/DELETE stay SUPER_ADMIN-only
 # because they change the agency hierarchy fundamentally.
 _AGENCIES_SCOPE = [Depends(require_scope(AdminScope.AGENCIES))]
+
+
+def _require_own_agency(ctx: CurrentAuth) -> uuid.UUID:
+    if ctx.agency_id is None:
+        from src.core.exceptions import ForbiddenError
+
+        raise ForbiddenError("Caller has no agency context.")
+    return ctx.agency_id
 
 
 # --------------------------------------------------------------------------
@@ -287,6 +296,64 @@ async def add_agency_admin_endpoint(
 # --------------------------------------------------------------------------
 # Single-row reads + writes
 # --------------------------------------------------------------------------
+@router.get(
+    "/me",
+    response_model=AgencyResponse,
+    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    responses=standard_responses(include=[401, 403, 404]),
+)
+async def get_my_agency_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> AgencyResponse:
+    """Return the authenticated agency admin's own agency settings."""
+    agency = await agencies_service.get_agency(
+        session,
+        agency_id=_require_own_agency(ctx),
+    )
+    return AgencyResponse.model_validate(agency)
+
+
+@router.patch(
+    "/me",
+    response_model=AgencyResponse,
+    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+    responses=standard_responses(include=[401, 403, 404, 422]),
+)
+async def update_my_agency_endpoint(
+    payload: AgencySelfUpdateRequest,
+    request: Request,
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> AgencyResponse:
+    """Update the authenticated agency's profile and JSON settings."""
+    agency_id = _require_own_agency(ctx)
+    update = AgencyUpdateRequest(**payload.model_dump(exclude_unset=True))
+    agency = await agencies_service.update_agency(
+        session,
+        agency_id=agency_id,
+        payload=update,
+    )
+    await session.flush()
+    try:
+        ip, ua = audit_logs_service.request_ip_ua(request)
+        await audit_logs_service.audit_log(
+            session,
+            agency_id=agency_id,
+            actor_user_id=ctx.user_id,
+            action=AuditAction.UPDATE,
+            entity_type="AGENCY_SETTINGS",
+            entity_id=agency.id,
+            new_data=payload.model_dump(exclude_unset=True),
+            ip_address=ip,
+            user_agent=ua,
+        )
+    except Exception as exc:
+        log.warning("agencies.self_settings_audit_failed", error=_type(exc).__name__)
+    await session.commit()
+    return AgencyResponse.model_validate(agency)
+
+
 @router.get(
     "/{agency_id}",
     response_model=AgencyResponse,

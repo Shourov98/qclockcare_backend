@@ -221,6 +221,26 @@ class AgencyUpdateRequest(BaseModel):
         return stripped
 
 
+class AgencySelfUpdateRequest(BaseModel):
+    """Safe subset of agency fields editable by its AGENCY_ADMIN."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    timezone: str | None = Field(default=None, min_length=1, max_length=64)
+    settings: dict[str, Any] | None = Field(default=None)
+
+    @field_validator("name", "timezone")
+    @classmethod
+    def _strip_non_empty(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("must not be empty or whitespace-only")
+        return stripped
+
+
 # --------------------------------------------------------------------------
 # Response
 # --------------------------------------------------------------------------
@@ -310,6 +330,7 @@ __all__ = [
     "AgencyProgramListResponse",
     "AgencyProgramResponse",
     "AgencyResponse",
+    "AgencySelfUpdateRequest",
     "AgencySubscriptionPackageListResponse",
     "AgencySubscriptionPackageResponse",
     "AgencyUpdateRequest",
