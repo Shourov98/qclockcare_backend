@@ -62,6 +62,7 @@ from src.shared.domain.enums import (
     AppointmentStatus,
     ServiceItemStatus,
     UserRole,
+    VisitStatus,
 )
 from src.shared.utils.datetime_utils import utc_now
 
@@ -294,6 +295,74 @@ def _extract_constraint(exc: IntegrityError) -> str:
     return "unknown"
 
 
+_EXPIRABLE_APPOINTMENT_STATUSES: frozenset[AppointmentStatus] = frozenset(
+    {
+        AppointmentStatus.SCHEDULED,
+        AppointmentStatus.READY,
+        AppointmentStatus.IN_PROGRESS,
+        AppointmentStatus.AWAITING_SIGNATURE,
+    }
+)
+
+_EXPIRABLE_VISIT_STATUSES: frozenset[VisitStatus] = frozenset(
+    {
+        VisitStatus.SCHEDULED,
+        VisitStatus.READY,
+        VisitStatus.IN_PROGRESS,
+        VisitStatus.AWAITING_SIGNATURE,
+    }
+)
+
+
+async def reconcile_expired_appointments(
+    session: AsyncSession,
+    *,
+    agency_id: uuid.UUID,
+    appointment_id: uuid.UUID | None = None,
+) -> int:
+    """Persist unfinished appointments as MISSED once their planned end passes.
+
+    Reconciliation runs before appointment reads rather than relying on an
+    in-process scheduler, which would be unreliable across multiple workers.
+    Completed, cancelled, rejected, and already-missed rows are untouched.
+    """
+    now = utc_now()
+    expired = select(Appointment.id).where(
+        Appointment.agency_id == agency_id,
+        Appointment.scheduled_end <= now,
+        Appointment.status.in_(_EXPIRABLE_APPOINTMENT_STATUSES),
+    )
+    if appointment_id is not None:
+        expired = expired.where(Appointment.id == appointment_id)
+
+    appointment_ids = list((await session.execute(expired)).scalars())
+    if not appointment_ids:
+        return 0
+
+    reason = "Automatically marked missed after the scheduled end time."
+    await session.execute(
+        update(Appointment)
+        .where(Appointment.id.in_(appointment_ids))
+        .values(
+            status=AppointmentStatus.MISSED,
+            cancelled_reason=reason,
+            cancelled_at=now,
+        )
+    )
+    # Keep a started visit in sync so EVV and reporting do not present it as
+    # in progress after its appointment has expired.
+    await session.execute(
+        update(Visit)
+        .where(
+            Visit.appointment_id.in_(appointment_ids),
+            Visit.status.in_(_EXPIRABLE_VISIT_STATUSES),
+        )
+        .values(status=VisitStatus.MISSED, sharing_location=False)
+    )
+    await session.flush()
+    return len(appointment_ids)
+
+
 # --------------------------------------------------------------------------
 # Appointments — CRUD
 # --------------------------------------------------------------------------
@@ -396,6 +465,11 @@ async def get_appointment(
     with_signature: bool = False,
     with_location: bool = False,
 ) -> Appointment:
+    await reconcile_expired_appointments(
+        session,
+        agency_id=agency_id,
+        appointment_id=appointment_id,
+    )
     return await _get_appointment_or_404(
         session,
         appointment_id=appointment_id,
@@ -439,6 +513,8 @@ async def list_appointments(
     """
     page = max(1, page)
     page_size = max(1, min(100, page_size))
+
+    await reconcile_expired_appointments(session, agency_id=agency_id)
 
     base = (
         select(Appointment)
@@ -515,6 +591,8 @@ async def list_appointments_in_window(
     Eager-loads the same joined fields as `list_appointments` so the
     response items render the full card in a single round trip.
     """
+    await reconcile_expired_appointments(session, agency_id=agency_id)
+
     base = (
         select(Appointment)
         .where(Appointment.agency_id == agency_id)
@@ -1435,6 +1513,7 @@ __all__ = [
     "mark_appointment_missed",
     "mark_appointment_ready",
     "mark_appointment_rejected",
+    "reconcile_expired_appointments",
     "sync_appointment_status_from_visit",
     "transition_status",
     "update_activity",
