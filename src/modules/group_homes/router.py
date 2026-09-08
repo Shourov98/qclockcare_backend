@@ -11,7 +11,7 @@ from src.core.exceptions import ForbiddenError, ValidationError
 from src.core.database import get_session
 from src.modules.group_homes.models import GroupHome, GroupHomeAppointment, GroupHomeAppointmentPatient, GroupHomeMember
 from src.modules.identity.dependencies import CurrentAuth, require_role
-from src.modules.patients.models import PatientProfile
+from src.modules.patients.models import GuardianProfile, PatientProfile
 from src.shared.domain.enums import UserRole
 
 router = APIRouter(prefix="/group-homes", tags=["group homes"])
@@ -24,6 +24,19 @@ def agency(ctx: CurrentAuth) -> uuid.UUID:
 class HomeCreate(BaseModel):
     location_id: uuid.UUID
     name: str = Field(min_length=1, max_length=120)
+    patient_ids: list[uuid.UUID] = Field(min_length=1, max_length=4)
+    guardian_id: uuid.UUID | None = None
+    owner_patient_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def validate_owner(self):
+        if len(set(self.patient_ids)) != len(self.patient_ids):
+            raise ValueError("A patient can be added only once.")
+        if self.guardian_id is None and self.owner_patient_id not in self.patient_ids:
+            raise ValueError("Select one resident patient as owner when no guardian is assigned.")
+        if self.guardian_id is not None and self.owner_patient_id is not None:
+            raise ValueError("A guardian owner replaces a patient owner.")
+        return self
 
 class MemberCreate(BaseModel): patient_id: uuid.UUID
 class HomeUpdate(BaseModel): name: str | None = Field(default=None, min_length=1, max_length=120); is_active: bool | None = None
@@ -52,9 +65,16 @@ async def list_homes(ctx: CurrentAuth, session: Annotated[AsyncSession, Depends(
 @router.post("", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))])
 async def create_home(payload: HomeCreate, ctx: CurrentAuth, session: Annotated[AsyncSession, Depends(get_session)]):
     aid = agency(ctx)
-    home = GroupHome(agency_id=aid, location_id=payload.location_id, name=payload.name, capacity=4)
+    patients = (await session.execute(select(PatientProfile.id).where(PatientProfile.id.in_(payload.patient_ids), PatientProfile.agency_id == aid, PatientProfile.deleted_at.is_(None)))).scalars().all()
+    if len(patients) != len(payload.patient_ids): raise ValidationError("All group-home patients must belong to this agency.")
+    if payload.guardian_id is not None:
+        guardian = (await session.execute(select(GuardianProfile.id).where(GuardianProfile.id == payload.guardian_id, GuardianProfile.agency_id == aid, GuardianProfile.deleted_at.is_(None)))).scalar_one_or_none()
+        if guardian is None: raise ValidationError("Guardian was not found in this agency.")
+    home = GroupHome(agency_id=aid, location_id=payload.location_id, name=payload.name, capacity=4, guardian_id=payload.guardian_id, owner_patient_id=None if payload.guardian_id else payload.owner_patient_id)
     session.add(home); await session.flush()
-    return {"id": home.id, "location_id": home.location_id, "name": home.name, "capacity": 4, "is_active": True, "member_count": 0}
+    session.add_all([GroupHomeMember(group_home_id=home.id, patient_id=patient_id) for patient_id in payload.patient_ids])
+    await session.flush()
+    return {"id": home.id, "location_id": home.location_id, "name": home.name, "capacity": 4, "is_active": True, "member_count": len(payload.patient_ids), "guardian_id": home.guardian_id, "owner_patient_id": home.owner_patient_id}
 
 @router.patch("/{home_id}", dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))])
 async def update_home(home_id: uuid.UUID, payload: HomeUpdate, ctx: CurrentAuth, session: Annotated[AsyncSession, Depends(get_session)]):

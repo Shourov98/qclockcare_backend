@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from src.shared.domain.base_entity import Base, IdMixin, TimestampedMixin
@@ -14,6 +14,16 @@ class GroupHome(IdMixin, TimestampedMixin, Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     capacity: Mapped[int] = mapped_column(Integer, nullable=False, server_default="4")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    guardian_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("guardian_profiles.id", ondelete="SET NULL"), nullable=True)
+    owner_patient_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("patient_profiles.id", ondelete="SET NULL"), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "(guardian_id IS NOT NULL AND owner_patient_id IS NULL) OR "
+            "(guardian_id IS NULL AND owner_patient_id IS NOT NULL)",
+            name="group_homes_one_owner",
+        ),
+    )
 
 
 class GroupHomeMember(IdMixin, TimestampedMixin, Base):
