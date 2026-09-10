@@ -143,6 +143,11 @@ class Appointment(IdMixin, TimestampedMixin, Base):
     billing_status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="unpaid", server_default="unpaid"
     )
+    # Amount due for this appointment, stored in integer cents so billing
+    # totals remain exact. Existing appointments are safely backfilled to 0.
+    billing_amount_cents: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     billing_paid_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

@@ -85,10 +85,10 @@ pm.test('{request_name} — response envelope shape', () => {{
         pm.expect(b.error).to.have.property('request_id');
         pm.expect(b.error).to.have.property('timestamp');
     }} else {{
-        // Successful responses are either {{data: ...}} or
-        // {{data: [...], pagination: ...}} or 204 with empty body.
+        // Successful responses are either a direct route model, an
+        // offset-paginated {{data, pagination}} body, or 204 with no body.
         if (pm.response.code !== 204) {{
-            pm.expect(b, 'success envelope missing data').to.have.property('data');
+            pm.expect(b, 'success response must be an object').to.be.an('object');
         }}
     }}
 }});
@@ -602,6 +602,11 @@ APPOINTMENTS_FOLDER = folder(
             path="/appointments?page=1&page_size=20",
         ),
         make_request(
+            name="Get appointment billing summary",
+            method="GET",
+            path="/appointments/billing-summary",
+        ),
+        make_request(
             name="Create appointment",
             method="POST",
             path="/appointments",
@@ -609,6 +614,7 @@ APPOINTMENTS_FOLDER = folder(
                 "patient_id": "{{patient_id}}",
                 "scheduled_start": "2026-07-01T10:00:00Z",
                 "scheduled_end": "2026-07-01T11:00:00Z",
+                "billing_amount_cents": 4500,
                 "location_id": "{{location_id}}",
                 "notes": "Initial assessment",
             },
@@ -628,7 +634,7 @@ APPOINTMENTS_FOLDER = folder(
             name="Update appointment",
             method="PATCH",
             path="/appointments/{{appointment_id}}",
-            body={"notes": "Updated notes"},
+            body={"notes": "Updated notes", "billing_amount_cents": 5000},
         ),
         make_request(
             name="Cancel appointment",

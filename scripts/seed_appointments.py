@@ -11,6 +11,8 @@ For each in-flight or completed visit the seed populates:
   - (For COMPLETED visits) one `AppointmentSignature` row
   - (For the COMPLETED-and-paid A5) the denormalized `billing_status`,
     `billing_paid_at`, `billing_paid_by_user_id`, and `claim_id` columns
+  - A `billing_amount_cents` value for every appointment, using the demo
+    PCA rate of $45/hour so paid, unpaid, and cancelled totals are real
 
 Re-running the script wipes its own rows and re-seeds them with a
 deterministic dataset so the dev experience is reproducible.
@@ -41,6 +43,7 @@ What gets created (14 appointments, each with 3 activities):
   U6  SCHEDULED  unassigned         +30 days 11:00   Monthly check-in
 
 Dependencies:
+  - Run `uv run alembic upgrade head` first so `billing_amount_cents` exists.
   - Run `scripts/seed_test_user.py` first. This script looks up the
     seeded AGENCY_ADMIN, STAFF, and PATIENT profiles by email and uses
     them as the FK targets.
@@ -674,6 +677,12 @@ async def _insert_appointments(
                 cancelled_reason = spec.get("cancelled_reason")
 
             billing_status = "unpaid"
+            # $45/hour is the documented demo PCA rate. Persist the final
+            # appointment amount so billing totals are derived from data,
+            # not a UI-side mock calculation.
+            billing_amount_cents = int(
+                spec.get("billing_amount_cents", round(spec["duration_h"] * 4_500))
+            )
             billing_paid_at = None
             billing_paid_by_user_id = None
             if spec.get("billing_paid"):
@@ -692,7 +701,7 @@ async def _insert_appointments(
                     "scheduled_start, scheduled_end, status, "
                     "location, location_id, notes, "
                     "cancelled_reason, cancelled_at, "
-                    "billing_status, billing_paid_at, billing_paid_by_user_id, "
+                    "billing_status, billing_amount_cents, billing_paid_at, billing_paid_by_user_id, "
                     "claim_id, "
                     "created_at, updated_at"
                     ") VALUES ("
@@ -701,7 +710,7 @@ async def _insert_appointments(
                     ":start, :end, :status, "
                     ":location, :location_id, :notes, "
                     ":cancelled_reason, :cancelled_at, "
-                    ":billing_status, :billing_paid_at, :billing_paid_by, "
+                    ":billing_status, :billing_amount_cents, :billing_paid_at, :billing_paid_by, "
                     ":claim_id, "
                     "now(), now()"
                     ")"
@@ -725,6 +734,7 @@ async def _insert_appointments(
                     "cancelled_reason": cancelled_reason,
                     "cancelled_at": cancelled_at,
                     "billing_status": billing_status,
+                    "billing_amount_cents": billing_amount_cents,
                     "billing_paid_at": billing_paid_at,
                     "billing_paid_by": billing_paid_by_user_id,
                     "claim_id": claim_id,

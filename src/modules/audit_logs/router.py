@@ -31,11 +31,11 @@ from src.modules.audit_logs.schemas import (
     AuditLogResponse,
 )
 from src.modules.identity.dependencies import (
+    AuthContext,
     CurrentAuth,
     get_session_with_auth,
-    require_role,
 )
-from src.modules.identity.scope_deps import require_any_scope
+from src.core.exceptions import InsufficientPermissionsError
 from src.shared.domain.enums import AdminScope, AuditAction, UserRole
 from src.shared.schemas.pagination import (
     PaginatedResponse,
@@ -48,12 +48,21 @@ router = APIRouter(prefix="/audit-logs", tags=["audit-logs"])
 #   - SUPER_ADMIN (full cross-tenant)
 #   - PLATFORM_ADMIN with SUPPORT scope (cross-tenant)
 #   - AGENCY_ADMIN (scoped to their agency via RLS)
-# Other roles are rejected. We use a list of deps so the OR semantics
-# is preserved — either dep suffices.
-_AUDIT_LOG_READERS = [
-    Depends(require_role(UserRole.AGENCY_ADMIN)),
-    Depends(require_any_scope(AdminScope.SUPPORT)),
-]
+# Other roles are rejected. FastAPI evaluates every entry in a
+# `dependencies` list, so placing role and scope checks in separate entries
+# would create AND semantics. Keep the complete OR policy in one dependency.
+def require_audit_log_reader(ctx: CurrentAuth) -> AuthContext:
+    if ctx.role in {UserRole.AGENCY_ADMIN, UserRole.SUPER_ADMIN}:
+        return ctx
+    if ctx.role == UserRole.PLATFORM_ADMIN and AdminScope.SUPPORT.value in ctx.scopes:
+        return ctx
+    raise InsufficientPermissionsError(
+        message="Audit-log access requires an Agency Admin role or Support scope.",
+        details={"role": ctx.role.value, "required_scope": AdminScope.SUPPORT.value},
+    )
+
+
+_AUDIT_LOG_READERS = [Depends(require_audit_log_reader)]
 
 
 @router.get(

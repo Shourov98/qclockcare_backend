@@ -48,6 +48,7 @@ class AppointmentCreateRequest(BaseModel):
     # `location_id` so the FE can render a map pin.
     location_id: UUID | None = None
     notes: Annotated[str, StringConstraints(max_length=4000)] | None = None
+    billing_amount_cents: Annotated[int, Field(ge=0)] = 0
     # Optional initial set of activities (free-text per spec §2)
     activities: list[AppointmentActivityCreateRequest] = Field(
         default_factory=list
@@ -80,6 +81,7 @@ class AppointmentUpdateRequest(BaseModel):
     # that becomes a need, we'd switch to a sentinel pattern.
     location_id: UUID | None = None
     notes: Annotated[str, StringConstraints(max_length=4000)] | None = None
+    billing_amount_cents: Annotated[int, Field(ge=0)] | None = None
 
     @model_validator(mode="after")
     def _validate_window(self) -> AppointmentUpdateRequest:
@@ -118,6 +120,10 @@ class AppointmentResponse(BaseModel):
     notes: str | None
     cancelled_reason: str | None
     cancelled_at: datetime | None
+    billing_amount_cents: int = 0
+    billing_status: str = "unpaid"
+    billing_paid_at: datetime | None = None
+    claim_id: str | None = None
     created_at: datetime
     updated_at: datetime
     # Structured location FK — same as the summary response. Surfaced
@@ -209,8 +215,20 @@ class AppointmentSummaryResponse(BaseModel):
     # timestamp of the staff/caregiver confirmation; `claim_id` is the
     # externally-rendered identifier (CG-{agency}-{appt}).
     billing_status: str = "unpaid"
+    billing_amount_cents: int = 0
     billing_paid_at: datetime | None = None
     claim_id: str | None = None
+
+
+class AppointmentBillingSummaryResponse(BaseModel):
+    """Agency-wide appointment billing totals, represented in integer cents."""
+
+    paid_amount_cents: int = 0
+    unpaid_amount_cents: int = 0
+    cancelled_amount_cents: int = 0
+    paid_count: int = 0
+    unpaid_count: int = 0
+    cancelled_count: int = 0
 
 
 # --------------------------------------------------------------------------
@@ -447,6 +465,7 @@ __all__ = [
     "AppointmentActivityCreateRequest",
     "AppointmentActivityResponse",
     "AppointmentActivityUpdateRequest",
+    "AppointmentBillingSummaryResponse",
     "AppointmentCancelRequest",
     "AppointmentCreateRequest",
     "AppointmentMarkBillingPaidRequest",

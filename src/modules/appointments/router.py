@@ -49,6 +49,7 @@ from src.modules.appointments.schemas import (
     AppointmentActivityResponse,
     AppointmentActivityUpdateRequest,
     AppointmentCancelRequest,
+    AppointmentBillingSummaryResponse,
     AppointmentCreateRequest,
     AppointmentMarkBillingPaidRequest,
     AppointmentMissedRequest,
@@ -167,6 +168,10 @@ def _to_response(
         "notes": appt.notes,
         "cancelled_reason": appt.cancelled_reason,
         "cancelled_at": appt.cancelled_at,
+        "billing_status": appt.billing_status,
+        "billing_amount_cents": appt.billing_amount_cents,
+        "billing_paid_at": appt.billing_paid_at,
+        "claim_id": appt.claim_id,
         "created_at": appt.created_at,
         "updated_at": appt.updated_at,
         "location_id": getattr(appt, "location_id", None),
@@ -252,6 +257,7 @@ async def create_appointment_endpoint(
                 "scheduled_end": appt.scheduled_end.isoformat()
                 if appt.scheduled_end
                 else None,
+                "billing_amount_cents": appt.billing_amount_cents,
             },
             ip_address=ip,
             user_agent=ua,
@@ -336,6 +342,24 @@ async def list_appointments_endpoint(
         for r in rows
     ]
     return build_offset_response(data, total=total, page=page, page_size=page_size)
+
+
+@router.get(
+    "/billing-summary",
+    response_model=AppointmentBillingSummaryResponse,
+    dependencies=[Depends(require_role(UserRole.AGENCY_ADMIN))],
+)
+async def get_billing_summary_endpoint(
+    ctx: CurrentAuth,
+    session: Annotated[AsyncSession, Depends(get_session_with_auth)],
+) -> AppointmentBillingSummaryResponse:
+    """Summarize paid, unpaid, and cancelled appointment amounts."""
+    agency_id = _require_agency(ctx)
+    return AppointmentBillingSummaryResponse(
+        **await appointments_service.get_billing_summary(
+            session, agency_id=agency_id
+        )
+    )
 
 
 @router.get(

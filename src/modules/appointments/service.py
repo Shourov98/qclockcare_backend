@@ -23,7 +23,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import date, datetime, time, timedelta
 
-from sqlalchemy import case, func, select, update
+from sqlalchemy import and_, case, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -403,6 +403,7 @@ async def create_appointment(
         notes=payload.notes,
         status=AppointmentStatus.SCHEDULED,
         billing_status="unpaid",
+        billing_amount_cents=payload.billing_amount_cents,
     )
     session.add(appt)
     try:
@@ -691,6 +692,8 @@ async def update_appointment(
         appt.location_id = payload.location_id
     if payload.notes is not None:
         appt.notes = payload.notes
+    if payload.billing_amount_cents is not None:
+        appt.billing_amount_cents = payload.billing_amount_cents
 
     try:
         await session.flush()
@@ -1493,9 +1496,35 @@ def _summarize_to_dict(appt: Appointment) -> dict:
         "patient_code": patient_code,
         "duration_label": duration_str,
         "billing_status": getattr(appt, "billing_status", None) or "unpaid",
+        "billing_amount_cents": getattr(appt, "billing_amount_cents", None) or 0,
         "billing_paid_at": getattr(appt, "billing_paid_at", None),
         "claim_id": getattr(appt, "claim_id", None),
     }
+
+
+async def get_billing_summary(
+    session: AsyncSession, *, agency_id: uuid.UUID
+) -> dict[str, int]:
+    """Return mutually-exclusive appointment billing totals in integer cents."""
+    await reconcile_expired_appointments(session, agency_id=agency_id)
+
+    amount = func.coalesce(Appointment.billing_amount_cents, 0)
+    cancelled = Appointment.status == AppointmentStatus.CANCELLED
+    paid = and_(~cancelled, Appointment.billing_status == "paid")
+    unpaid = and_(~cancelled, Appointment.billing_status != "paid")
+    row = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(case((paid, amount), else_=0)), 0).label("paid_amount_cents"),
+                func.coalesce(func.sum(case((unpaid, amount), else_=0)), 0).label("unpaid_amount_cents"),
+                func.coalesce(func.sum(case((cancelled, amount), else_=0)), 0).label("cancelled_amount_cents"),
+                func.count().filter(paid).label("paid_count"),
+                func.count().filter(unpaid).label("unpaid_count"),
+                func.count().filter(cancelled).label("cancelled_count"),
+            ).where(Appointment.agency_id == agency_id)
+        )
+    ).one()
+    return {key: int(getattr(row, key) or 0) for key in row._fields}
 
 
 __all__ = [
@@ -1505,6 +1534,7 @@ __all__ = [
     "create_appointment",
     "delete_activity",
     "get_appointment",
+    "get_billing_summary",
     "get_patient_dashboard_summary",
     "list_activities",
     "list_appointments",
