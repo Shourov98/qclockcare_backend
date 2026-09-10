@@ -44,6 +44,7 @@ class TestAppointmentCreateRequest:
             patient_id=_UUID_A,
             scheduled_start=_START,
             scheduled_end=_END,
+            billing_amount_cents=4500,
         )
         assert req.patient_id == uuid.UUID(_UUID_A)
         assert req.staff_id is None
@@ -59,6 +60,7 @@ class TestAppointmentCreateRequest:
             scheduled_end=_END,
             location="123 Main St",
             notes="Bring paperwork",
+            billing_amount_cents=6750,
             activities=[
                 AppointmentActivityCreateRequest(
                     name="Check blood pressure",
@@ -78,6 +80,7 @@ class TestAppointmentCreateRequest:
                 patient_id=_UUID_A,
                 scheduled_start=_START,
                 scheduled_end=_END,
+                billing_amount_cents=4500,
                 extra_field="bogus",  # type: ignore[call-arg]
             )
 
@@ -87,6 +90,7 @@ class TestAppointmentCreateRequest:
                 patient_id=_UUID_A,
                 scheduled_start=_END,
                 scheduled_end=_START,
+                billing_amount_cents=4500,
             )
         assert "scheduled_end must be after scheduled_start" in str(exc.value)
 
@@ -96,6 +100,17 @@ class TestAppointmentCreateRequest:
                 patient_id=_UUID_A,
                 scheduled_start=_START,
                 scheduled_end=_START,
+                billing_amount_cents=4500,
+            )
+
+    @pytest.mark.parametrize("amount", [0, -1])
+    def test_payment_amount_must_be_positive(self, amount: int) -> None:
+        with pytest.raises(ValidationError):
+            AppointmentCreateRequest(
+                patient_id=_UUID_A,
+                scheduled_start=_START,
+                scheduled_end=_END,
+                billing_amount_cents=amount,
             )
 
 
