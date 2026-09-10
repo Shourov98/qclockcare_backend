@@ -12,7 +12,7 @@ For each in-flight or completed visit the seed populates:
   - (For the COMPLETED-and-paid A5) the denormalized `billing_status`,
     `billing_paid_at`, `billing_paid_by_user_id`, and `claim_id` columns
   - A `billing_amount_cents` value for every appointment, using the demo
-    PCA rate of $45/hour so paid, unpaid, and cancelled totals are real
+    PCA rate of $45/hour so paid, pending, and cancelled totals are real
 
 Re-running the script wipes its own rows and re-seeds them with a
 deterministic dataset so the dev experience is reproducible.
@@ -676,7 +676,7 @@ async def _insert_appointments(
                 cancelled_at = scheduled_start + timedelta(minutes=15)
                 cancelled_reason = spec.get("cancelled_reason")
 
-            billing_status = "unpaid"
+            billing_status = "pending"
             # $45/hour is the documented demo PCA rate. Persist the final
             # appointment amount so billing totals are derived from data,
             # not a UI-side mock calculation.
@@ -687,11 +687,12 @@ async def _insert_appointments(
             billing_paid_by_user_id = None
             if spec.get("billing_paid"):
                 billing_status = "paid"
-                # "Admin" processed the payment — use admin_user_id so the
-                # audit trail shows the agency-admin (the role that
-                # actually flips the toggle in production).
+                # The assigned caregiver collected and confirmed the
+                # in-person payment after the signed visit.
                 billing_paid_at = scheduled_end + timedelta(minutes=2)
-                billing_paid_by_user_id = ids.admin_user_id
+                billing_paid_by_user_id = ids.staff_user_id
+            elif spec["status"] in {"CANCELLED", "MISSED", "REJECTED"}:
+                billing_status = "cancelled"
 
             await conn.execute(
                 text(

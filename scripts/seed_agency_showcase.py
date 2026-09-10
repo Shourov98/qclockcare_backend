@@ -333,7 +333,7 @@ async def _replace_showcase_schedule(
                 ) VALUES (
                     :id, :agency_id, :patient_id, :staff_id, :program, :start, :end,
                     :status, :location, :location_id, :notes, :cancelled_reason,
-                    :cancelled_at, 'unpaid', :amount, :claim_id
+                    :cancelled_at, :billing_status, :amount, :claim_id
                 )
             """), {
                 "id": appointment_id, "agency_id": agency.id,
@@ -343,6 +343,7 @@ async def _replace_showcase_schedule(
                 "location_id": locations[index % len(locations)],
                 "notes": f"{SEED_TAG} {service}. Linked demonstration appointment.",
                 "cancelled_reason": cancelled_reason, "cancelled_at": cancelled_at,
+                "billing_status": "cancelled" if status in {"CANCELLED", "MISSED"} else "pending",
                 "amount": amount, "claim_id": f"CG-SHOW-{str(appointment_id)[:8].upper()}",
             })
             await conn.execute(text("""
