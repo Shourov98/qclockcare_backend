@@ -244,8 +244,13 @@ async def _ensure_group_homes(
                 home_id = uuid.uuid4()
                 await conn.execute(text("""
                     INSERT INTO group_homes (
-                        id, agency_id, location_id, name, capacity, is_active, guardian_id, owner_patient_id
-                    ) VALUES (:id, :agency_id, :location_id, :name, 4, true, :guardian_id, :owner_patient_id)
+                        id, agency_id, location_id, latitude, longitude, name, capacity, is_active, guardian_id, owner_patient_id
+                    ) VALUES (
+                        :id, :agency_id, :location_id,
+                        (SELECT latitude FROM locations WHERE id = :location_id),
+                        (SELECT longitude FROM locations WHERE id = :location_id),
+                        :name, 4, true, :guardian_id, :owner_patient_id
+                    )
                 """), {"id": home_id, "agency_id": agency.id, "location_id": location_id,
                        "name": name, "guardian_id": guardian_id, "owner_patient_id": owner_patient_id})
             for patient_id in members:
