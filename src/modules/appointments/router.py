@@ -272,7 +272,17 @@ async def create_appointment_endpoint(
         )
         await session.commit()
     except Exception:
-        pass
+        # The appointment was committed before the best-effort audit write.
+        # Roll back the separate failed audit transaction so SQLAlchemy does
+        # not leave this request in PendingRollback state while serializing
+        # the successful appointment response.
+        await session.rollback()
+        appt = await appointments_service.get_appointment(
+            session,
+            appointment_id=appt.id,
+            agency_id=agency_id,
+            with_activities=True,
+        )
     return _to_response(appt, with_items=True)
 
 
