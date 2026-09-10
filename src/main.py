@@ -35,9 +35,12 @@ from src.core.middleware import RequestContextMiddleware
 # the registry.
 from src.modules.agencies.models import Agency as _Agency  # noqa: F401
 from src.modules.agencies.router import router as agencies_router
-from src.modules.compliance.models import AgencyDocument, AgencyLicense  # noqa: F401
+from src.modules.compliance.models import (  # noqa: F401
+    AgencyComplianceReport, AgencyDocument, AgencyLicense, ServiceAuthorization, SupervisoryVisit,
+)
 from src.modules.compliance.issues import ComplianceIssue  # noqa: F401
 from src.modules.compliance.router import router as compliance_router
+from src.modules.compliance.operations_router import router as agency_compliance_router
 from src.modules.appointments.models import (  # noqa: F401
     Appointment,
     AppointmentActivity,
@@ -461,6 +464,7 @@ def create_app() -> FastAPI:
     # Guarded by `require_scope(AGENCIES)` so admins who can manage
     # agencies can also track their document/license status.
     app.include_router(compliance_router)
+    app.include_router(agency_compliance_router)
 
     # Billing — Stripe checkout + portal (per-agency) + webhook receiver.
     # Routes are mounted unconditionally but each handler short-circuits

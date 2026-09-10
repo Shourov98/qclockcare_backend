@@ -1336,6 +1336,28 @@ ADMIN_COMPLIANCE_FOLDER = folder(
 
 
 # --------------------------------------------------------------------------
+# Agency operational compliance (tenant scoped)
+# --------------------------------------------------------------------------
+AGENCY_COMPLIANCE_FOLDER = folder(
+    "agency-compliance",
+    [
+        make_request(name="Compliance overview", method="GET", path="/compliance/overview"),
+        make_request(name="List service authorizations", method="GET", path="/compliance/authorizations"),
+        make_request(name="Create service authorization", method="POST", path="/compliance/authorizations", body={"patient_id": "{{patient_id}}", "program_type": "PCA", "service_name": "Personal care", "authorization_number": "AUTH-2026-001", "starts_on": "2026-09-01", "ends_on": "2027-08-31", "authorized_units": 120, "unit_label": "hours"}, extract=[("authorization_id", "id")]),
+        make_request(name="Record authorization usage", method="POST", path="/compliance/authorizations/{{authorization_id}}/usage", body={"units": 2}),
+        make_request(name="List supervisory visits", method="GET", path="/compliance/supervisory-visits"),
+        make_request(name="Schedule supervisory visit", method="POST", path="/compliance/supervisory-visits", body={"staff_id": "{{staff_id}}", "patient_id": "{{patient_id}}", "scheduled_at": "2026-10-01T14:00:00Z", "objectives": "Observe service delivery."}, extract=[("supervisory_visit_id", "id")]),
+        make_request(name="Complete supervisory visit", method="POST", path="/compliance/supervisory-visits/{{supervisory_visit_id}}/complete", body={"findings": "Service delivery and documentation meet standards."}),
+        make_request(name="Acknowledge supervisory visit (staff)", method="POST", path="/compliance/supervisory-visits/{{supervisory_visit_id}}/acknowledge"),
+        make_request(name="List compliance reports", method="GET", path="/compliance/reports"),
+        make_request(name="Submit compliance report", method="POST", path="/compliance/reports", body={"title": "Documentation follow-up", "description": "Please review this compliance concern.", "category": "DOCUMENTATION", "severity": "MEDIUM", "patient_id": "{{patient_id}}"}, extract=[("compliance_report_id", "id")]),
+        make_request(name="Resolve compliance report", method="POST", path="/compliance/reports/{{compliance_report_id}}/resolve", body={"resolution_note": "Reviewed and corrected.", "dismiss": False}),
+    ],
+    description="Agency-scoped authorizations, supervision, and reporting. Agency admins manage records; staff acknowledge their supervision; staff, patients, and guardians submit reports.",
+)
+
+
+# --------------------------------------------------------------------------
 # 14. Admin — Admins (5 routes — SUPER_ADMIN only for write paths)
 # --------------------------------------------------------------------------
 ADMIN_ADMINS_FOLDER = folder(
@@ -1930,6 +1952,7 @@ COLLECTION: dict[str, Any] = {
         CHANGE_PASSWORD_FOLDER,
         ADMIN_TICKETS_FOLDER,
         ADMIN_COMPLIANCE_FOLDER,
+        AGENCY_COMPLIANCE_FOLDER,
         ADMIN_ADMINS_FOLDER,
         # 2. Admin (SUPER_ADMIN) — cross-tenant ops.
         ADMIN_FOLDER,

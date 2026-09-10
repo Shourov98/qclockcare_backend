@@ -15,10 +15,12 @@ it in sync with `expires_at` on every update.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import (
+    CheckConstraint,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
@@ -161,4 +163,85 @@ class AgencyLicense(IdMixin, TimestampedMixin, SoftDeleteMixin, Base):
     )
 
 
-__all__ = ["AgencyDocument", "AgencyLicense"]
+# --------------------------------------------------------------------------
+# Agency operational compliance
+# --------------------------------------------------------------------------
+class ServiceAuthorization(IdMixin, TimestampedMixin, SoftDeleteMixin, Base):
+    """A patient's authorization to receive a specific service.
+
+    Units are deliberately generic: agencies may authorize visits, hours, or
+    another payer unit. The UI displays the unit label stored with the record.
+    """
+
+    __tablename__ = "service_authorizations"
+
+    agency_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agencies.id", ondelete="CASCADE"), nullable=False, index=True)
+    patient_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("patient_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    program_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    service_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    authorization_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    starts_on: Mapped[date] = mapped_column(Date, nullable=False)
+    ends_on: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    authorized_units: Mapped[float] = mapped_column(nullable=False)
+    used_units: Mapped[float] = mapped_column(nullable=False, default=0, server_default="0")
+    unit_label: Mapped[str] = mapped_column(String(32), nullable=False, default="hours", server_default="hours")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="ACTIVE", server_default="ACTIVE", index=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("ends_on >= starts_on", name="ck_service_authorization_dates"),
+        CheckConstraint("authorized_units > 0", name="ck_service_authorization_authorized_units"),
+        CheckConstraint("used_units >= 0", name="ck_service_authorization_used_units"),
+        CheckConstraint("status IN ('ACTIVE', 'EXPIRING', 'EXPIRED', 'EXHAUSTED', 'CANCELLED')", name="ck_service_authorization_status"),
+        Index("idx_service_authorizations_agency_status", "agency_id", "status"),
+    )
+
+
+class SupervisoryVisit(IdMixin, TimestampedMixin, Base):
+    """An agency-admin documented supervision event for a staff member."""
+
+    __tablename__ = "supervisory_visits"
+
+    agency_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agencies.id", ondelete="CASCADE"), nullable=False, index=True)
+    staff_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("staff_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    patient_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("patient_profiles.id", ondelete="SET NULL"), nullable=True, index=True)
+    supervisor_user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="SCHEDULED", server_default="SCHEDULED", index=True)
+    objectives: Mapped[str | None] = mapped_column(Text, nullable=True)
+    findings: Mapped[str | None] = mapped_column(Text, nullable=True)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('SCHEDULED', 'COMPLETED', 'CANCELLED')", name="ck_supervisory_visit_status"),
+        Index("idx_supervisory_visits_agency_scheduled", "agency_id", "scheduled_at"),
+    )
+
+
+class AgencyComplianceReport(IdMixin, TimestampedMixin, Base):
+    """A concern reported by an agency member, patient, or guardian."""
+
+    __tablename__ = "agency_compliance_reports"
+
+    agency_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agencies.id", ondelete="CASCADE"), nullable=False, index=True)
+    reporter_user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True)
+    patient_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("patient_profiles.id", ondelete="SET NULL"), nullable=True, index=True)
+    category: Mapped[str] = mapped_column(String(32), nullable=False, default="OTHER", server_default="OTHER")
+    severity: Mapped[str] = mapped_column(String(16), nullable=False, default="MEDIUM", server_default="MEDIUM")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="OPEN", server_default="OPEN", index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    resolution_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("category IN ('DOCUMENTATION', 'STAFF_CREDENTIAL', 'SAFETY', 'SERVICE_AUTH', 'STAFF_TRAINING', 'OTHER')", name="ck_agency_compliance_report_category"),
+        CheckConstraint("severity IN ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW')", name="ck_agency_compliance_report_severity"),
+        CheckConstraint("status IN ('OPEN', 'IN_PROGRESS', 'RESOLVED', 'DISMISSED')", name="ck_agency_compliance_report_status"),
+        Index("idx_agency_compliance_reports_agency_status", "agency_id", "status"),
+    )
+
+
+__all__ = ["AgencyComplianceReport", "AgencyDocument", "AgencyLicense", "ServiceAuthorization", "SupervisoryVisit"]

@@ -7265,6 +7265,627 @@
       ]
     },
     {
+      "name": "agency-compliance",
+      "description": "Agency-scoped authorizations, supervision, and reporting. Agency admins manage records; staff acknowledge their supervision; staff, patients, and guardians submit reports.",
+      "item": [
+        {
+          "name": "Compliance overview",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-ID",
+                "value": "{{$randomUUID}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/compliance/overview",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "compliance",
+                "overview"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{access_token}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Compliance overview \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Compliance overview \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either a direct route model, an\n        // offset-paginated {data, pagination} body, or 204 with no body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success response must be an object').to.be.an('object');\n        }\n    }\n});\n\npm.test('Compliance overview \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List service authorizations",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-ID",
+                "value": "{{$randomUUID}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/compliance/authorizations",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "compliance",
+                "authorizations"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{access_token}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('List service authorizations \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('List service authorizations \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either a direct route model, an\n        // offset-paginated {data, pagination} body, or 204 with no body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success response must be an object').to.be.an('object');\n        }\n    }\n});\n\npm.test('List service authorizations \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create service authorization",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-ID",
+                "value": "{{$randomUUID}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/compliance/authorizations",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "compliance",
+                "authorizations"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"patient_id\": \"{{patient_id}}\",\n  \"program_type\": \"PCA\",\n  \"service_name\": \"Personal care\",\n  \"authorization_number\": \"AUTH-2026-001\",\n  \"starts_on\": \"2026-09-01\",\n  \"ends_on\": \"2027-08-31\",\n  \"authorized_units\": 120,\n  \"unit_label\": \"hours\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Create service authorization \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Create service authorization \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either a direct route model, an\n        // offset-paginated {data, pagination} body, or 204 with no body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success response must be an object').to.be.an('object');\n        }\n    }\n});\n\npm.test('Create service authorization \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});",
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {\n    const b = pm.response.json();\n    const v = \"id\".split('.').reduce(\n        (o, k) => (o == null ? o : o[k]), b\n    );\n    if (v != null) {\n        pm.environment.set('authorization_id', String(v));\n    }\n}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Record authorization usage",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-ID",
+                "value": "{{$randomUUID}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/compliance/authorizations/{{authorization_id}}/usage",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "compliance",
+                "authorizations",
+                "{{authorization_id}}",
+                "usage"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"units\": 2\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Record authorization usage \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Record authorization usage \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either a direct route model, an\n        // offset-paginated {data, pagination} body, or 204 with no body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success response must be an object').to.be.an('object');\n        }\n    }\n});\n\npm.test('Record authorization usage \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List supervisory visits",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-ID",
+                "value": "{{$randomUUID}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/compliance/supervisory-visits",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "compliance",
+                "supervisory-visits"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{access_token}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('List supervisory visits \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('List supervisory visits \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either a direct route model, an\n        // offset-paginated {data, pagination} body, or 204 with no body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success response must be an object').to.be.an('object');\n        }\n    }\n});\n\npm.test('List supervisory visits \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Schedule supervisory visit",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-ID",
+                "value": "{{$randomUUID}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/compliance/supervisory-visits",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "compliance",
+                "supervisory-visits"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"staff_id\": \"{{staff_id}}\",\n  \"patient_id\": \"{{patient_id}}\",\n  \"scheduled_at\": \"2026-10-01T14:00:00Z\",\n  \"objectives\": \"Observe service delivery.\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Schedule supervisory visit \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Schedule supervisory visit \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either a direct route model, an\n        // offset-paginated {data, pagination} body, or 204 with no body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success response must be an object').to.be.an('object');\n        }\n    }\n});\n\npm.test('Schedule supervisory visit \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});",
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {\n    const b = pm.response.json();\n    const v = \"id\".split('.').reduce(\n        (o, k) => (o == null ? o : o[k]), b\n    );\n    if (v != null) {\n        pm.environment.set('supervisory_visit_id', String(v));\n    }\n}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Complete supervisory visit",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-ID",
+                "value": "{{$randomUUID}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/compliance/supervisory-visits/{{supervisory_visit_id}}/complete",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "compliance",
+                "supervisory-visits",
+                "{{supervisory_visit_id}}",
+                "complete"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"findings\": \"Service delivery and documentation meet standards.\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Complete supervisory visit \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Complete supervisory visit \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either a direct route model, an\n        // offset-paginated {data, pagination} body, or 204 with no body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success response must be an object').to.be.an('object');\n        }\n    }\n});\n\npm.test('Complete supervisory visit \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Acknowledge supervisory visit (staff)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-ID",
+                "value": "{{$randomUUID}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/compliance/supervisory-visits/{{supervisory_visit_id}}/acknowledge",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "compliance",
+                "supervisory-visits",
+                "{{supervisory_visit_id}}",
+                "acknowledge"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{access_token}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Acknowledge supervisory visit (staff) \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Acknowledge supervisory visit (staff) \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either a direct route model, an\n        // offset-paginated {data, pagination} body, or 204 with no body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success response must be an object').to.be.an('object');\n        }\n    }\n});\n\npm.test('Acknowledge supervisory visit (staff) \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List compliance reports",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-ID",
+                "value": "{{$randomUUID}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/compliance/reports",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "compliance",
+                "reports"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{access_token}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('List compliance reports \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('List compliance reports \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either a direct route model, an\n        // offset-paginated {data, pagination} body, or 204 with no body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success response must be an object').to.be.an('object');\n        }\n    }\n});\n\npm.test('List compliance reports \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Submit compliance report",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-ID",
+                "value": "{{$randomUUID}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/compliance/reports",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "compliance",
+                "reports"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"title\": \"Documentation follow-up\",\n  \"description\": \"Please review this compliance concern.\",\n  \"category\": \"DOCUMENTATION\",\n  \"severity\": \"MEDIUM\",\n  \"patient_id\": \"{{patient_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Submit compliance report \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Submit compliance report \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either a direct route model, an\n        // offset-paginated {data, pagination} body, or 204 with no body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success response must be an object').to.be.an('object');\n        }\n    }\n});\n\npm.test('Submit compliance report \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});",
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {\n    const b = pm.response.json();\n    const v = \"id\".split('.').reduce(\n        (o, k) => (o == null ? o : o[k]), b\n    );\n    if (v != null) {\n        pm.environment.set('compliance_report_id', String(v));\n    }\n}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Resolve compliance report",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-ID",
+                "value": "{{$randomUUID}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/compliance/reports/{{compliance_report_id}}/resolve",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "compliance",
+                "reports",
+                "{{compliance_report_id}}",
+                "resolve"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{access_token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"resolution_note\": \"Reviewed and corrected.\",\n  \"dismiss\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Resolve compliance report \u2014 status is in 2xx', () => {\n    pm.expect(pm.response.code, `expected 2xx, got ${pm.response.code}: ${pm.response.text()}`)\n        .to.be.within(200, 299);\n});\n\npm.test('Resolve compliance report \u2014 response envelope shape', () => {\n    const b = pm.response.json();\n    if (pm.response.code >= 400) {\n        pm.expect(b, 'error envelope missing').to.have.property('error');\n        pm.expect(b.error).to.have.property('code');\n        pm.expect(b.error).to.have.property('message');\n        pm.expect(b.error).to.have.property('request_id');\n        pm.expect(b.error).to.have.property('timestamp');\n    } else {\n        // Successful responses are either a direct route model, an\n        // offset-paginated {data, pagination} body, or 204 with no body.\n        if (pm.response.code !== 204) {\n            pm.expect(b, 'success response must be an object').to.be.an('object');\n        }\n    }\n});\n\npm.test('Resolve compliance report \u2014 X-Request-ID round-trip', () => {\n    const rid = pm.response.headers.get('X-Request-ID');\n    pm.expect(rid, 'X-Request-ID header missing').to.be.a('string');\n    pm.expect(rid.length, 'X-Request-ID empty').to.be.greaterThan(0);\n});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
       "name": "admin-admins",
       "description": "Platform admin management. List/get are open to SUPER_ADMIN + PLATFORM_ADMIN; create / delete are SUPER_ADMIN only. PLATFORM_ADMIN creation requires at least one scope. Updating `scopes` on a SUPER_ADMIN is silently ignored.",
       "item": [
