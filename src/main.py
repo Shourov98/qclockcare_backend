@@ -10,6 +10,7 @@ See `09_BACKEND_STRUCTURE_SOLID_OOP.md` for the layering rationale.
 
 from __future__ import annotations
 
+import shared.session
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
