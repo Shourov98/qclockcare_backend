@@ -314,6 +314,13 @@ _EXPIRABLE_VISIT_STATUSES: frozenset[VisitStatus] = frozenset(
 )
 
 
+def _cancel_payment(appt: Appointment) -> None:
+    """Apply the terminal payment state for care that will not be delivered."""
+    appt.billing_status = "cancelled"
+    appt.billing_paid_at = None
+    appt.billing_paid_by_user_id = None
+
+
 async def reconcile_expired_appointments(
     session: AsyncSession,
     *,
@@ -347,6 +354,9 @@ async def reconcile_expired_appointments(
             status=AppointmentStatus.MISSED,
             cancelled_reason=reason,
             cancelled_at=now,
+            billing_status="cancelled",
+            billing_paid_at=None,
+            billing_paid_by_user_id=None,
         )
     )
     # Keep a started visit in sync so EVV and reporting do not present it as
@@ -402,7 +412,7 @@ async def create_appointment(
         location_id=payload.location_id,
         notes=payload.notes,
         status=AppointmentStatus.SCHEDULED,
-        billing_status="unpaid",
+        billing_status="pending",
         billing_amount_cents=payload.billing_amount_cents,
     )
     session.add(appt)
@@ -754,6 +764,12 @@ async def transition_status(
         )
 
     appt.status = payload.status
+    if payload.status in {
+        AppointmentStatus.CANCELLED,
+        AppointmentStatus.MISSED,
+        AppointmentStatus.REJECTED,
+    }:
+        _cancel_payment(appt)
     # Unused argument; kept so the signature matches the audit_logs
     # plumbing in the router.
     _ = actor_user_id
@@ -826,6 +842,7 @@ async def cancel_appointment(
     appt.status = AppointmentStatus.CANCELLED
     appt.cancelled_reason = payload.reason
     appt.cancelled_at = utc_now()
+    _cancel_payment(appt)
     _ = actor_user_id
     await session.flush()
     return appt
@@ -868,6 +885,7 @@ async def mark_appointment_missed(
     appt.status = AppointmentStatus.MISSED
     appt.cancelled_reason = payload.reason  # reuse the cancelled_reason field
     appt.cancelled_at = utc_now()
+    _cancel_payment(appt)
     _ = actor_user_id
     await session.flush()
     return appt
@@ -906,6 +924,7 @@ async def mark_appointment_rejected(
     appt.status = AppointmentStatus.REJECTED
     appt.cancelled_reason = payload.reason
     appt.cancelled_at = utc_now()
+    _cancel_payment(appt)
     _ = actor_user_id
     await session.flush()
     return appt
@@ -918,16 +937,9 @@ async def mark_appointment_billing_paid(
     agency_id: uuid.UUID,
     by_user_id: uuid.UUID,
 ) -> Appointment:
-    """Flip the denormalized billing toggle on the appointment row.
+    """Confirm in-person payment after a completed, signed visit.
 
-    The visit-side `billing_confirmed_at` is the staff's *caregiver*
-    confirmation (timestamp of the clinical sign-off). This row is the
-    *billing-payment* flag the agency admin / staff toggles after the
-    payment is processed. Both can coexist: the FE renders one badge
-    (`Paid` once `billing_status = 'paid'`).
-
-    Idempotent — re-paying is a no-op (the original `billing_paid_at`
-    is preserved for audit).
+    Only the staff member assigned to the appointment can record payment.
     """
     appt = await _get_appointment_or_404(
         session, appointment_id=appointment_id, agency_id=agency_id
@@ -935,6 +947,23 @@ async def mark_appointment_billing_paid(
 
     if appt.billing_status == "paid":
         return appt  # idempotent
+    if appt.billing_status == "cancelled":
+        raise InvalidStateTransitionError("Cancelled payments cannot be marked paid.")
+    if appt.status != AppointmentStatus.COMPLETED:
+        raise InvalidStateTransitionError(
+            "Payment can be marked paid only after the visit is completed and signed.",
+            details={"current_status": appt.status.value},
+        )
+    staff_id = (
+        await session.execute(
+            select(StaffProfile.id).where(
+                StaffProfile.agency_id == agency_id,
+                StaffProfile.user_id == by_user_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if staff_id is None or staff_id != appt.staff_id:
+        raise CrossAgencyAccessDeniedError()
 
     appt.billing_status = "paid"
     appt.billing_paid_at = utc_now()
@@ -1495,7 +1524,7 @@ def _summarize_to_dict(appt: Appointment) -> dict:
         "patient_initials": patient_initials,
         "patient_code": patient_code,
         "duration_label": duration_str,
-        "billing_status": getattr(appt, "billing_status", None) or "unpaid",
+        "billing_status": getattr(appt, "billing_status", None) or "pending",
         "billing_amount_cents": getattr(appt, "billing_amount_cents", None) or 0,
         "billing_paid_at": getattr(appt, "billing_paid_at", None),
         "claim_id": getattr(appt, "claim_id", None),
@@ -1509,17 +1538,17 @@ async def get_billing_summary(
     await reconcile_expired_appointments(session, agency_id=agency_id)
 
     amount = func.coalesce(Appointment.billing_amount_cents, 0)
-    cancelled = Appointment.status == AppointmentStatus.CANCELLED
-    paid = and_(~cancelled, Appointment.billing_status == "paid")
-    unpaid = and_(~cancelled, Appointment.billing_status != "paid")
+    cancelled = Appointment.billing_status == "cancelled"
+    paid = Appointment.billing_status == "paid"
+    pending = Appointment.billing_status == "pending"
     row = (
         await session.execute(
             select(
                 func.coalesce(func.sum(case((paid, amount), else_=0)), 0).label("paid_amount_cents"),
-                func.coalesce(func.sum(case((unpaid, amount), else_=0)), 0).label("unpaid_amount_cents"),
+                func.coalesce(func.sum(case((pending, amount), else_=0)), 0).label("pending_amount_cents"),
                 func.coalesce(func.sum(case((cancelled, amount), else_=0)), 0).label("cancelled_amount_cents"),
                 func.count().filter(paid).label("paid_count"),
-                func.count().filter(unpaid).label("unpaid_count"),
+                func.count().filter(pending).label("pending_count"),
                 func.count().filter(cancelled).label("cancelled_count"),
             ).where(Appointment.agency_id == agency_id)
         )
