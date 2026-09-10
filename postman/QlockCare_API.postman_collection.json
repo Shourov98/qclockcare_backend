@@ -2438,7 +2438,7 @@
             },
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"patient_id\": \"{{patient_id}}\",\n  \"scheduled_start\": \"2026-07-01T10:00:00Z\",\n  \"scheduled_end\": \"2026-07-01T11:00:00Z\",\n  \"billing_amount_cents\": 4500,\n  \"location_id\": \"{{location_id}}\",\n  \"notes\": \"Initial assessment\"\n}",
+              "raw": "{\n  \"patient_id\": \"{{patient_id}}\",\n  \"staff_id\": \"{{staff_id}}\",\n  \"program_type\": \"PCA\",\n  \"scheduled_start\": \"2026-10-01T10:00:00Z\",\n  \"scheduled_end\": \"2026-10-01T11:00:00Z\",\n  \"billing_amount_cents\": 4500,\n  \"location_id\": \"{{location_id}}\",\n  \"notes\": \"Initial assessment\",\n  \"activities\": [\n    {\n      \"name\": \"Check vitals and record\",\n      \"planned_minutes\": 15\n    },\n    {\n      \"name\": \"Assist with personal hygiene\",\n      \"planned_minutes\": 30\n    },\n    {\n      \"name\": \"Prepare light meal\",\n      \"planned_minutes\": 15\n    }\n  ]\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -11110,7 +11110,7 @@
             },
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"patient_id\": \"{{patient_id}}\",\n  \"scheduled_start\": \"2026-07-01T10:00:00Z\",\n  \"scheduled_end\": \"2026-07-01T11:00:00Z\",\n  \"billing_amount_cents\": 4500,\n  \"location_id\": \"{{location_id}}\",\n  \"notes\": \"Initial assessment\"\n}",
+              "raw": "{\n  \"patient_id\": \"{{patient_id}}\",\n  \"staff_id\": \"{{staff_id}}\",\n  \"program_type\": \"PCA\",\n  \"scheduled_start\": \"2026-10-01T10:00:00Z\",\n  \"scheduled_end\": \"2026-10-01T11:00:00Z\",\n  \"billing_amount_cents\": 4500,\n  \"location_id\": \"{{location_id}}\",\n  \"notes\": \"Initial assessment\",\n  \"activities\": [\n    {\n      \"name\": \"Check vitals and record\",\n      \"planned_minutes\": 15\n    },\n    {\n      \"name\": \"Assist with personal hygiene\",\n      \"planned_minutes\": 30\n    },\n    {\n      \"name\": \"Prepare light meal\",\n      \"planned_minutes\": 15\n    }\n  ]\n}",
               "options": {
                 "raw": {
                   "language": "json"
