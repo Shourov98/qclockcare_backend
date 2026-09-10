@@ -127,7 +127,15 @@ def _to_response(
     eagers, when used, leave the attr as `None` on rows without a
     location row).
     """
-    location_rel = getattr(appt, "location_rel", None)
+    # `location_rel` is configured with ``lazy="raise"``. Create and
+    # transition handlers often have the new appointment instance, rather
+    # than an instance re-queried with the location relationship eager
+    # loaded. Accessing that relationship directly would raise here after
+    # the write succeeded, incorrectly returning a 500 to the client.
+    try:
+        location_rel = getattr(appt, "location_rel", None)
+    except Exception:
+        location_rel = None
     latitude = (
         float(location_rel.latitude)
         if location_rel is not None and location_rel.latitude is not None
