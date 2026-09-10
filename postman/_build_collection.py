@@ -985,6 +985,8 @@ GROUP_HOMES_FOLDER = folder(
             body={
                 "name": "Maple Home",
                 "location_id": "{{location_id}}",
+                "latitude": 44.953700,
+                "longitude": -93.090000,
                 "patient_ids": ["{{patient_id}}"],
                 "owner_patient_id": "{{patient_id}}",
             },
@@ -997,6 +999,8 @@ GROUP_HOMES_FOLDER = folder(
             body={
                 "name": "Oak Home",
                 "location_id": "{{location_id}}",
+                "latitude": 44.985400,
+                "longitude": -93.270500,
                 "patient_ids": ["{{patient_id}}"],
                 "guardian_id": "{{guardian_id}}",
             },

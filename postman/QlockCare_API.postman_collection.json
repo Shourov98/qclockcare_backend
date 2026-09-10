@@ -5026,7 +5026,7 @@
             },
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"name\": \"Maple Home\",\n  \"location_id\": \"{{location_id}}\",\n  \"patient_ids\": [\n    \"{{patient_id}}\"\n  ],\n  \"owner_patient_id\": \"{{patient_id}}\"\n}",
+              "raw": "{\n  \"name\": \"Maple Home\",\n  \"location_id\": \"{{location_id}}\",\n  \"latitude\": 44.9537,\n  \"longitude\": -93.09,\n  \"patient_ids\": [\n    \"{{patient_id}}\"\n  ],\n  \"owner_patient_id\": \"{{patient_id}}\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -5085,7 +5085,7 @@
             },
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"name\": \"Oak Home\",\n  \"location_id\": \"{{location_id}}\",\n  \"patient_ids\": [\n    \"{{patient_id}}\"\n  ],\n  \"guardian_id\": \"{{guardian_id}}\"\n}",
+              "raw": "{\n  \"name\": \"Oak Home\",\n  \"location_id\": \"{{location_id}}\",\n  \"latitude\": 44.9854,\n  \"longitude\": -93.2705,\n  \"patient_ids\": [\n    \"{{patient_id}}\"\n  ],\n  \"guardian_id\": \"{{guardian_id}}\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
