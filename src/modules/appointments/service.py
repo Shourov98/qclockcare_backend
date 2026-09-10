@@ -457,9 +457,10 @@ async def create_appointment(
         await session.flush()
     except IntegrityError as exc:
         await session.rollback()
+        constraint = _extract_constraint(exc)
         raise ValidationError(
-            "Activity violates a check constraint.",
-            details={"constraint": _extract_constraint(exc)},
+            "Activity could not be saved.",
+            details={"constraint": constraint},
         ) from exc
 
     await session.refresh(appt, attribute_names=["activities"])
