@@ -141,7 +141,7 @@ class Appointment(IdMixin, TimestampedMixin, Base):
     # payload. `claim_id` is the durable, externally-rendered identifier
     # generated at insert time as `CG-{agency_code_short}-{appt_short}`.
     billing_status: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="unpaid", server_default="unpaid"
+        String(16), nullable=False, default="pending", server_default="pending"
     )
     # Amount due for this appointment, stored in integer cents so billing
     # totals remain exact. Existing appointments are safely backfilled to 0.
