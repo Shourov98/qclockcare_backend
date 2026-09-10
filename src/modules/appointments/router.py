@@ -18,7 +18,7 @@ Endpoints:
   POST   /appointments/{id}/missed                    — mark MISSED (SCHEDULED/READY)
   POST   /appointments/{id}/rejected                  — mark REJECTED (SCHEDULED)
   POST   /appointments/{id}/assign                    — assign staff
-  POST   /appointments/{id}/billing/paid              — flip billing toggle to paid
+  POST   /appointments/{id}/billing/paid              — assigned staff records in-person payment
 
   GET    /appointments/{id}/activities
   POST   /appointments/{id}/activities
@@ -353,7 +353,7 @@ async def get_billing_summary_endpoint(
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> AppointmentBillingSummaryResponse:
-    """Summarize paid, unpaid, and cancelled appointment amounts."""
+    """Summarize paid, pending, and cancelled appointment amounts."""
     agency_id = _require_agency(ctx)
     return AppointmentBillingSummaryResponse(
         **await appointments_service.get_billing_summary(
@@ -751,9 +751,7 @@ async def mark_appointment_rejected_endpoint(
 @router.post(
     "/{appointment_id}/billing/paid",
     response_model=AppointmentResponse,
-    dependencies=[
-        Depends(require_role(UserRole.AGENCY_ADMIN, UserRole.STAFF))
-    ],
+    dependencies=[Depends(require_role(UserRole.STAFF))],
 )
 async def mark_appointment_billing_paid_endpoint(
     appointment_id: uuid.UUID,
@@ -762,12 +760,7 @@ async def mark_appointment_billing_paid_endpoint(
     ctx: CurrentAuth,
     session: Annotated[AsyncSession, Depends(get_session_with_auth)],
 ) -> AppointmentResponse:
-    """Flip the billing toggle to `paid` (idempotent).
-
-    The visit-side `billing_confirmed_at` is the caregiver's
-    clinical sign-off; this endpoint flips the *payment* flag the
-    agency-admin / staff toggles after payment is processed.
-    """
+    """Record in-person payment for the assigned staff member's completed visit."""
     agency_id = _require_agency(ctx)
     ip, ua = audit_logs_service.request_ip_ua(request)
     appt = await appointments_service.mark_appointment_billing_paid(
