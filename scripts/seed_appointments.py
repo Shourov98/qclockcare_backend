@@ -51,10 +51,12 @@ Dependencies:
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import json
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import text
@@ -102,6 +104,7 @@ class SeedResult:
     notes: int
     signatures: int
     evv_records: int
+    notifications: int = 0
 
 
 # --------------------------------------------------------------------------
@@ -123,126 +126,75 @@ def _make_claim_id(agency_name: str, appt_id: uuid.UUID) -> str:
     return f"CG-{tag}-{str(appt_id)[:8].upper()}"
 
 
-async def _require_seeded_ids(engine: AsyncEngine) -> SeededIds:
-    """Look up the IDs seeded by `seed_test_user.py`.
-
-    Resolves the agency context the same way the JWT auth flow does:
-    the admin's "primary" agency is the AGENCY_ADMIN role row that
-    shares an agency with both a `staff_profiles` row for the seeded
-    STAFF user and a `patient_profiles` row for the seeded PATIENT
-    user. This is the agency whose `/appointments`, `/visits`, and
-    `/portal/visits` responses will surface the rows we insert.
-    """
+async def _require_seeded_ids(
+    engine: AsyncEngine,
+    *,
+    agency_admin_email: str,
+    staff_email: str | None,
+    patient_email: str | None,
+) -> SeededIds:
+    """Resolve one agency admin plus a staff member and patient in its tenant."""
     async with engine.begin() as conn:
-        # Resolve the three seeded users.
-        user_rows = (
-            await conn.execute(
-                text(
-                    "SELECT email, id FROM users "
-                    "WHERE email IN (:a, :s, :p)"
-                ),
-                {"a": AGENCY_ADMIN_EMAIL, "s": STAFF_EMAIL, "p": PATIENT_EMAIL},
-            )
-        ).all()
-        if len(user_rows) != 3:
-            missing = {
-                AGENCY_ADMIN_EMAIL,
-                STAFF_EMAIL,
-                PATIENT_EMAIL,
-            } - {r[0] for r in user_rows}
-            raise SystemExit(
-                "ERROR: missing one of the seeded users: "
-                f"{', '.join(sorted(missing))}. "
-                "Run scripts/seed_test_user.py first."
-            )
-        user_ids = {r[0]: r[1] for r in user_rows}
-        admin_user_id = user_ids[AGENCY_ADMIN_EMAIL]
-        staff_user_id = user_ids[STAFF_EMAIL]
-        patient_user_id = user_ids[PATIENT_EMAIL]
-
-        # Find the agency where ALL THREE have a coordinated presence.
         agency_row = (
             await conn.execute(
                 text(
                     """
-                    SELECT ur.agency_id, ag.name
-                    FROM user_roles ur
+                    SELECT ur.agency_id, ag.name, u.id
+                    FROM users u
+                    JOIN user_roles ur ON ur.user_id = u.id
                     JOIN agencies ag ON ag.id = ur.agency_id
-                    WHERE ur.user_id = :u
-                      AND ur.role = 'AGENCY_ADMIN'
-                      AND EXISTS (
-                          SELECT 1 FROM staff_profiles sp
-                          WHERE sp.agency_id = ur.agency_id
-                            AND sp.user_id = :s
-                      )
-                      AND EXISTS (
-                          SELECT 1 FROM patient_profiles pp
-                          WHERE pp.agency_id = ur.agency_id
-                            AND pp.user_id = :p
-                      )
+                    WHERE u.email = :email AND ur.role = 'AGENCY_ADMIN'
                     LIMIT 1
                     """
                 ),
-                {"u": admin_user_id, "s": staff_user_id, "p": patient_user_id},
+                {"email": agency_admin_email},
             )
         ).first()
         if agency_row is None:
             raise SystemExit(
-                "ERROR: no agency found where the seeded admin, staff, "
-                "and patient all share a coordinated presence. "
-                "Run scripts/seed_test_user.py first."
+                f"ERROR: {agency_admin_email!r} is not an AGENCY_ADMIN."
             )
         agency_id = agency_row[0]
         agency_name = agency_row[1]
+        admin_user_id = agency_row[2]
         print(f"Using agency {agency_id} ({agency_name!r})")
 
-        # Sanity fix: the admin user can have AGENCY_ADMIN role rows at
-        # multiple agencies (e.g. leftover rows from earlier dev runs).
-        deleted = await conn.execute(
-            text(
-                "DELETE FROM user_roles "
-                "WHERE user_id = :u AND role = 'AGENCY_ADMIN' "
-                "  AND agency_id IS DISTINCT FROM :a"
-            ),
-            {"u": admin_user_id, "a": agency_id},
-        )
-        if deleted.rowcount:
-            print(
-                f"  removed {deleted.rowcount} stale admin role row(s) "
-                "at other agencies"
-            )
-
+        staff_where = " AND u.email = :email" if staff_email else ""
         staff_profile_row = (
             await conn.execute(
                 text(
-                    "SELECT id FROM staff_profiles "
-                    "WHERE agency_id = :a AND user_id = :u"
+                    "SELECT sp.id, sp.user_id FROM staff_profiles sp "
+                    "JOIN users u ON u.id = sp.user_id "
+                    "WHERE sp.agency_id = :agency"
+                    f"{staff_where} ORDER BY sp.created_at, sp.id LIMIT 1"
                 ),
-                {"a": agency_id, "u": staff_user_id},
+                {"agency": agency_id, **({"email": staff_email} if staff_email else {})},
             )
         ).first()
+        patient_where = " AND u.email = :email" if patient_email else ""
         patient_profile_row = (
             await conn.execute(
                 text(
-                    "SELECT id FROM patient_profiles "
-                    "WHERE agency_id = :a AND user_id = :u"
+                    "SELECT pp.id, pp.user_id FROM patient_profiles pp "
+                    "JOIN users u ON u.id = pp.user_id "
+                    "WHERE pp.agency_id = :agency"
+                    f"{patient_where} ORDER BY pp.created_at, pp.id LIMIT 1"
                 ),
-                {"a": agency_id, "u": patient_user_id},
+                {"agency": agency_id, **({"email": patient_email} if patient_email else {})},
             )
         ).first()
         if staff_profile_row is None or patient_profile_row is None:
             raise SystemExit(
-                "ERROR: missing staff/patient profile at the resolved "
-                "agency. Run scripts/seed_test_user.py first."
+                "ERROR: target agency needs at least one staff profile and one patient profile."
             )
 
         return SeededIds(
             agency_id=agency_id,
             agency_name=agency_name,
             patient_profile_id=patient_profile_row[0],
-            patient_user_id=patient_user_id,
+            patient_user_id=patient_profile_row[1],
             staff_profile_id=staff_profile_row[0],
-            staff_user_id=staff_user_id,
+            staff_user_id=staff_profile_row[1],
             admin_user_id=admin_user_id,
         )
 
@@ -317,43 +269,44 @@ async def _seed_locations(
         return new_id
 
 
-async def _wipe(engine: AsyncEngine) -> None:
+async def _wipe(engine: AsyncEngine, *, agency_id: uuid.UUID) -> None:
     """Clear rows in dependency order.
 
     We don't touch `patient_profiles`, `staff_profiles`, `agencies`,
     `users`, etc — those are owned by `seed_test_user.py`. We only
     clear the appointment-side rows.
     """
-    # Each statement runs in its own short transaction so a missing
-    # optional table doesn't poison the rest of the wipe.
-    required = (
-        "appointment_signatures",
-        "visit_notes",
-        "evv_records",
-        "visit_activity_deliveries",
-        "visits",
-        "appointment_activities",
-        "appointments",
-    )
-    optional = (
-        "service_verifications",
-        "appointment_confirmations",
-        "appointment_events",
-        "appointment_charges",
-    )
-    for tbl in required:
-        async with engine.begin() as conn:
-            await conn.execute(text(f"DELETE FROM {tbl}"))
-    for tbl in optional:
-        try:
-            async with engine.begin() as conn:
-                await conn.execute(text(f"DELETE FROM {tbl}"))
-        except Exception:
-            # Table doesn't exist on this schema version — skip.
-            pass
+    async with engine.begin() as conn:
+        params = {"agency": agency_id}
+        await conn.execute(text(
+            "DELETE FROM appointment_signatures s USING visits v, appointments a "
+            "WHERE s.visit_id = v.id AND v.appointment_id = a.id AND a.agency_id = :agency"
+        ), params)
+        await conn.execute(text(
+            "DELETE FROM visit_notes n USING visits v, appointments a "
+            "WHERE n.visit_id = v.id AND v.appointment_id = a.id AND a.agency_id = :agency"
+        ), params)
+        await conn.execute(text(
+            "DELETE FROM evv_records e USING visits v, appointments a "
+            "WHERE e.visit_id = v.id AND v.appointment_id = a.id AND a.agency_id = :agency"
+        ), params)
+        await conn.execute(text(
+            "DELETE FROM visit_activity_deliveries d USING visits v, appointments a "
+            "WHERE d.visit_id = v.id AND v.appointment_id = a.id AND a.agency_id = :agency"
+        ), params)
+        await conn.execute(text(
+            "DELETE FROM visits v USING appointments a "
+            "WHERE v.appointment_id = a.id AND a.agency_id = :agency"
+        ), params)
+        await conn.execute(
+            text("DELETE FROM appointment_activities WHERE agency_id = :agency"), params
+        )
+        await conn.execute(text("DELETE FROM appointments WHERE agency_id = :agency"), params)
 
 
-async def _seed() -> SeedResult:
+async def _seed(
+    *, agency_admin_email: str, staff_email: str | None, patient_email: str | None
+) -> SeedResult:
     engine = create_async_engine(
         settings.effective_database_url,
         pool_pre_ping=True,
@@ -375,7 +328,12 @@ async def _seed() -> SeedResult:
             )
             raise SystemExit(2) from exc
 
-        ids = await _require_seeded_ids(engine)
+        ids = await _require_seeded_ids(
+            engine,
+            agency_admin_email=agency_admin_email,
+            staff_email=staff_email,
+            patient_email=patient_email,
+        )
         print(f"  staff={ids.staff_profile_id} "
               f"patient={ids.patient_profile_id}")
 
@@ -383,16 +341,58 @@ async def _seed() -> SeedResult:
         location_id = await _seed_locations(engine, ids=ids)
 
         print("Wiping existing appointments + visits + signatures + EVV + notes…")
-        await _wipe(engine)
+        await _wipe(engine, agency_id=ids.agency_id)
 
         print(
             "Inserting 14 appointments "
             "(8 lifecycle demo + 6 upcoming for the patient calendar)…"
         )
         result = await _insert_appointments(engine, ids=ids, location_id=location_id)
-        return result
+        notifications = await _seed_notifications(engine, ids=ids)
+        return replace(result, notifications=notifications)
     finally:
         await engine.dispose()
+
+
+async def _seed_notifications(engine: AsyncEngine, *, ids: SeededIds) -> int:
+    """Create a small, linked-looking inbox for the target agency admin."""
+    notices = (
+        ("APPOINTMENT_READY", "Visit ready for assignment", "A same-day PCA visit is ready for caregiver review."),
+        ("VISIT_SUBMITTED_FOR_SIGNATURE", "Signature needed", "A completed visit is ready for patient or guardian signature."),
+        ("BILLING_CONFIRMED", "Payment received", "One completed appointment has been marked as paid."),
+        ("GENERIC", "Schedule coverage update", "A future visit still needs a caregiver assignment."),
+        ("GENERIC", "Documentation review", "One visit has a note ready for agency review."),
+    )
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "DELETE FROM notifications "
+                "WHERE agency_id = :agency AND metadata->>'source' = 'demo_seed'"
+            ),
+            {"agency": ids.agency_id},
+        )
+        for index, (notification_type, title, body) in enumerate(notices):
+            await conn.execute(
+                text(
+                    "INSERT INTO notifications ("
+                    "id, agency_id, recipient_user_id, type, title, body, status, metadata, created_at"
+                    ") VALUES ("
+                    ":id, :agency, :recipient, :type, :title, :body, 'SENT', "
+                    "CAST(:metadata AS jsonb), now() - (:age_hours * interval '1 hour')"
+                    ")"
+                ),
+                {
+                    "id": uuid.uuid4(),
+                    "agency": ids.agency_id,
+                    "recipient": ids.admin_user_id,
+                    "type": notification_type,
+                    "title": title,
+                    "body": body,
+                    "metadata": json.dumps({"source": "demo_seed"}),
+                    "age_hours": index,
+                },
+            )
+    return len(notices)
 
 
 async def _insert_appointments(
@@ -1025,8 +1025,19 @@ async def _insert_appointments(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Seed one agency's appointment demo data.")
+    parser.add_argument("--agency-admin-email", default=AGENCY_ADMIN_EMAIL)
+    parser.add_argument("--staff-email")
+    parser.add_argument("--patient-email")
+    args = parser.parse_args()
     print("Seeding appointment + visit lifecycle demo data…\n")
-    result = asyncio.run(_seed())
+    result = asyncio.run(
+        _seed(
+            agency_admin_email=args.agency_admin_email,
+            staff_email=args.staff_email,
+            patient_email=args.patient_email,
+        )
+    )
     print(
         f"\nDone.\n"
         f"  appointments              = {result.appointments}\n"
@@ -1036,6 +1047,7 @@ def main() -> None:
         f"  visit_notes               = {result.notes}\n"
         f"  appointment_signatures    = {result.signatures}\n"
         f"  evv_records               = {result.evv_records}\n"
+        f"  notifications             = {result.notifications}\n"
     )
     print("Now hit these endpoints to see the data:")
     print("  GET /appointments")
