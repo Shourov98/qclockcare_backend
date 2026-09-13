@@ -500,6 +500,7 @@ async def list_appointments(
     patient_id: uuid.UUID | None = None,
     staff_id: uuid.UUID | None = None,
     status_filter: AppointmentStatus | None = None,
+    billing_status: str | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
     page: int = 1,
@@ -557,6 +558,9 @@ async def list_appointments(
     if status_filter is not None:
         base = base.where(Appointment.status == status_filter)
         count_base = count_base.where(Appointment.status == status_filter)
+    if billing_status is not None:
+        base = base.where(Appointment.billing_status == billing_status)
+        count_base = count_base.where(Appointment.billing_status == billing_status)
     if date_from is not None:
         dt_from = datetime.combine(date_from, time.min)
         base = base.where(Appointment.scheduled_start >= dt_from)

@@ -31,7 +31,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from datetime import date, timedelta
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -296,6 +296,10 @@ async def list_appointments_endpoint(
     patient_id: uuid.UUID | None = Query(default=None),
     staff_id: uuid.UUID | None = Query(default=None),
     status_filter: AppointmentStatus | None = Query(default=None, alias="status"),
+    billing_status: Literal["pending", "paid", "cancelled"] | None = Query(
+        default=None,
+        description="Filter by in-person payment status.",
+    ),
     date_from: date | None = Query(
         default=None,
         description="Calendar date (YYYY-MM-DD) — only appointments at or after this date are returned.",
@@ -313,6 +317,7 @@ async def list_appointments_endpoint(
       - patient_id (PATIENT role forces this to their own profile id)
       - staff_id   (STAFF role: useful for "my day" / "my week" views)
       - status     — one of the 8 lifecycle values
+      - billing_status — pending, paid, or cancelled payment records
       - date_from / date_to — calendar-date filters on `scheduled_start`,
                               both inclusive (so `date_from == date_to`
                               means "appointments on that day")
@@ -345,6 +350,7 @@ async def list_appointments_endpoint(
         patient_id=patient_id,
         staff_id=staff_id,
         status_filter=status_filter,
+        billing_status=billing_status,
         date_from=date_from,
         date_to=date_to,
         page=page,
