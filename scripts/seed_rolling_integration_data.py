@@ -55,7 +55,7 @@ async def seed(agency_admin_email: str) -> None:
                 LIMIT 12
             """), {"agency_id": agency_id})).all()
             patient_rows = (await conn.execute(text("""
-                SELECT id FROM patient_profiles
+                SELECT id, user_id FROM patient_profiles
                 WHERE agency_id = :agency_id AND status = 'ACTIVE'
                 ORDER BY created_at, id
                 LIMIT 24
@@ -101,6 +101,10 @@ async def seed(agency_admin_email: str) -> None:
                 DELETE FROM notifications
                 WHERE agency_id = :agency_id AND metadata->>'source' = 'rolling_integration_seed'
             """), {"agency_id": agency_id})
+            await conn.execute(text("""
+                DELETE FROM conversations
+                WHERE agency_id = :agency_id AND title LIKE :tag
+            """), {"agency_id": agency_id, "tag": "[integration seed]%"})
 
             now = datetime.now(tz=UTC)
             day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -280,9 +284,88 @@ async def seed(agency_admin_email: str) -> None:
                 )
             """), notifications)
 
+            conversation_specs = [
+                (
+                    "[integration seed] Schedule coordination",
+                    [admin_user_id, staff_rows[0][1]],
+                    [
+                        (admin_user_id, "Welcome. Please use this thread for schedule questions."),
+                        (staff_rows[0][1], "Thank you. I will confirm my visits before the shift starts."),
+                    ],
+                ),
+                (
+                    "[integration seed] Care update",
+                    [staff_rows[0][1], patient_rows[0][1]],
+                    [
+                        (staff_rows[0][1], "I will see you at the scheduled time today."),
+                        (patient_rows[0][1], "Thank you. I will be ready."),
+                    ],
+                ),
+            ]
+            guardian_user_id = (await conn.execute(text("""
+                SELECT user_id FROM guardian_profiles
+                WHERE agency_id = :agency_id AND status = 'ACTIVE'
+                ORDER BY created_at, id
+                LIMIT 1
+            """), {"agency_id": agency_id})).scalar_one_or_none()
+            if guardian_user_id is not None:
+                conversation_specs.append((
+                    "[integration seed] Family coordination",
+                    [admin_user_id, guardian_user_id],
+                    [
+                        (admin_user_id, "Your agency contact is available for care coordination."),
+                        (guardian_user_id, "Thank you. I will use this thread for non-urgent questions."),
+                    ],
+                ))
+
+            conversation_count = 0
+            for title, participant_ids, messages in conversation_specs:
+                conversation_id = uuid.uuid4()
+                message_time = now - timedelta(minutes=conversation_count * 20)
+                await conn.execute(text("""
+                    INSERT INTO conversations (
+                        id, agency_id, created_by_user_id, title, last_message_at,
+                        last_message_preview
+                    ) VALUES (
+                        :id, :agency_id, :created_by_user_id, :title, :last_message_at,
+                        :last_message_preview
+                    )
+                """), {
+                    "id": conversation_id, "agency_id": agency_id,
+                    "created_by_user_id": messages[0][0], "title": title,
+                    "last_message_at": message_time,
+                    "last_message_preview": messages[-1][1],
+                })
+                await conn.execute(text("""
+                    INSERT INTO conversation_participants (
+                        id, conversation_id, user_id, last_read_at
+                    ) VALUES (:id, :conversation_id, :user_id, :last_read_at)
+                """), [
+                    {
+                        "id": uuid.uuid4(), "conversation_id": conversation_id,
+                        "user_id": participant_id,
+                        "last_read_at": message_time if participant_id == messages[-1][0] else None,
+                    }
+                    for participant_id in participant_ids
+                ])
+                await conn.execute(text("""
+                    INSERT INTO conversation_messages (
+                        id, conversation_id, sender_user_id, body, created_at
+                    ) VALUES (:id, :conversation_id, :sender_user_id, :body, :created_at)
+                """), [
+                    {
+                        "id": uuid.uuid4(), "conversation_id": conversation_id,
+                        "sender_user_id": sender_user_id, "body": body,
+                        "created_at": message_time - timedelta(minutes=(len(messages) - message_index) * 4),
+                    }
+                    for message_index, (sender_user_id, body) in enumerate(messages)
+                ])
+                conversation_count += 1
+
         print(
             f"Seeded {agency_name}: {len(appointments)} appointments, {len(activities)} activities, "
-            f"{len(visits)} visits, {len(evv_records)} EVV records, and {len(notifications)} notifications."
+            f"{len(visits)} visits, {len(evv_records)} EVV records, {len(notifications)} notifications, "
+            f"and {conversation_count} conversations."
         )
     finally:
         await engine.dispose()

@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -131,9 +131,14 @@ async def serialize_conversation(session: AsyncSession, conversation: Conversati
     users = {user.id: user for user in (await session.execute(select(User).where(User.id.in_(user_ids)))).scalars().all()}
     roles = {row.user_id: row.role.value for row in (await session.execute(select(UserRoleAssignment).where(UserRoleAssignment.user_id.in_(user_ids), UserRoleAssignment.agency_id == conversation.agency_id))).scalars().all()}
     viewer = next(participant for participant in conversation.participants if participant.user_id == viewer_id)
-    unread_count = 0
-    if details:
-        unread_count = sum(1 for message in conversation.messages if message.sender_user_id != viewer_id and (viewer.last_read_at is None or message.created_at > viewer.last_read_at))
+    unread_filter = [
+        ConversationMessage.conversation_id == conversation.id,
+        ConversationMessage.sender_user_id != viewer_id,
+        ConversationMessage.created_at > viewer.last_read_at if viewer.last_read_at else true(),
+    ]
+    unread_count = (await session.execute(
+        select(func.count(ConversationMessage.id)).where(*unread_filter)
+    )).scalar_one()
     payload = {"id": conversation.id, "title": conversation.title, "created_by_user_id": conversation.created_by_user_id, "last_message_at": conversation.last_message_at, "last_message_preview": conversation.last_message_preview, "unread_count": unread_count, "participants": [{"user_id": participant.user_id, "full_name": users.get(participant.user_id).full_name if users.get(participant.user_id) else None, "role": roles.get(participant.user_id), "last_read_at": participant.last_read_at} for participant in conversation.participants]}
     if details:
         payload["messages"] = [{"id": message.id, "sender_user_id": message.sender_user_id, "sender_name": users.get(message.sender_user_id).full_name if users.get(message.sender_user_id) else None, "body": message.body, "created_at": message.created_at} for message in conversation.messages]
