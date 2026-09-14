@@ -427,6 +427,11 @@ def create_app() -> FastAPI:
     # Notifications — recipient-facing list/read endpoints.
     app.include_router(notifications_router)
 
+    # Messaging — agency-scoped conversations for admins, staff, patients,
+    # and guardians. Participant authorization is enforced by the module.
+    from src.modules.messaging.router import router as messaging_router
+    app.include_router(messaging_router)
+
     # Locations — service-delivery addresses (used by appointments/visits).
     app.include_router(locations_router)
     app.include_router(group_homes_router)

@@ -7,6 +7,7 @@ billing, and notifications.
 
 It is safe to re-run.  It only creates deterministic ``showcase`` accounts in
 the selected agency and replaces only appointments that carry its seed marker.
+Its calendar always covers today through the following seven days.
 It never deletes another agency's records.
 
 Example:
@@ -33,7 +34,6 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from src.core.config import settings
 from src.core.security import hash_password
-
 
 PASSWORD = "ShowcasePass123!"
 SEED_TAG = "[showcase-seed:v1]"
@@ -293,7 +293,8 @@ async def _ensure_group_homes(
 
 async def _replace_showcase_schedule(
     engine: AsyncEngine, agency: Agency, *, locations: list[uuid.UUID], patients: list[uuid.UUID], staff: list[uuid.UUID]
-) -> int:
+) -> tuple[int, int, int]:
+    """Replace one agency's rolling eight-day integration test schedule."""
     async with engine.begin() as conn:
         await conn.execute(text("""
             DELETE FROM appointment_activities aa
@@ -304,32 +305,43 @@ async def _replace_showcase_schedule(
             DELETE FROM appointments WHERE agency_id = :agency_id AND notes LIKE :tag
         """), {"agency_id": agency.id, "tag": f"{SEED_TAG}%"})
 
-        base = datetime.now(tz=UTC).replace(hour=8, minute=0, second=0, microsecond=0) - timedelta(days=7)
+        now = datetime.now(tz=UTC)
+        base = now.replace(hour=0, minute=0, second=0, microsecond=0)
         services = [
             ("Morning personal care", "PCA", 4500),
             ("Medication and wellness check", "PCA", 4500),
             ("Community skills support", "245D", 6750),
             ("Care plan check-in", "CFSS", 4500),
         ]
-        slots = [8, 10, 13, 15]
+        slots = [1, 3, 5, 11, 14, 17]
+        appointment_count = 0
+        visit_count = 0
+        evv_count = 0
         for index in range(48):
             service, program, amount = services[index % len(services)]
-            start = base + timedelta(days=index // 4, hours=slots[index % len(slots)])
+            day_offset = index // len(slots)
+            start = base + timedelta(days=day_offset, hours=slots[index % len(slots)])
             status = "SCHEDULED"
             cancelled_at = None
             cancelled_reason = None
-            if start < datetime.now(tz=UTC):
-                if index % 5 == 0:
-                    status = "CANCELLED"
+            has_visit = False
+            if day_offset == 0 and start < now:
+                status = ("COMPLETED", "AWAITING_SIGNATURE", "MISSED", "CANCELLED")[index % 4]
+                has_visit = status in {"COMPLETED", "AWAITING_SIGNATURE"}
+                if status == "CANCELLED":
                     cancelled_at = start - timedelta(hours=2)
                     cancelled_reason = "Family requested a reschedule."
-                else:
-                    status = "MISSED"
+                elif status == "MISSED":
                     cancelled_at = start + timedelta(minutes=20)
                     cancelled_reason = "Caregiver was unavailable; office notified the family."
-            elif start.date() == datetime.now(tz=UTC).date() and index % 3 == 0:
+            elif day_offset == 0 and index % 3 == 0:
                 status = "READY"
+            elif day_offset in {2, 5} and index % 13 == 0:
+                status = "CANCELLED"
+                cancelled_at = now
+                cancelled_reason = "Family cancelled the upcoming visit."
             appointment_id = uuid.uuid4()
+            staff_id = None if status == "SCHEDULED" and index % 9 == 0 else staff[index % len(staff)]
             await conn.execute(text("""
                 INSERT INTO appointments (
                     id, agency_id, patient_id, staff_id, program_type, scheduled_start,
@@ -342,24 +354,117 @@ async def _replace_showcase_schedule(
                 )
             """), {
                 "id": appointment_id, "agency_id": agency.id,
-                "patient_id": patients[index % len(patients)], "staff_id": staff[index % len(staff)],
+                "patient_id": patients[index % len(patients)], "staff_id": staff_id,
                 "program": program, "start": start, "end": start + timedelta(hours=1),
                 "status": status, "location": LOCATIONS[index % len(locations)][0],
                 "location_id": locations[index % len(locations)],
                 "notes": f"{SEED_TAG} {service}. Linked demonstration appointment.",
                 "cancelled_reason": cancelled_reason, "cancelled_at": cancelled_at,
-                "billing_status": "cancelled" if status in {"CANCELLED", "MISSED"} else "pending",
+                "billing_status": (
+                    "paid" if status == "COMPLETED"
+                    else "cancelled" if status in {"CANCELLED", "MISSED"}
+                    else "pending"
+                ),
                 "amount": amount, "claim_id": f"CG-SHOW-{str(appointment_id)[:8].upper()}",
             })
+            appointment_count += 1
+            activity_ids: list[uuid.UUID] = []
+            for activity_name, minutes in ((service, 35), ("Document care outcomes", 15)):
+                activity_id = uuid.uuid4()
+                activity_ids.append(activity_id)
+                await conn.execute(text("""
+                    INSERT INTO appointment_activities (
+                        id, appointment_id, agency_id, name, planned_minutes, status, notes
+                    ) VALUES (
+                        :id, :appointment_id, :agency_id, :name, :minutes, 'PENDING', :notes
+                    )
+                """), {"id": activity_id, "appointment_id": appointment_id, "agency_id": agency.id,
+                       "name": activity_name, "minutes": minutes,
+                       "notes": "Showcase activity checklist item."})
+
+            if has_visit and staff_id is not None:
+                visit_id = uuid.uuid4()
+                visit_status = "COMPLETED" if status == "COMPLETED" else "AWAITING_SIGNATURE"
+                await conn.execute(text("""
+                    INSERT INTO visits (
+                        id, appointment_id, agency_id, staff_id, status, sharing_location,
+                        billing_confirmed_at, created_at, updated_at
+                    ) VALUES (
+                        :id, :appointment_id, :agency_id, :staff_id, :status, false,
+                        :billing_confirmed_at, now(), now()
+                    )
+                """), {"id": visit_id, "appointment_id": appointment_id,
+                       "agency_id": agency.id, "staff_id": staff_id, "status": visit_status,
+                       "billing_confirmed_at": start + timedelta(hours=1)
+                       if status == "AWAITING_SIGNATURE" else None})
+                visit_count += 1
+                await conn.execute(text("""
+                    INSERT INTO evv_records (
+                        id, visit_id, agency_id, start_time, start_lat, start_lng,
+                        start_accuracy_m, start_device_id, start_verification_status,
+                        end_time, end_lat, end_lng, end_accuracy_m, created_at, updated_at
+                    ) VALUES (
+                        :id, :visit_id, :agency_id, :start, 44.953700, -93.090000,
+                        10.0, 'showcase-device', 'VERIFIED',
+                        :end, 44.953700, -93.090000, 12.0, now(), now()
+                    )
+                """), {"id": uuid.uuid4(), "visit_id": visit_id, "agency_id": agency.id,
+                       "start": start, "end": start + timedelta(hours=1)})
+                evv_count += 1
+                for activity_id in activity_ids:
+                    await conn.execute(text("""
+                        INSERT INTO visit_activity_deliveries (
+                            id, visit_id, agency_id, activity_id, status, completed_at, created_at, updated_at
+                        ) VALUES (
+                            :id, :visit_id, :agency_id, :activity_id, 'DONE', :completed_at, now(), now()
+                        )
+                    """), {"id": uuid.uuid4(), "visit_id": visit_id, "agency_id": agency.id,
+                           "activity_id": activity_id, "completed_at": start + timedelta(hours=1)})
+    return appointment_count, visit_count, evv_count
+
+
+async def _replace_showcase_notifications(engine: AsyncEngine, agency: Agency) -> int:
+    """Refresh a current admin inbox without touching real notifications."""
+    async with engine.begin() as conn:
+        admin_id = (await conn.execute(text("""
+            SELECT u.id
+            FROM users u
+            JOIN user_roles ur ON ur.user_id = u.id
+            WHERE ur.agency_id = :agency_id AND ur.role = 'AGENCY_ADMIN'
+            ORDER BY u.created_at
+            LIMIT 1
+        """), {"agency_id": agency.id})).scalar_one()
+        await conn.execute(text("""
+            DELETE FROM notifications
+            WHERE agency_id = :agency_id AND metadata->>'source' = 'showcase_seed'
+        """), {"agency_id": agency.id})
+        notices = (
+            ("APPOINTMENT_READY", "Visit ready for review", "A today visit is ready for caregiver review."),
+            ("APPOINTMENT_ASSIGNED", "Caregiver assigned", "An upcoming visit now has an assigned caregiver."),
+            ("VISIT_SUBMITTED_FOR_SIGNATURE", "Signature requested", "A completed visit is awaiting patient or guardian signature."),
+            ("BILLING_CONFIRMED", "Payment received", "A completed appointment has been marked paid."),
+            ("APPOINTMENT_CANCELLED", "Visit cancelled", "A future visit was cancelled by the family."),
+            ("GENERIC", "Coverage review", "One upcoming appointment remains open for assignment."),
+        )
+        now = datetime.now(tz=UTC)
+        for index, (kind, title, body) in enumerate(notices):
+            read_at = now - timedelta(minutes=index * 15) if index in {0, 3} else None
             await conn.execute(text("""
-                INSERT INTO appointment_activities (
-                    id, appointment_id, agency_id, name, planned_minutes, status, notes, service_type
+                INSERT INTO notifications (
+                    id, agency_id, recipient_user_id, type, title, body, status,
+                    metadata, created_at, read_at
                 ) VALUES (
-                    :id, :appointment_id, :agency_id, :name, 60, 'PENDING', :notes, 'PERSONAL_CARE'
+                    :id, :agency_id, :recipient_id, :kind, :title, :body, :status,
+                    CAST(:metadata AS jsonb), :created_at, :read_at
                 )
-            """), {"id": uuid.uuid4(), "appointment_id": appointment_id, "agency_id": agency.id,
-                   "name": service, "notes": "Showcase activity checklist item."})
-    return 48
+            """), {
+                "id": uuid.uuid4(), "agency_id": agency.id, "recipient_id": admin_id,
+                "kind": kind, "title": title, "body": body,
+                "status": "READ" if read_at else "SENT",
+                "metadata": '{"source":"showcase_seed"}',
+                "created_at": now - timedelta(minutes=index * 15), "read_at": read_at,
+            })
+    return len(notices)
 
 
 async def seed(agency_admin_email: str) -> None:
@@ -369,10 +474,14 @@ async def seed(agency_admin_email: str) -> None:
         staff, patients, guardians = await _ensure_roster(engine, agency)
         locations = await _ensure_locations(engine, agency)
         homes = await _ensure_group_homes(engine, agency, locations=locations, patients=patients, guardians=guardians, staff=staff)
-        appointments = await _replace_showcase_schedule(engine, agency, locations=locations, patients=patients, staff=staff)
+        appointments, visits, evv_records = await _replace_showcase_schedule(
+            engine, agency, locations=locations, patients=patients, staff=staff
+        )
+        notifications = await _replace_showcase_notifications(engine, agency)
         print(f"Seeded {agency.name} ({agency.id}): {len(staff)} staff, {len(patients)} patients, "
               f"{len(guardians)} guardians, {len(locations)} locations, {homes} group homes, "
-              f"and {appointments} linked appointments.")
+              f"{appointments} appointments across today + 7 days, {visits} visits, "
+              f"{evv_records} EVV records, and {notifications} notifications.")
         print(f"Generated login password: {PASSWORD}")
     finally:
         await engine.dispose()

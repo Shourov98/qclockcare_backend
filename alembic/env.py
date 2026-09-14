@@ -31,6 +31,11 @@ from src.modules.identity.models import (  # noqa: F401
     User,
     UserRoleAssignment,
 )
+from src.modules.messaging.models import (  # noqa: F401
+    Conversation,
+    ConversationMessage,
+    ConversationParticipant,
+)
 from src.shared.domain.base_entity import Base
 
 config = context.config
