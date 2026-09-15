@@ -30,7 +30,7 @@ markdown), and `responses=` (pre-wired 401/403/422 examples via
 sidebar with realistic payloads.
 """
 
-from __future__ import annotations
+from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession

@@ -17,8 +17,16 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    StringConstraints,
+    field_validator,
+)
 
 # --------------------------------------------------------------------------
 # Password policy — shared by every endpoint that accepts a plaintext password

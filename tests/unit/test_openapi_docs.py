@@ -86,18 +86,30 @@ class TestAppOpenAPISchema:
         )
 
     def test_paths_count_matches_routes(self) -> None:
-        """Sanity check that route registration didn't break — we
-        should have ~100 unique operations across 70+ paths."""
+        """Sanity check that route registration didn't break.
+
+        The current product surface includes agency operations, compliance,
+        messaging, billing, reports, portal, and dashboard APIs, so the
+        expected operation count is intentionally well above the original
+        appointment-and-visit-only range.
+        """
         spec = self._spec()
         total_ops = sum(
             len([m for m in methods if m in {"get", "post", "put", "patch", "delete"}])
             for path, methods in spec["paths"].items()
         )
-        # Migration 0027 reshaped the appointment+visit endpoints (some
-        # removed — verify/dispute/confirm/reschedule — others added —
-        # sign/confirm-billing/end). Allow a wider band to reflect that.
-        # The important thing is we're in the right order of magnitude.
-        assert 90 <= total_ops <= 135, f"unexpected op count: {total_ops}"
+        # Keep this broad enough for additive feature modules, while still
+        # detecting accidental router loss or a duplicate-registration spike.
+        assert 190 <= total_ops <= 240, f"unexpected op count: {total_ops}"
+
+    def test_dashboard_operations_are_documented(self) -> None:
+        """The agency-admin dashboard API must remain discoverable in docs."""
+        spec = self._spec()
+        overview = spec["paths"]["/dashboard/overview"]["get"]
+        search = spec["paths"]["/dashboard/search"]["get"]
+        assert overview["tags"] == ["dashboard"]
+        assert search["tags"] == ["dashboard"]
+        assert overview["responses"]["200"]["description"] == "Successful Response"
 
 
 # ---------------------------------------------------------------------------
@@ -134,13 +146,11 @@ class TestErrorEnvelope:
         JSON output. Drift = a future PR will produce 401/403 JSON
         that doesn't match the OpenAPI examples."""
         from src.core.exceptions import _envelope
-        from src.shared.schemas.error import build_error_envelope
+        from src.shared.schemas.error import ErrorResponse, build_error_envelope
 
         # `_envelope` builds with `datetime.now()` so we can't
         # compare exact timestamps; instead we exercise both paths
         # with the same input and assert structural equality.
-        from src.shared.schemas.error import ErrorResponse
-
         typed = build_error_envelope(
             code="UNAUTHORIZED",
             message="Authentication required.",

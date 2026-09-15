@@ -174,6 +174,14 @@ tags_metadata: Final[list[dict[str, str]]] = [
         ),
     },
     {
+        "name": "dashboard",
+        "description": (
+            "Agency-admin operational overview and global record search. "
+            "Both endpoints are scoped to the caller's agency and require "
+            "the `AGENCY_ADMIN` role."
+        ),
+    },
+    {
         "name": "health",
         "description": (
             "Liveness (`/health`) and readiness (`/ready`) probes. "
